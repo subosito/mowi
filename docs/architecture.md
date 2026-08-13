@@ -1,0 +1,89 @@
+# Architecture
+
+## Rule
+
+**mow is headless. The UI is a client. ACP is owned by mow.**
+
+mowi never:
+
+- constructs an Engine
+- registers tools or slash commands
+- launches Cursor / Gemini / `mow acp` as a peer
+- implements review/sec (it *invokes* them via `slash`)
+
+mowi does:
+
+- paint a document (header, transcript, activity, input, perm strip)
+- send `prompt` / `cancel` / `steer` / `slash` / `perm.decide`
+- render `event` and `perm.ask` notifications
+
+## Processes
+
+```
+operator
+   │
+   ├─ mowi (this crate)          Ratatui, keys, theme, markdown, diffs
+   │      │ stdio JSON-lines
+   │      ▼
+   └─ mow rpc [engine flags]     Engine + linked packs (review, goal, acp, …)
+              │
+              ├─ LLM HTTP
+              ├─ FS tools (jailed)
+              └─ acp_delegate ──▶ external / native ACP peers
+```
+
+Default: mowi **spawns** `mow` (or `$MOW_BIN`) with `rpc` plus the same engine
+flags the user passed. Alternative: attach to an already-running `mow rpc` on
+stdio / a socket later — not required for v1.
+
+One Engine per process. In-app session switch is out (same as Go mowi):
+resume with `--session` / `--continue` on the next launch.
+
+## Why RPC, not ACP, for the UI
+
+| | `mow rpc` | ACP |
+|---|---|---|
+| Role | Native host protocol | Foreign agents / editors |
+| Perm | `perm.ask` + y/n/always with tool args | Peer-defined `session/request_permission` |
+| Slash | `/review`, `/sec` on **this** Engine | Not a thing |
+| Usage | `prompt.usage` + `EventDelegateUsage` | Often omitted by external peers |
+| Who owns peers | Engine | — |
+
+If the UI spoke only ACP to `mow acp`, you would lose ask-mode previews,
+exclusive slash, and a reliable usage chip. ACP stays how **mow** talks to
+other products.
+
+## Protocol version
+
+`version.rpc` is `"3"`. Feature-detect that field. Older `mow rpc` (`"2"`)
+has prompt/cancel/status only — refuse to start a full UI against it.
+
+See [protocol.md](protocol.md).
+
+## Trust and flags
+
+Workspace trust (`mow trust`) stays out-of-band. mowi may shell out to
+`mow trust` or document it; it does not invent a second trust store.
+
+`--allow-write` / `--allow-shell` / `--ask` / `--auto` are **engine flags**
+passed through to `mow rpc`. After connect, `perm.set` mirrors ask/auto so
+the UI and Engine agree.
+
+## Packs
+
+Slash commands exist only if the **mow binary** blank-imported the pack.
+`slash.list` is the source of truth. This crate must not hard-code `/review`.
+
+## Improved vs Go mowi
+
+Same baseline ([baseline.md](baseline.md)), deliberately better in:
+
+- **Process isolation** — UI is not the Engine. Spawn-kill still cancels.
+- **Layout** — Ratatui widgets/constraints instead of hand-rolled lipgloss.
+- **Testing** — ratatui `TestBackend` + protocol fixtures (no PTY required
+  for logic). Optional cell smoke later.
+- **Theme** — mocha default and flashdiff-style diffs as a palette module,
+  not Charm AdaptiveColor.
+- **No blank-import tricks in the UI** — one crate, one binary.
+
+Do **not** “improve” by putting peer management or review ensemble in the UI.
