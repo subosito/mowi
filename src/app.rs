@@ -23,13 +23,13 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Flex, Layout, Rect},
     text::{Line, Span},
     widgets::{
-        Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph, Scrollbar,
+        Block, BorderType, Clear, List, ListItem, Padding, Paragraph, Scrollbar,
         ScrollbarOrientation, ScrollbarState, Wrap,
     },
 };
 use serde_json::Value;
 
-use crate::render::{Segment, diff_file, markdown_lines, split_markdown_and_diffs};
+use crate::render::{Segment, diff_title, fill_span, markdown_lines, split_markdown_and_diffs};
 use crate::rpc::{
     Client, Error, Notification, PermissionRequest, SessionInfo, SessionSummary, SlashCommand,
     TranscriptMessage, token_delta,
@@ -265,10 +265,10 @@ impl App {
             } else {
                 format!("mowi · {}", vanity.join(" · "))
             };
-            if left.chars().count() + safety.chars().count() + 2 <= width || vanity.is_empty() {
-                let pad = width
-                    .saturating_sub(left.chars().count() + safety.chars().count())
-                    .max(1);
+            let left_w = Span::raw(left.as_str()).width();
+            let safety_w = Span::raw(safety.as_str()).width();
+            if left_w + safety_w + 1 <= width || vanity.is_empty() {
+                let pad = width.saturating_sub(left_w + safety_w);
                 return Line::from(vec![
                     Span::styled(left, self.theme.header()),
                     Span::styled(" ".repeat(pad), self.theme.header_bg()),
@@ -320,39 +320,42 @@ impl App {
         }
     }
 
-    /// User prompt as a full-width filled band, not a lone unpadded span.
+    /// User prompt as a full-width filled band: accent bar, padded body, blank
+    /// rows above and below so it reads as a message, not a leftover prompt.
     fn user_lines(&self, text: &str) -> Vec<Line<'static>> {
         let width = self.last_view_w.max(8) as usize;
-        let glyph = self.prompt_glyph();
-        let indent = " ".repeat(glyph.chars().count());
-        let mut out = Vec::new();
-        for (index, raw) in text.split('\n').enumerate() {
-            let prefix = if index == 0 { glyph } else { indent.as_str() };
-            let inner = width.saturating_sub(prefix.chars().count()).max(1);
-            for (wrap_i, chunk) in wrap_cols(raw, inner).into_iter().enumerate() {
-                let lead = if wrap_i == 0 { prefix } else { indent.as_str() };
-                let mut spans = vec![
-                    Span::styled(lead.to_string(), self.theme.user()),
-                    Span::styled(chunk.clone(), self.theme.user()),
-                ];
-                let painted = lead.chars().count() + chunk.chars().count();
-                let pad = width.saturating_sub(painted);
-                if pad > 0 {
-                    spans.push(Span::styled(" ".repeat(pad), self.theme.user()));
-                }
-                out.push(Line::from(spans));
+        let blank = self.user_band_row("", width);
+        let mut out = vec![blank.clone()];
+        for raw in text.split('\n') {
+            let inner = width.saturating_sub(3).max(1); // accent + gutters
+            for chunk in wrap_cols(raw, inner) {
+                out.push(self.user_band_row(&chunk, width));
             }
         }
-        if out.is_empty() {
-            out.push(Line::from(Span::styled(
-                format!(
-                    "{glyph}{}",
-                    " ".repeat(width.saturating_sub(glyph.chars().count()))
-                ),
-                self.theme.user(),
-            )));
-        }
+        out.push(blank);
         out
+    }
+
+    fn user_band_row(&self, body: &str, width: usize) -> Line<'static> {
+        let mut spans = Vec::new();
+        if self.theme.colored {
+            spans.push(fill_span(1, self.theme.overlay()));
+        }
+        let used: usize = spans.iter().map(Span::width).sum();
+        let room = width.saturating_sub(used);
+        let text = if body.is_empty() {
+            String::new()
+        } else {
+            format!(" {body}")
+        };
+        let text: String = text.chars().take(room).collect();
+        spans.push(Span::styled(text, self.theme.user()));
+        let painted: usize = spans.iter().map(Span::width).sum();
+        let pad = width.saturating_sub(painted);
+        if pad > 0 {
+            spans.push(fill_span(pad, self.theme.user()));
+        }
+        Line::from(spans)
     }
 
     /// Markdown by default; only fenced or bare unified-diff bodies become cards.
@@ -378,18 +381,17 @@ impl App {
     /// rectangles rather than ragged stripes.
     fn diff_card(&self, text: &str) -> Vec<Line<'static>> {
         let width = self.last_view_w.max(8);
-        let title = diff_file(text).unwrap_or_else(|| "diff".to_string());
+        let title = diff_title(text);
         let head = format!("─ {title} ");
-        let fill = (width as usize).saturating_sub(head.chars().count());
+        // One column short of the pane so wrap does not insert a blank row.
+        let band_w = (width as usize).saturating_sub(1).max(8);
+        let fill = band_w.saturating_sub(head.chars().count());
         let mut out = vec![Line::styled(
             format!("{head}{}", "─".repeat(fill)),
             self.theme.chrome(),
         )];
-        out.extend(crate::render::diff_lines(text, self.theme, width));
-        out.push(Line::styled(
-            "─".repeat(width as usize),
-            self.theme.chrome(),
-        ));
+        out.extend(crate::render::diff_lines(text, self.theme, band_w as u16));
+        out.push(Line::styled("─".repeat(band_w), self.theme.chrome()));
         out
     }
 
@@ -429,6 +431,7 @@ impl App {
     fn estimated_entry_lines(&self, entry: &Entry) -> usize {
         (match entry {
             Entry::Assistant(text) => text.lines().count().max(1),
+            Entry::User(text) => text.lines().count().max(1) + 2,
             _ => 1,
         }) + 1
     }
@@ -935,8 +938,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 
     frame.render_widget(Block::new().style(app.theme.base()), area);
 
-    // header (with bottom hairline) · [activity] · transcript · input · footer
-    let mut rows = vec![Constraint::Length(2)];
+    // header · hairline · [activity] · transcript · input · footer
+    let mut rows = vec![Constraint::Length(1), Constraint::Length(1)];
     if app.busy {
         rows.push(Constraint::Length(1));
     }
@@ -947,31 +950,28 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints(rows)
         .split(area);
-    let rest = &areas[1..];
+    let rest = &areas[2..];
     let (activity, transcript_area, input_area, footer_area) = if app.busy {
         (Some(rest[0]), rest[1], rest[2], rest[3])
     } else {
         (None, rest[0], rest[1], rest[2])
     };
 
-    // Full-width mantle bar; the bottom border is the hairline under the chips.
+    paint_filled_header(frame, app, areas[0]);
     frame.render_widget(
-        Paragraph::new(app.header_line(area.width.saturating_sub(2)))
-            .style(app.theme.header())
-            .block(
-                Block::new()
-                    .style(app.theme.header_bg())
-                    .borders(Borders::BOTTOM)
-                    .border_style(app.theme.chrome())
-                    .padding(Padding::horizontal(1)),
-            ),
-        areas[0],
+        Paragraph::new(Line::from(Span::styled(
+            "─".repeat(areas[1].width as usize),
+            app.theme.chrome().patch(app.theme.header_bg()),
+        )))
+        .style(app.theme.header_bg()),
+        areas[1],
     );
 
     // The activity band exists only while a turn runs.
     if let Some(band) = activity {
         frame.render_widget(
             Paragraph::new(Line::styled(app.activity(), app.theme.note()))
+                .style(app.theme.base())
                 .block(Block::new().padding(Padding::horizontal(1))),
             band,
         );
@@ -987,7 +987,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let input_inner = input_block.inner(input_area);
     frame.render_widget(input_block, input_area);
     frame.render_widget(
-        Paragraph::new(prompt_text(app))
+        Paragraph::new(prompt_text(app, input_inner.width))
             .style(app.theme.surface())
             .wrap(Wrap { trim: false }),
         input_inner,
@@ -1019,21 +1019,44 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     }
 }
 
-/// Input text with the prompt glyph on the first line.
-fn prompt_text(app: &App) -> Vec<Line<'static>> {
+/// Paint the header as a solid mantle bar: fill every cell, then overlay chips.
+fn paint_filled_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let fill = Line::from(Span::styled(
+        " ".repeat(area.width as usize),
+        app.theme.header_bg(),
+    ));
+    frame.render_widget(Paragraph::new(fill).style(app.theme.header_bg()), area);
+    frame.render_widget(
+        Paragraph::new(app.header_line(area.width)).style(app.theme.header_bg()),
+        area,
+    );
+}
+
+/// Input text with the prompt glyph on the first line, padded to `width` so
+/// the surface wash is a rectangle.
+fn prompt_text(app: &App, width: u16) -> Vec<Line<'static>> {
+    let width = width as usize;
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (index, line) in app.input.split('\n').enumerate() {
         let glyph = if index == 0 { app.prompt_glyph() } else { "  " };
-        lines.push(Line::from(vec![
-            Span::styled(glyph, app.theme.accent()),
+        let mut spans = vec![
+            Span::styled(glyph, app.theme.accent().patch(app.theme.surface())),
             Span::styled(line.to_string(), app.theme.user()),
-        ]));
+        ];
+        let painted: usize = spans.iter().map(Span::width).sum();
+        let pad = width.saturating_sub(painted.saturating_add(1));
+        if pad > 0 {
+            spans.push(Span::styled(" ".repeat(pad), app.theme.surface()));
+        }
+        lines.push(Line::from(spans));
     }
     if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            app.prompt_glyph(),
-            app.theme.accent(),
-        )));
+        let glyph = app.prompt_glyph();
+        let pad = width.saturating_sub(Span::raw(glyph).width());
+        lines.push(Line::from(vec![
+            Span::styled(glyph, app.theme.accent().patch(app.theme.surface())),
+            Span::styled(" ".repeat(pad), app.theme.surface()),
+        ]));
     }
     lines
 }
@@ -1059,6 +1082,7 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     };
     frame.render_widget(
         Paragraph::new(lines)
+            .style(app.theme.base())
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0)),
         inner,
@@ -1643,7 +1667,8 @@ mod tests {
         assert!(out.contains("mowi"), "{out}");
         assert!(out.contains("gpt-5-mini"), "{out}");
         assert!(out.contains("abcdef01"), "{out}");
-        assert!(out.contains("❯ hi"), "{out}");
+        assert!(out.contains("hi"), "{out}");
+        assert!(!out.contains("❯ hi"), "{out}");
         assert!(out.contains("hello"), "{out}");
         assert!(out.contains("enter send"), "{out}");
         // Safety chips are always painted.
@@ -1664,8 +1689,15 @@ mod tests {
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer();
         let mantle = Color::Rgb(0x18, 0x18, 0x25);
-        assert_eq!(buf[(0, 0)].bg, mantle, "left edge of header");
-        assert_eq!(buf[(79, 0)].bg, mantle, "right edge of header");
+        for x in 0..80 {
+            assert_eq!(
+                buf[(x, 0)].bg,
+                mantle,
+                "header cell ({x},0) bg={:?} symbol={:?}",
+                buf[(x, 0)].bg,
+                buf[(x, 0)].symbol()
+            );
+        }
     }
 
     #[test]
@@ -1677,18 +1709,23 @@ mod tests {
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer();
         let user_bg = Color::Rgb(0x31, 0x32, 0x44);
-        let mut found = false;
-        for y in 0..16 {
+        let overlay = Color::Rgb(0x45, 0x47, 0x5a);
+        let mut found = None;
+        for y in 0..16u16 {
             let row: String = (0..60).map(|x| buf[(x, y)].symbol().to_string()).collect();
             if let Some(x) = row.find("hi") {
-                found = true;
-                assert_eq!(buf[(x as u16, y)].bg, user_bg, "text cell {x},{y}");
-                // The band continues past the letters, not a lone unpadded span.
-                assert_eq!(buf[(x as u16 + 4, y)].bg, user_bg, "pad cell after text");
+                found = Some((x as u16, y));
                 break;
             }
         }
-        assert!(found, "user text not painted");
+        let (x, y) = found.expect("user text not painted");
+        assert_eq!(buf[(x, y)].bg, user_bg, "text cell {x},{y}");
+        // Inner transcript starts at x=1 (left pad); the band fills across.
+        assert_eq!(buf[(1, y)].bg, overlay, "accent bar");
+        assert_eq!(buf[(x + 4, y)].bg, user_bg, "pad cell after text");
+        // Blank rows inside the band, above and below the text.
+        assert_eq!(buf[(x, y - 1)].bg, user_bg, "pad row above");
+        assert_eq!(buf[(x, y + 1)].bg, user_bg, "pad row below");
     }
 
     #[test]
@@ -1904,6 +1941,56 @@ mod tests {
         assert!(card < after, "trailing prose should follow the card\n{out}");
         // The whole message is not a generic wrapping card.
         assert!(!out.contains("─ diff "), "{out}");
+    }
+
+    #[test]
+    fn pathless_hunk_is_titled_hunk_not_diff() {
+        let mut app = App::new(SessionInfo::default());
+        app.theme = Theme { colored: true };
+        app.entries.push(Entry::Assistant(
+            "Edited `cfg.go`:\n\n```diff\n@@ -1 +1 @@\n-old\n+new\n```\n".into(),
+        ));
+        let out = render(&mut app, 80, 20);
+        assert!(out.contains("─ hunk "), "{out}");
+        assert!(!out.contains("─ diff "), "{out}");
+        assert!(out.contains("Edited"), "{out}");
+    }
+
+    #[test]
+    fn add_band_cells_use_add_background() {
+        let mut app = App::new(SessionInfo::default());
+        app.theme = Theme { colored: true };
+        app.entries.push(Entry::Assistant(
+            "--- a/x.go\n+++ b/x.go\n@@ -1 +1 @@\n-old\n+new".into(),
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let add_bg = Color::Rgb(51, 65, 56);
+        let mut found = None;
+        for y in 0..16u16 {
+            let row: String = (0..60).map(|x| buf[(x, y)].symbol().to_string()).collect();
+            if row.contains("new") && row.contains('+') {
+                found = Some(y);
+                break;
+            }
+        }
+        let y = found.expect("add band not painted");
+        let mut saw_add = false;
+        for x in 0..60u16 {
+            if buf[(x, y)].bg == add_bg {
+                saw_add = true;
+            }
+        }
+        assert!(saw_add, "add row y={y} had no add-band background");
+        // The wash reaches past the text, not a ragged stripe.
+        let row: String = (0..60).map(|x| buf[(x, y)].symbol().to_string()).collect();
+        let text_at = row.find("new").expect("new");
+        assert_eq!(
+            buf[(text_at as u16 + 6, y)].bg,
+            add_bg,
+            "pad after add text"
+        );
     }
 
     #[test]

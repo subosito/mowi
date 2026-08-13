@@ -176,18 +176,47 @@ pub fn markdown_lines(text: &str, theme: Theme) -> Vec<Line<'static>> {
     lines
 }
 
-/// File path of a unified diff, from the `+++ b/path` header when present.
+/// File path of a unified diff, from `+++` / `---` / `diff --git` when present.
 pub fn diff_file(text: &str) -> Option<String> {
-    text.lines()
-        .find_map(|line| line.strip_prefix("+++ "))
-        .map(|path| {
-            path.split('\t')
-                .next()
-                .unwrap_or(path)
-                .trim_start_matches("b/")
-                .to_string()
-        })
-        .filter(|path| !path.is_empty() && path != "/dev/null")
+    let mut from_plus = None;
+    let mut from_minus = None;
+    let mut from_git = None;
+    for line in text.lines() {
+        let line = line.trim_start();
+        if let Some(path) = line.strip_prefix("+++ ") {
+            from_plus = from_plus.or_else(|| clean_diff_path(path));
+        } else if let Some(path) = line.strip_prefix("--- ") {
+            from_minus = from_minus.or_else(|| clean_diff_path(path));
+        } else if let Some(rest) = line.strip_prefix("diff --git ") {
+            from_git = from_git.or_else(|| git_diff_path(rest));
+        }
+    }
+    from_plus.or(from_minus).or(from_git)
+}
+
+/// Card title: a path from the hunk headers, or `hunk` when the body is file-less.
+pub fn diff_title(text: &str) -> String {
+    diff_file(text).unwrap_or_else(|| "hunk".to_string())
+}
+
+fn clean_diff_path(path: &str) -> Option<String> {
+    let path = path.split('\t').next().unwrap_or(path).trim();
+    let path = path
+        .strip_prefix("b/")
+        .or_else(|| path.strip_prefix("a/"))
+        .unwrap_or(path);
+    if path.is_empty() || path == "/dev/null" {
+        None
+    } else {
+        Some(path.to_string())
+    }
+}
+
+fn git_diff_path(rest: &str) -> Option<String> {
+    let mut parts = rest.split_whitespace();
+    let a = parts.next().unwrap_or("");
+    let b = parts.next().unwrap_or(a);
+    clean_diff_path(b).or_else(|| clean_diff_path(a))
 }
 
 /// Render a unified diff as flashdiff-style full-width bands.
@@ -202,6 +231,12 @@ pub fn diff_lines(text: &str, theme: Theme, width: u16) -> Vec<Line<'static>> {
     let mut index = 0;
     while index < rows.len() {
         let row = rows[index].as_str();
+        if row.is_empty() {
+            // Blank source lines are not painted: they show up as a hole after
+            // `@@` and break the card. A real empty file line is ` ` (space).
+            index += 1;
+            continue;
+        }
         if row.starts_with("+++") || row.starts_with("---") || row.starts_with("@@") {
             out.push(Line::from(Span::styled(row.to_string(), theme.diff_meta())));
             index += 1;
@@ -298,9 +333,24 @@ fn band(
     let painted: usize = spans.iter().map(Span::width).sum();
     let pad = (width as usize).saturating_sub(painted);
     if pad > 0 {
-        spans.push(Span::styled(" ".repeat(pad), band));
+        spans.push(fill_span(pad, band));
     }
     Line::from(spans)
+}
+
+/// Pad that WordWrapper will not treat as wrapping whitespace.
+///
+/// A run of spaces at `>= pane width` makes ratatui emit an extra empty row.
+/// A full-block with matching fg/bg reads as a solid wash and stays one line.
+pub(crate) fn fill_span(cols: usize, style: Style) -> Span<'static> {
+    if cols == 0 {
+        return Span::raw("");
+    }
+    let (ch, style) = match style.bg {
+        Some(bg) => ('█', style.fg(bg)),
+        None => (' ', style),
+    };
+    Span::styled(ch.to_string().repeat(cols), style)
 }
 
 /// Byte range of the changed span in each row of a `-`/`+` pair.
@@ -423,6 +473,34 @@ mod tests {
         let diff = "--- a/src/app.rs\n+++ b/src/app.rs\n@@ -1 +1 @@\n-old\n+new";
         assert_eq!(super::diff_file(diff).as_deref(), Some("src/app.rs"));
         assert_eq!(super::diff_file("@@ -1 +1 @@\n+new"), None);
+        assert_eq!(super::diff_title("@@ -1 +1 @@\n+new"), "hunk");
+        assert_eq!(
+            super::diff_file("+++ cfg.go\n@@ -1 +1 @@\n+x").as_deref(),
+            Some("cfg.go")
+        );
+        assert_eq!(
+            super::diff_file("diff --git a/cfg.go b/cfg.go\n@@ -1 +1 @@\n+x").as_deref(),
+            Some("cfg.go")
+        );
+        assert_eq!(
+            super::diff_file("--- a/gone.go\n+++ /dev/null\n@@ -1 +0 @@\n-x").as_deref(),
+            Some("gone.go")
+        );
+    }
+
+    #[test]
+    fn empty_source_lines_inside_a_hunk_are_not_painted() {
+        let theme = Theme { colored: true };
+        let lines = diff_lines("@@ -1 +1 @@\n\n-old\n+new", theme, 20);
+        assert_eq!(
+            lines.len(),
+            3,
+            "{:?}",
+            lines.iter().map(plain).collect::<Vec<_>>()
+        );
+        assert!(plain(&lines[0]).starts_with("@@"));
+        assert!(plain(&lines[1]).starts_with('−'));
+        assert!(plain(&lines[2]).starts_with('+'));
     }
 
     fn plain(line: &Line<'_>) -> String {
