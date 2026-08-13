@@ -46,13 +46,17 @@ Host-side (this crate, or slash if registered):
 | `/sessions` | RPC `sessions` — overlay list + `mowi --session <id>` hint |
 | `/search` | UI-local find in painted transcript |
 | `/copy` `/retry` `/edit` | UI-local / re-`prompt` |
+| `/clear` | UI-local: clear painted transcript (engine history kept) |
 | `/quit` `/exit` `/q` | UI-local quit (cancels an in-flight turn first) |
-| `/model` | UI-local: `model.list` overlay, or `/model gpt-5-mini` → `model.set` |
+| `/model` | UI-local: `model.list` overlay (enter to set), or `/model gpt-5-mini` → `model.set` |
+| `/effort` | UI-local: `effort.list` overlay (enter to set), or `/effort high` → `effort.set` |
 | `/review` `/sec` `/goal` … | RPC `slash` — only if `slash.list` has them |
 
 Local commands are routed by name before the RPC fallback, so `/quit`,
-`/model`, and friends can never be sent to the host as an unknown slash
-command.
+`/model`, `/effort`, and friends can never be sent to the host as an unknown
+slash command. RPC `slash` is used only for names in the cached `slash.list`
+(today: `review`, `sec`). Anything else is a local error listing available
+commands.
 
 Exclusive slash: refuse while `status.busy`.
 

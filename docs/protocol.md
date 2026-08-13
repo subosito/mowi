@@ -39,6 +39,8 @@ Stderr is Engine logs — do not parse it.
 | `perm.decide` | yes | `{id, decision}` | `{ok}` |
 | `model.list` | yes | — | `{models:[{id,current,wire?}], current}` |
 | `model.set` | yes | `{id}` | `{ok, model}` |
+| `effort.list` | yes | — | `{efforts:[{id,current}], current, default}` |
+| `effort.set` | yes | `{id}` | `{ok, effort}` |
 | `version` | yes | — | `{name, version, rpc, package}` |
 | `ping` | yes | — | `"pong"` |
 

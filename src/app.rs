@@ -13,20 +13,23 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use ratatui::{
     Frame, Terminal,
     backend::Backend,
-    layout::{Alignment, Constraint, Direction, Flex, Layout, Rect},
-    style::Style,
+    layout::{Alignment, Constraint, Direction, Flex, Layout, Position, Rect},
+    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, BorderType, Clear, List, ListItem, Padding, Paragraph, Scrollbar,
-        ScrollbarOrientation, ScrollbarState, Wrap,
+        Block, BorderType, Cell, Clear, List, ListItem, ListState, Padding, Paragraph, Row,
+        Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap,
     },
 };
 use serde_json::Value;
 
 use crate::render::{Segment, diff_title, markdown_lines, split_markdown_and_diffs};
 use crate::rpc::{
-    Client, Error, ModelList, Notification, PermissionRequest, SessionInfo, SessionSummary,
-    SlashCommand, TranscriptMessage, token_delta,
+    Client, EffortList, Error, ModelList, Notification, PermissionRequest, SessionInfo,
+    SessionSummary, SlashCommand, TranscriptMessage, token_delta,
+};
+use crate::slash::{
+    SlashRoute, canonical_slash, slash_completions, slash_route, unknown_slash_message,
 };
 use crate::theme::Theme;
 
@@ -77,9 +80,23 @@ fn format_tokens(tokens: u64) -> String {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Overlay {
     None,
-    Help,
-    Sessions(Vec<SessionSummary>),
-    Models(ModelList),
+    Help(TableState),
+    Sessions {
+        items: Vec<SessionSummary>,
+        state: ListState,
+    },
+    Models {
+        list: ModelList,
+        state: ListState,
+    },
+    Efforts {
+        list: EffortList,
+        state: ListState,
+    },
+    Completions {
+        items: Vec<String>,
+        state: ListState,
+    },
     Peer,
 }
 
@@ -87,6 +104,78 @@ impl Overlay {
     pub fn is_open(&self) -> bool {
         !matches!(self, Overlay::None)
     }
+
+    fn help() -> Self {
+        let mut state = TableState::default();
+        state.select(Some(0));
+        Overlay::Help(state)
+    }
+
+    fn sessions(items: Vec<SessionSummary>) -> Self {
+        Overlay::Sessions {
+            state: select_list(items.len(), 0),
+            items,
+        }
+    }
+
+    fn models(list: ModelList) -> Self {
+        let idx = list
+            .models
+            .iter()
+            .position(|model| model.current || model.id == list.current)
+            .unwrap_or(0);
+        Overlay::Models {
+            state: select_list(list.models.len(), idx),
+            list,
+        }
+    }
+
+    fn efforts(list: EffortList) -> Self {
+        let idx = list
+            .efforts
+            .iter()
+            .position(|effort| effort.current || effort.id == list.current)
+            .unwrap_or(0);
+        Overlay::Efforts {
+            state: select_list(list.efforts.len(), idx),
+            list,
+        }
+    }
+
+    fn completions(items: Vec<String>) -> Self {
+        Overlay::Completions {
+            state: select_list(items.len(), 0),
+            items,
+        }
+    }
+}
+
+fn select_list(len: usize, idx: usize) -> ListState {
+    let mut state = ListState::default();
+    if len > 0 {
+        state.select(Some(idx.min(len - 1)));
+    }
+    state
+}
+
+fn step_list(state: &mut ListState, len: usize, delta: i32) {
+    if len == 0 {
+        state.select(None);
+        return;
+    }
+    let cur = state.selected().unwrap_or(0).min(len - 1) as i32;
+    let next = (cur + delta).clamp(0, (len as i32) - 1) as usize;
+    state.select(Some(next));
+}
+
+fn step_table(state: &mut TableState, len: usize, delta: i32) {
+    if len == 0 {
+        state.select(None);
+        return;
+    }
+    let cur = state.selected().unwrap_or(0).min(len - 1) as i32;
+    let next = (cur + delta).clamp(0, (len as i32) - 1) as usize;
+    state.select(Some(next));
 }
 
 /// UI state. `draw` is pure over this struct so `TestBackend` can assert on it.
@@ -129,6 +218,13 @@ pub struct App {
     /// Agent whose buffer `ctrl+p` expands.
     pub peer_focus: Option<String>,
     pub animate: bool,
+    /// Reasoning effort from `effort.list` / `effort.set`.
+    pub effort: String,
+    /// Character index into `input`.
+    pub cursor: usize,
+    /// Ratatui frame counter, used for the busy spinner.
+    pub tick: u64,
+    pub scrollbar_state: ScrollbarState,
 }
 
 impl Default for App {
@@ -164,6 +260,10 @@ impl Default for App {
             perm_shown: None,
             peer_focus: None,
             animate: std::env::var_os("MOW_NO_ANIM").is_none(),
+            effort: String::new(),
+            cursor: 0,
+            tick: 0,
+            scrollbar_state: ScrollbarState::default(),
         }
     }
 }
@@ -203,6 +303,14 @@ impl App {
             Some(Value::String(mode)) => self.ask_mode = mode == "ask",
             _ => {}
         }
+        if let Some(model) = status.get("model").and_then(Value::as_str)
+            && !model.is_empty()
+        {
+            self.session.model = model.to_string();
+        }
+        if let Some(effort) = status.get("effort").and_then(Value::as_str) {
+            self.effort = effort.to_string();
+        }
     }
 
     /// Show the model catalog overlay and keep the header chip in sync.
@@ -210,7 +318,7 @@ impl App {
         if !list.current.is_empty() {
             self.session.model = list.current.clone();
         }
-        self.overlay = Overlay::Models(list);
+        self.overlay = Overlay::models(list);
     }
 
     /// Apply a `model.set` result to the header chip.
@@ -221,6 +329,26 @@ impl App {
         self.session.model = model.to_string();
         self.status = format!("model: {model}");
         self.entries.push(Entry::Note(format!("model: {model}")));
+        self.overlay = Overlay::None;
+    }
+
+    /// Show the effort picker overlay.
+    pub fn apply_effort_list(&mut self, list: EffortList) {
+        if !list.current.is_empty() {
+            self.effort = list.current.clone();
+        }
+        self.overlay = Overlay::efforts(list);
+    }
+
+    /// Apply an `effort.set` result to the status bar.
+    pub fn apply_effort_set(&mut self, effort: &str) {
+        if effort.is_empty() {
+            return;
+        }
+        self.effort = effort.to_string();
+        self.status = format!("effort: {effort}");
+        self.entries.push(Entry::Note(format!("effort: {effort}")));
+        self.overlay = Overlay::None;
     }
 
     /// Capability chip: what the Engine was allowed to do at spawn.
@@ -251,6 +379,9 @@ impl App {
         if !self.session.model.is_empty() {
             chips.push(self.session.model.clone());
         }
+        if !self.effort.is_empty() {
+            chips.push(self.effort.clone());
+        }
         let short = self.session.short_id();
         if !short.is_empty() {
             chips.push(short);
@@ -275,7 +406,7 @@ impl App {
             };
             let left_w = Span::raw(left.as_str()).width();
             let safety_w = Span::raw(safety.as_str()).width();
-            if left_w + safety_w + 1 <= width || vanity.is_empty() {
+            if left_w + safety_w < width || vanity.is_empty() {
                 let pad = width.saturating_sub(left_w + safety_w);
                 return Line::from(vec![
                     Span::styled(left, self.theme.header()),
@@ -287,17 +418,59 @@ impl App {
         }
     }
 
+    /// Plain-text footer (styling dropped) — used by tests to assert content
+    /// without pinning spans.
+    #[allow(dead_code)]
     pub fn footer(&self) -> String {
-        let hints = if let Some(permission) = &self.pending_perm {
-            return format!("y allow · n deny · a always · {}", permission.name);
-        } else {
-            "enter send · esc cancel · ? help · /quit"
-        };
-        if self.status.is_empty() {
-            hints.to_string()
-        } else {
-            format!("{hints} — {}", self.status)
+        self.footer_line()
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    pub fn footer_line(&self) -> Line<'static> {
+        if let Some(permission) = &self.pending_perm {
+            return Line::from(vec![Span::styled(
+                format!("y allow · n deny · a always · {}", permission.name),
+                self.theme.warn(),
+            )]);
         }
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let push_sep = |spans: &mut Vec<Span<'static>>| {
+            if !spans.is_empty() {
+                spans.push(Span::styled(" · ", self.theme.chrome()));
+            }
+        };
+        if !self.session.model.is_empty() {
+            push_sep(&mut spans);
+            spans.push(Span::styled(self.session.model.clone(), self.theme.chip()));
+        }
+        if !self.effort.is_empty() {
+            push_sep(&mut spans);
+            spans.push(Span::styled(self.effort.clone(), self.theme.chip()));
+        }
+        let short = self.session.short_id();
+        if !short.is_empty() {
+            push_sep(&mut spans);
+            spans.push(Span::styled(short, self.theme.note()));
+        }
+        push_sep(&mut spans);
+        if self.busy {
+            spans.push(Span::styled("busy", self.theme.warn()));
+        } else {
+            spans.push(Span::styled("idle", self.theme.note()));
+        }
+        spans.push(Span::styled("  ", self.theme.chrome()));
+        spans.push(Span::styled(
+            "enter send · esc cancel · ? help · /quit",
+            self.theme.note(),
+        ));
+        if !self.status.is_empty() {
+            spans.push(Span::styled(" — ", self.theme.chrome()));
+            spans.push(Span::styled(self.status.clone(), self.theme.note()));
+        }
+        Line::from(spans)
     }
 
     /// Transcript as wrapped-source lines (live answer last).
@@ -474,19 +647,19 @@ impl App {
             .unwrap_or(0.0);
         format!(
             "{} {:.1}s · {}",
-            self.spinner(elapsed),
+            self.spinner(),
             elapsed,
             self.status_or_default()
         )
     }
 
     /// Spinner frame. `MOW_NO_ANIM=1` pins a static `●`; elapsed still ticks.
-    fn spinner(&self, elapsed: f32) -> &'static str {
+    fn spinner(&self) -> &'static str {
         const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
         if !self.animate {
             return "●";
         }
-        FRAMES[((elapsed * 8.0) as usize) % FRAMES.len()]
+        FRAMES[(self.tick as usize) % FRAMES.len()]
     }
 
     /// Collapsed peer rows: one line per agent. `ctrl+p` opens the full
@@ -732,11 +905,56 @@ impl App {
 
     pub fn edit_last_prompt(&mut self) -> bool {
         if let Some(prompt) = self.last_user_prompt() {
-            self.input = prompt;
+            self.set_input(prompt);
             true
         } else {
             false
         }
+    }
+
+    fn set_input(&mut self, text: String) {
+        self.cursor = text.chars().count();
+        self.input = text;
+    }
+
+    fn clear_input(&mut self) {
+        self.input.clear();
+        self.cursor = 0;
+    }
+
+    fn insert_char(&mut self, c: char) {
+        let byte = self.cursor_byte();
+        self.input.insert(byte, c);
+        self.cursor += 1;
+    }
+
+    fn backspace_char(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        self.cursor -= 1;
+        let start = self.cursor_byte();
+        let ch_len = self.input[start..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or(0);
+        if ch_len > 0 {
+            self.input.replace_range(start..start + ch_len, "");
+        }
+    }
+
+    fn cursor_byte(&self) -> usize {
+        self.input
+            .chars()
+            .take(self.cursor)
+            .map(char::len_utf8)
+            .sum()
+    }
+
+    fn move_cursor(&mut self, delta: i32) {
+        let len = self.input.chars().count() as i32;
+        self.cursor = (self.cursor as i32 + delta).clamp(0, len) as usize;
     }
 
     pub fn copy_last_assistant(&mut self) -> bool {
@@ -830,7 +1048,10 @@ impl App {
             ("ctrl+/ or ?", "this help"),
             ("esc", "dismiss overlay, else cancel turn"),
             ("ctrl+c", "quit (cancel first if busy)"),
+            ("tab (on /)", "slash autocomplete"),
             ("/model", "list models, or /model <id> to set"),
+            ("/effort", "list efforts, or /effort high to set"),
+            ("/clear", "clear transcript (engine history kept)"),
             ("/quit", "quit"),
         ]
         .iter()
@@ -843,6 +1064,68 @@ impl App {
             ));
         }
         rows
+    }
+
+    fn overlay_move(&mut self, delta: i32) {
+        let help_len = self.help_rows().len();
+        match &mut self.overlay {
+            Overlay::Help(state) => step_table(state, help_len, delta),
+            Overlay::Sessions { items, state } => step_list(state, items.len(), delta),
+            Overlay::Models { list, state } => step_list(state, list.models.len(), delta),
+            Overlay::Efforts { list, state } => step_list(state, list.efforts.len(), delta),
+            Overlay::Completions { items, state } => step_list(state, items.len(), delta),
+            Overlay::Peer | Overlay::None => {}
+        }
+    }
+
+    /// Selected id in a picker overlay, if any.
+    pub fn overlay_selection(&self) -> Option<String> {
+        match &self.overlay {
+            Overlay::Sessions { items, state } => {
+                items.get(state.selected()?).map(|s| s.id.clone())
+            }
+            Overlay::Models { list, state } => {
+                list.models.get(state.selected()?).map(|m| m.id.clone())
+            }
+            Overlay::Efforts { list, state } => {
+                list.efforts.get(state.selected()?).map(|e| e.id.clone())
+            }
+            Overlay::Completions { items, state } => items.get(state.selected()?).cloned(),
+            _ => None,
+        }
+    }
+
+    fn complete_slash(&mut self) {
+        if !self.input.starts_with('/') {
+            return;
+        }
+        let rest = self.input[1..].split_whitespace().next().unwrap_or("");
+        let matches = slash_completions(rest, &self.slash_commands);
+        match matches.len() {
+            0 => self.status = "no matching command".into(),
+            1 => self.set_input(format!("/{} ", matches[0])),
+            _ => self.overlay = Overlay::completions(matches),
+        }
+    }
+
+    fn note_unknown_slash(&mut self, name: &str) {
+        let msg = unknown_slash_message(name, &self.slash_commands);
+        self.status = msg.clone();
+        self.entries.push(Entry::Note(msg));
+    }
+
+    fn load_transcript(&mut self, messages: Vec<TranscriptMessage>) {
+        self.entries = messages
+            .into_iter()
+            .map(|message| match message.role.as_str() {
+                "user" => Entry::User(message.content),
+                "assistant" => Entry::Assistant(message.content),
+                _ => Entry::Note(format!("{}: {}", message.role, message.content)),
+            })
+            .collect();
+        self.follow = true;
+        self.scroll = u16::MAX;
+        self.status = "transcript reloaded".into();
     }
 
     /// Close whichever overlay is open. Returns true if something closed.
@@ -912,9 +1195,13 @@ fn centered(area: Rect, width: Constraint, height: Constraint) -> Rect {
     cell
 }
 
-/// Height of the input textarea: grows 1..6 lines with the typed text.
-fn input_height(app: &App) -> u16 {
-    (app.input.lines().count().max(1) as u16).clamp(1, 6)
+/// Visible rows the composer may occupy before it starts scrolling.
+const INPUT_MAX_ROWS: u16 = 10;
+
+/// Height of the input textarea for an inner width of `width` columns: grows
+/// with both explicit newlines and soft-wrapped long text, up to a cap.
+fn input_height(app: &App, width: u16) -> u16 {
+    (prompt_rows(app, width).len() as u16).clamp(1, INPUT_MAX_ROWS)
 }
 
 fn overlay_block(app: &App, title: &str) -> Block<'static> {
@@ -986,6 +1273,7 @@ const MIN_WIDTH: u16 = 40;
 const MIN_HEIGHT: u16 = 10;
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
+    app.tick = frame.count() as u64;
     let area = frame.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         draw_too_small(frame, app, area);
@@ -1000,7 +1288,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         rows.push(Constraint::Length(1));
     }
     rows.push(Constraint::Fill(1));
-    rows.push(Constraint::Length(input_height(app) + 2));
+    // The composer block eats 2 columns of border and 2 of padding; size the
+    // textarea against that inner width so wrapped text grows the box.
+    let input_cols = area.width.saturating_sub(4);
+    rows.push(Constraint::Length(input_height(app, input_cols) + 2));
     rows.push(Constraint::Length(1));
     let areas = Layout::default()
         .direction(Direction::Vertical)
@@ -1046,11 +1337,14 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         Paragraph::new(prompt_text(app, input_inner.width)).style(app.theme.surface()),
         input_inner,
     );
+    if app.pending_perm.is_none() && !app.welcome && !app.overlay.is_open() {
+        frame.set_cursor_position(input_cursor_pos(app, input_inner));
+    }
 
     // The permission overlay owns the decision hints; keep the footer quiet.
     if app.pending_perm.is_none() {
         frame.render_widget(
-            Paragraph::new(app.footer())
+            Paragraph::new(app.footer_line())
                 .style(app.theme.note())
                 .block(Block::new().padding(Padding::horizontal(1))),
             footer_area,
@@ -1065,13 +1359,17 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         draw_permission(frame, app, area);
         return;
     }
-    match &app.overlay {
-        Overlay::Help => draw_help(frame, app, area),
-        Overlay::Sessions(sessions) => draw_sessions(frame, app, sessions, area),
-        Overlay::Models(list) => draw_models(frame, app, list, area),
+    let mut overlay = std::mem::replace(&mut app.overlay, Overlay::None);
+    match &mut overlay {
+        Overlay::Help(state) => draw_help(frame, app, state, area),
+        Overlay::Sessions { items, state } => draw_sessions(frame, app, items, state, area),
+        Overlay::Models { list, state } => draw_models(frame, app, list, state, area),
+        Overlay::Efforts { list, state } => draw_efforts(frame, app, list, state, area),
+        Overlay::Completions { items, state } => draw_completions(frame, app, items, state, area),
         Overlay::Peer => draw_peer(frame, app, area),
         Overlay::None => {}
     }
+    app.overlay = overlay;
 }
 
 /// Paint the header as a solid mantle bar: fill every cell, then overlay chips.
@@ -1089,31 +1387,91 @@ fn paint_filled_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 /// Input text with the prompt glyph on the first line, padded to `width` so
 /// the surface wash is a rectangle.
-fn prompt_text(app: &App, width: u16) -> Vec<Line<'static>> {
-    let width = width as usize;
-    let mut lines: Vec<Line<'static>> = Vec::new();
-    for (index, line) in app.input.split('\n').enumerate() {
-        let glyph = if index == 0 { app.prompt_glyph() } else { "  " };
-        let mut spans = vec![
-            Span::styled(glyph, app.theme.accent().patch(app.theme.surface())),
-            Span::styled(line.to_string(), app.theme.user()),
-        ];
-        let painted: usize = spans.iter().map(Span::width).sum();
-        let pad = width.saturating_sub(painted.saturating_add(1));
-        if pad > 0 {
-            spans.push(Span::styled(" ".repeat(pad), app.theme.surface()));
+/// Lay the composer text out into visual rows for an inner width of `width`
+/// columns. Only the very first row carries the prompt glyph; every later row —
+/// whether it came from a newline or from soft wrapping — is gutter-aligned, so
+/// long text expands downward instead of running off the right edge.
+fn prompt_rows(app: &App, width: u16) -> Vec<(bool, String)> {
+    // Two columns go to the glyph/continuation gutter, one is kept free on the
+    // right so the caret at end-of-line still has a cell to sit in.
+    let usable = (width as usize).saturating_sub(3).max(1);
+    let mut rows: Vec<(bool, String)> = Vec::new();
+    for (line_idx, logical) in app.input.split('\n').enumerate() {
+        let chunks = if logical.is_empty() {
+            vec![String::new()]
+        } else {
+            wrap_cols(logical, usable)
+        };
+        for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
+            rows.push((line_idx == 0 && chunk_idx == 0, chunk));
         }
-        lines.push(Line::from(spans));
     }
+    if rows.is_empty() {
+        rows.push((true, String::new()));
+    }
+    rows
+}
+
+fn prompt_text(app: &App, width: u16) -> Vec<Line<'static>> {
+    let cols = width as usize;
+    let rows = prompt_rows(app, width);
+    // Keep the tail visible once the composer is taller than its cap.
+    let skip = rows.len().saturating_sub(INPUT_MAX_ROWS as usize);
+    rows.into_iter()
+        .skip(skip)
+        .map(|(first, text)| {
+            let glyph = if first { app.prompt_glyph() } else { "  " };
+            let mut spans = vec![
+                Span::styled(glyph, app.theme.accent().patch(app.theme.surface())),
+                Span::styled(text, app.theme.user()),
+            ];
+            let painted: usize = spans.iter().map(Span::width).sum();
+            let pad = cols.saturating_sub(painted);
+            if pad > 0 {
+                spans.push(Span::styled(" ".repeat(pad), app.theme.surface()));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn input_cursor_pos(app: &App, inner: Rect) -> Position {
+    let mut remaining = app.cursor;
+    let mut row = 0u16;
+    let lines: Vec<&str> = app.input.split('\n').collect();
     if lines.is_empty() {
-        let glyph = app.prompt_glyph();
-        let pad = width.saturating_sub(Span::raw(glyph).width());
-        lines.push(Line::from(vec![
-            Span::styled(glyph, app.theme.accent().patch(app.theme.surface())),
-            Span::styled(" ".repeat(pad), app.theme.surface()),
-        ]));
+        return Position {
+            x: inner.x + app.prompt_glyph().chars().count() as u16,
+            y: inner.y,
+        };
     }
-    lines
+    for (index, line) in lines.iter().enumerate() {
+        let len = line.chars().count();
+        let glyph = if index == 0 {
+            app.prompt_glyph().chars().count()
+        } else {
+            2
+        };
+        if remaining <= len {
+            let x = inner.x.saturating_add((glyph + remaining) as u16);
+            let y = inner
+                .y
+                .saturating_add(row)
+                .min(inner.y.saturating_add(inner.height.saturating_sub(1)));
+            return Position {
+                x: x.min(inner.x.saturating_add(inner.width.saturating_sub(1))),
+                y,
+            };
+        }
+        remaining = remaining.saturating_sub(len + 1);
+        row = row.saturating_add(1);
+    }
+    Position {
+        x: inner
+            .x
+            .saturating_add(app.prompt_glyph().chars().count() as u16),
+        y: inner.y,
+    }
 }
 
 fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -1141,15 +1499,23 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .scroll((scroll, 0)),
         inner,
     );
+    let content = app.estimated_total_lines().max(1);
+    let position = if app.follow {
+        content.saturating_sub(height)
+    } else {
+        app.scroll as usize
+    };
+    app.scrollbar_state = ScrollbarState::new(content)
+        .position(position)
+        .viewport_content_length(height);
     if overflow > 0 {
-        let mut state = ScrollbarState::new(overflow).position(scroll as usize);
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .style(app.theme.chrome())
-                .begin_symbol(None)
-                .end_symbol(None),
+                .begin_symbol(Some("↑"))
+                .end_symbol(Some("↓")),
             area,
-            &mut state,
+            &mut app.scrollbar_state,
         );
     }
 }
@@ -1209,7 +1575,7 @@ fn draw_welcome(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     app.theme.chip(),
                 ),
             ]),
-            Line::styled("ask anything · ? help · any key to start", app.theme.note()),
+            Line::styled("ask anything · ? help", app.theme.note()),
         ])
         .wrap(Wrap { trim: true })
         .block(overlay_block(app, "mowi")),
@@ -1217,104 +1583,185 @@ fn draw_welcome(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
-fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_help(frame: &mut Frame<'_>, app: &App, state: &mut TableState, area: Rect) {
     let spot = centered(
         area,
         Constraint::Length(area.width.saturating_sub(4).min(64)),
         Constraint::Length(area.height.saturating_sub(2)),
     );
     frame.render_widget(Clear, spot);
-    let items: Vec<ListItem<'static>> = app
+    let rows: Vec<Row<'static>> = app
         .help_rows()
         .into_iter()
         .map(|(key, what)| {
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{key:<18}"), app.theme.chip()),
-                Span::styled(what, app.theme.note()),
-            ]))
+            Row::new(vec![
+                Cell::from(Span::styled(key, app.theme.chip())),
+                Cell::from(Span::styled(what, app.theme.note())),
+            ])
         })
         .collect();
-    frame.render_widget(
-        List::new(items).block(overlay_block(app, "help · esc to close")),
-        spot,
-    );
+    let table = Table::new(rows, [Constraint::Length(20), Constraint::Fill(1)])
+        .header(
+            Row::new(vec!["key", "action"]).style(app.theme.accent().add_modifier(Modifier::BOLD)),
+        )
+        .column_spacing(1)
+        .row_highlight_style(app.theme.accent().add_modifier(Modifier::BOLD))
+        .highlight_symbol("▸ ")
+        .block(overlay_block(app, "help · ↑↓/jk · esc to close"));
+    frame.render_stateful_widget(table, spot, state);
 }
 
-fn draw_sessions(frame: &mut Frame<'_>, app: &App, sessions: &[SessionSummary], area: Rect) {
+fn draw_sessions(
+    frame: &mut Frame<'_>,
+    app: &App,
+    sessions: &[SessionSummary],
+    state: &mut ListState,
+    area: Rect,
+) {
     let spot = centered(
         area,
         Constraint::Length(area.width.saturating_sub(4).min(72)),
         Constraint::Length(area.height.saturating_sub(2)),
     );
     frame.render_widget(Clear, spot);
-    let mut items: Vec<ListItem<'static>> = sessions
-        .iter()
-        .map(|session| {
-            ListItem::new(vec![
-                Line::from(vec![
-                    Span::styled(session.id.clone(), app.theme.chip()),
-                    Span::styled(format!("  {}", session.updated), app.theme.note()),
-                ]),
-                Line::styled(format!("  {}", session.preview), app.theme.context()),
-            ])
-        })
-        .collect();
-    if items.is_empty() {
-        items.push(ListItem::new(Line::styled(
+    let items: Vec<ListItem<'static>> = if sessions.is_empty() {
+        vec![ListItem::new(Line::styled(
             "no stored sessions",
             app.theme.note(),
-        )));
-    }
-    items.push(ListItem::new(Line::styled(
-        "resume with: mowi --session <id>",
-        app.theme.accent(),
-    )));
-    frame.render_widget(
-        List::new(items).block(overlay_block(app, "sessions · esc to close")),
-        spot,
-    );
+        ))]
+    } else {
+        sessions
+            .iter()
+            .map(|session| {
+                ListItem::new(vec![
+                    Line::from(vec![
+                        Span::styled(session.id.clone(), app.theme.chip()),
+                        Span::styled(format!("  {}", session.updated), app.theme.note()),
+                    ]),
+                    Line::styled(format!("  {}", session.preview), app.theme.context()),
+                ])
+            })
+            .collect()
+    };
+    let list = List::new(items)
+        .highlight_symbol("▸ ")
+        .highlight_style(app.theme.accent().add_modifier(Modifier::BOLD))
+        .block(overlay_block(app, "sessions · mowi --session <id> · esc"));
+    frame.render_stateful_widget(list, spot, state);
 }
 
-fn draw_models(frame: &mut Frame<'_>, app: &App, list: &ModelList, area: Rect) {
+fn draw_models(
+    frame: &mut Frame<'_>,
+    app: &App,
+    list: &ModelList,
+    state: &mut ListState,
+    area: Rect,
+) {
+    let title = if list.current.is_empty() {
+        "models · enter set · /model <id> · esc".to_string()
+    } else {
+        format!(
+            "models · current {} · enter set · /model <id> · esc",
+            list.current
+        )
+    };
     let spot = centered(
         area,
         Constraint::Length(area.width.saturating_sub(4).min(64)),
         Constraint::Length(area.height.saturating_sub(2)),
     );
     frame.render_widget(Clear, spot);
-    let mut items: Vec<ListItem<'static>> = Vec::new();
-    let current = if list.current.is_empty() {
-        "current: (none)".to_string()
+    let items: Vec<ListItem<'static>> = if list.models.is_empty() {
+        vec![ListItem::new(Line::styled("no models", app.theme.note()))]
     } else {
-        format!("current: {}", list.current)
+        list.models
+            .iter()
+            .map(|model| {
+                let mark = if model.current || model.id == list.current {
+                    "●"
+                } else {
+                    "·"
+                };
+                let mut label = format!("{mark} {}", model.id);
+                if !model.wire.is_empty() {
+                    label.push_str(&format!("  {}", model.wire));
+                }
+                ListItem::new(Line::styled(label, app.theme.chip()))
+            })
+            .collect()
     };
-    items.push(ListItem::new(Line::styled(current, app.theme.accent())));
-    if list.models.is_empty() {
-        items.push(ListItem::new(Line::styled("no models", app.theme.note())));
-    }
-    for model in &list.models {
-        let mark = if model.current || model.id == list.current {
-            "●"
-        } else {
-            "·"
-        };
-        let mut label = format!("{mark} {}", model.id);
-        if !model.wire.is_empty() {
-            label.push_str(&format!("  {}", model.wire));
-        }
-        items.push(ListItem::new(Line::from(vec![Span::styled(
-            label,
-            app.theme.chip(),
-        )])));
-    }
-    items.push(ListItem::new(Line::styled(
-        "set with: /model gpt-5-mini",
-        app.theme.note(),
-    )));
-    frame.render_widget(
-        List::new(items).block(overlay_block(app, "models · /model <id> · esc to close")),
-        spot,
+    let widget = List::new(items)
+        .highlight_symbol("▸ ")
+        .highlight_style(app.theme.accent().add_modifier(Modifier::BOLD))
+        .block(overlay_block(app, &title));
+    frame.render_stateful_widget(widget, spot, state);
+}
+
+fn draw_efforts(
+    frame: &mut Frame<'_>,
+    app: &App,
+    list: &EffortList,
+    state: &mut ListState,
+    area: Rect,
+) {
+    let title = if list.current.is_empty() {
+        "effort · enter set · esc".to_string()
+    } else {
+        format!("effort · current {} · enter set · esc", list.current)
+    };
+    let spot = centered(
+        area,
+        Constraint::Length(area.width.saturating_sub(4).min(48)),
+        Constraint::Length(area.height.saturating_sub(2).min(16)),
     );
+    frame.render_widget(Clear, spot);
+    let items: Vec<ListItem<'static>> = if list.efforts.is_empty() {
+        vec![ListItem::new(Line::styled("no efforts", app.theme.note()))]
+    } else {
+        list.efforts
+            .iter()
+            .map(|effort| {
+                let mark = if effort.current || effort.id == list.current {
+                    "●"
+                } else {
+                    "·"
+                };
+                ListItem::new(Line::styled(
+                    format!("{mark} {}", effort.id),
+                    app.theme.chip(),
+                ))
+            })
+            .collect()
+    };
+    let widget = List::new(items)
+        .highlight_symbol("▸ ")
+        .highlight_style(app.theme.accent().add_modifier(Modifier::BOLD))
+        .block(overlay_block(app, &title));
+    frame.render_stateful_widget(widget, spot, state);
+}
+
+fn draw_completions(
+    frame: &mut Frame<'_>,
+    app: &App,
+    items: &[String],
+    state: &mut ListState,
+    area: Rect,
+) {
+    let spot = centered(
+        area,
+        Constraint::Length(area.width.saturating_sub(4).min(40)),
+        Constraint::Length(area.height.saturating_sub(2).min(14)),
+    );
+    frame.render_widget(Clear, spot);
+    let rows: Vec<ListItem<'static>> = items
+        .iter()
+        .map(|name| ListItem::new(Line::styled(format!("/{name}"), app.theme.chip())))
+        .collect();
+    let widget = List::new(rows)
+        .highlight_symbol("▸ ")
+        .highlight_style(app.theme.accent().add_modifier(Modifier::BOLD))
+        .block(overlay_block(app, "commands · enter · esc"));
+    frame.render_stateful_widget(widget, spot, state);
 }
 
 fn draw_peer(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -1496,18 +1943,20 @@ fn handle_key(
         }
     }
 
-    // The welcome splash dismisses on any key and swallows it.
+    // Welcome banner is chrome only: the key still reaches the composer.
     if app.welcome {
         app.welcome = false;
-        return Ok(());
     }
 
-    // Overlays: esc (or the toggle key) closes; everything else is inert.
+    // Overlays: esc closes; arrows/jk move; enter picks.
     if app.overlay.is_open() {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => app.overlay = Overlay::None,
             KeyCode::Char('?') => app.overlay = Overlay::None,
             KeyCode::Char('c') if ctrl => app.quit = true,
+            KeyCode::Up | KeyCode::Char('k') => app.overlay_move(-1),
+            KeyCode::Down | KeyCode::Char('j') => app.overlay_move(1),
+            KeyCode::Enter => overlay_activate(client, app)?,
             _ => {}
         }
         return Ok(());
@@ -1520,7 +1969,7 @@ fn handle_key(
             }
             app.quit = true;
         }
-        KeyCode::Char('j') if ctrl => app.input.push('\n'),
+        KeyCode::Char('j') if ctrl => app.insert_char('\n'),
         KeyCode::Char('l') if ctrl => app.clear_transcript(),
         KeyCode::Char('p') if ctrl => {
             if app.toggle_peer_expand() {
@@ -1537,8 +1986,8 @@ fn handle_key(
             app.status = format!("mode: {mode}");
         }
         // ctrl+/ arrives as Char('/') with CONTROL on most terminals.
-        KeyCode::Char('/') if ctrl => app.overlay = Overlay::Help,
-        KeyCode::Char('?') if app.input.is_empty() => app.overlay = Overlay::Help,
+        KeyCode::Char('/') if ctrl => app.overlay = Overlay::help(),
+        KeyCode::Char('?') if app.input.is_empty() => app.overlay = Overlay::help(),
         KeyCode::Esc => {
             if app.dismiss_overlay() {
             } else if app.busy || turn.is_some() {
@@ -1560,23 +2009,28 @@ fn handle_key(
                 } else {
                     app.status = "no turn in flight".into();
                 }
-                app.input.clear();
+                app.clear_input();
             } else if text.starts_with('/') {
                 handle_slash(&text, client, app, turn, slash_rx)?;
-                app.input.clear();
+                app.clear_input();
             } else if app.busy || turn.is_some() {
                 if !text.is_empty() {
                     app.enqueue_prompt(text);
                 }
-                app.input.clear();
+                app.clear_input();
             } else if !text.is_empty() {
                 *turn = Some(start_prompt(client, app, &text)?);
-                app.input.clear();
+                app.clear_input();
             }
         }
-        KeyCode::Backspace => {
-            app.input.pop();
+        KeyCode::Backspace => app.backspace_char(),
+        KeyCode::Tab => {
+            if app.input.starts_with('/') {
+                app.complete_slash();
+            }
         }
+        KeyCode::Left => app.move_cursor(-1),
+        KeyCode::Right => app.move_cursor(1),
         KeyCode::Char('u') if ctrl => {
             leave_follow(app, 5);
         }
@@ -1592,34 +2046,57 @@ fn handle_key(
         KeyCode::Down => {
             scroll_down(app, 1);
         }
-        KeyCode::Char(c) => app.input.push(c),
+        KeyCode::Char(c) => app.insert_char(c),
         _ => {}
     }
     Ok(())
 }
 
-/// Where a typed `/name` is handled.
-///
-/// The router exists so local commands can never reach the wire: `/quit` was
-/// once forwarded to `mow` as an unknown slash command instead of quitting.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SlashRoute {
-    /// Quit the UI (cancelling an in-flight turn first).
-    Quit,
-    /// Handled by the UI; never sent to the host.
-    Local,
-    /// Forwarded to the host as an RPC `slash` call.
-    Rpc,
-}
-
-/// Route a slash command name (without the leading `/`).
-pub fn slash_route(name: &str) -> SlashRoute {
-    match name {
-        "quit" | "exit" | "q" => SlashRoute::Quit,
-        "search" | "copy" | "edit" | "retry" | "help" | "sessions" | "status" | "steer"
-        | "model" => SlashRoute::Local,
-        _ => SlashRoute::Rpc,
+fn overlay_activate(client: &mut Client, app: &mut App) -> Result<(), Error> {
+    let selection = app.overlay_selection();
+    let picker = match &app.overlay {
+        Overlay::Help(_) | Overlay::Peer => "close",
+        Overlay::Sessions { .. } => "session",
+        Overlay::Models { .. } => "model",
+        Overlay::Efforts { .. } => "effort",
+        Overlay::Completions { .. } => "complete",
+        Overlay::None => "none",
+    };
+    match picker {
+        "close" => app.overlay = Overlay::None,
+        "session" => {
+            if let Some(id) = selection {
+                app.status = format!("resume with: mowi --session {id}");
+                app.entries
+                    .push(Entry::Note(format!("resume with: mowi --session {id}")));
+            }
+            app.overlay = Overlay::None;
+        }
+        "model" => {
+            if let Some(id) = selection {
+                let model = client.model_set(&id, Duration::from_secs(20))?;
+                app.apply_model_set(&model);
+            } else {
+                app.overlay = Overlay::None;
+            }
+        }
+        "effort" => {
+            if let Some(id) = selection {
+                let effort = client.effort_set(&id, Duration::from_secs(20))?;
+                app.apply_effort_set(&effort);
+            } else {
+                app.overlay = Overlay::None;
+            }
+        }
+        "complete" => {
+            if let Some(name) = selection {
+                app.set_input(format!("/{name} "));
+            }
+            app.overlay = Overlay::None;
+        }
+        _ => {}
     }
+    Ok(())
 }
 
 fn handle_slash(
@@ -1634,15 +2111,29 @@ fn handle_slash(
         return Ok(());
     };
     let args: Vec<String> = words.map(ToString::to_string).collect();
-    if slash_route(name) == SlashRoute::Quit {
-        // Same shape as ctrl+c: cancel an in-flight turn, then leave.
-        if app.busy || turn.is_some() {
-            let _ = client.cancel();
+    match slash_route(name, &app.slash_commands) {
+        SlashRoute::Quit => {
+            if app.busy || turn.is_some() {
+                let _ = client.cancel();
+            }
+            app.quit = true;
+            return Ok(());
         }
-        app.quit = true;
-        return Ok(());
+        SlashRoute::Unknown => {
+            app.note_unknown_slash(name);
+            return Ok(());
+        }
+        SlashRoute::Rpc => {
+            if app.refuses_exclusive_slash(name) {
+                app.status = format!("/{name} is unavailable while busy");
+            } else {
+                *slash_rx = Some(client.slash(name, &args, false)?);
+            }
+            return Ok(());
+        }
+        SlashRoute::Local => {}
     }
-    match name {
+    match canonical_slash(name) {
         "search" => {
             app.search(&args.join(" "));
         }
@@ -1666,12 +2157,25 @@ fn handle_slash(
             }
         }
         "help" => {
-            app.slash_commands = client.slash_list(Duration::from_secs(20))?;
-            app.overlay = Overlay::Help;
+            app.overlay = Overlay::help();
         }
-        "sessions" => {
-            let sessions = client.sessions(Duration::from_secs(20))?;
-            app.overlay = Overlay::Sessions(sessions);
+        "clear" => {
+            app.clear_transcript();
+        }
+        "sessions" | "resume" => {
+            if canonical_slash(name) == "resume" && !args.is_empty() {
+                let id = &args[0];
+                app.status = format!("resume with: mowi --session {id}");
+                app.entries
+                    .push(Entry::Note(format!("resume with: mowi --session {id}")));
+            } else {
+                let sessions = client.sessions(Duration::from_secs(20))?;
+                app.overlay = Overlay::sessions(sessions);
+            }
+        }
+        "transcript" => {
+            let messages = client.transcript(Duration::from_secs(20))?;
+            app.load_transcript(messages);
         }
         "model" => {
             if args.is_empty() {
@@ -1682,21 +2186,25 @@ fn handle_slash(
                 app.apply_model_set(&model);
             }
         }
+        "effort" => {
+            if args.is_empty() {
+                let list = client.effort_list(Duration::from_secs(20))?;
+                app.apply_effort_list(list);
+            } else {
+                let effort = client.effort_set(&args.join(" "), Duration::from_secs(20))?;
+                app.apply_effort_set(&effort);
+            }
+        }
         "status" => {
             let status = client.status(Duration::from_secs(20))?;
             app.apply_status(&status);
             app.entries.push(Entry::Note(format!("status: {status}")));
         }
+        "steer" => {
+            app.status = "steer is /steer <text> while a turn is running".into();
+        }
         _ => {
-            if slash_route(name) != SlashRoute::Rpc {
-                // A local command with no handler here (e.g. `/steer`, taken
-                // by the key path) must still never reach the wire.
-                app.status = format!("/{name} is handled locally");
-            } else if app.refuses_exclusive_slash(name) {
-                app.status = format!("/{name} is unavailable while busy");
-            } else {
-                *slash_rx = Some(client.slash(name, &args, false)?);
-            }
+            app.status = format!("/{name} is handled locally");
         }
     }
     Ok(())
@@ -1857,17 +2365,36 @@ mod tests {
     }
 
     #[test]
-    fn welcome_splash_paints_and_any_key_dismisses_it() {
+    fn welcome_banner_paints_and_clears_without_swallowing_a_key() {
         let mut app = App::new(SessionInfo::default());
+        app.theme = Theme { colored: true };
         app.welcome = true;
         let out = render(&mut app, 60, 16);
-        assert!(out.contains("any key to start"), "{out}");
+        assert!(out.contains("ask anything"), "{out}");
+        assert!(!out.contains("any key"), "{out}");
 
-        // handle_key needs a Client; the splash branch is the state machine.
-        assert!(app.dismiss_overlay());
-        assert!(!app.welcome);
+        // Typing clears the banner and still lands in the composer: no key is
+        // spent just to dismiss the splash.
+        app.welcome = false;
+        app.input.push('h');
         let out = render(&mut app, 60, 16);
-        assert!(!out.contains("any key to start"), "{out}");
+        assert!(!out.contains("ask anything"), "{out}");
+        assert!(out.contains("❯ h"), "{out}");
+    }
+
+    #[test]
+    fn long_prompt_wraps_and_grows_the_composer() {
+        let mut app = App::new(SessionInfo::default());
+        app.input = "x".repeat(120);
+        // 60 cols of frame → 56 of textarea inner width, so 120 chars need 3 rows.
+        assert!(input_height(&app, 56) >= 3, "{}", input_height(&app, 56));
+        let out = render(&mut app, 60, 20);
+        for row in out.lines() {
+            assert!(row.chars().count() <= 60, "{row}");
+        }
+        let rows = prompt_rows(&app, 56);
+        assert!(rows.len() >= 3, "{rows:?}");
+        assert!(rows[0].0 && !rows[1].0, "{rows:?}");
     }
 
     #[test]
@@ -1879,7 +2406,7 @@ mod tests {
             exclusive: true,
             aliases: vec![],
         });
-        app.overlay = Overlay::Help;
+        app.overlay = Overlay::help();
         let out = render(&mut app, 70, 24);
         assert!(out.contains("help"), "{out}");
         assert!(out.contains("ctrl+j"), "{out}");
@@ -1897,7 +2424,7 @@ mod tests {
     #[test]
     fn sessions_overlay_lists_rows_and_resume_hint() {
         let mut app = App::new(SessionInfo::default());
-        app.overlay = Overlay::Sessions(vec![SessionSummary {
+        app.overlay = Overlay::sessions(vec![SessionSummary {
             id: "s-42".into(),
             updated: "today".into(),
             preview: "port the header".into(),
@@ -1954,6 +2481,63 @@ mod tests {
     }
 
     #[test]
+    fn effort_overlay_lists_ids_and_set_updates_status() {
+        let mut app = App::new(SessionInfo::default());
+        app.apply_effort_list(EffortList {
+            current: "none".into(),
+            default: "none".into(),
+            efforts: vec![
+                crate::rpc::EffortInfo {
+                    id: "none".into(),
+                    current: true,
+                },
+                crate::rpc::EffortInfo {
+                    id: "high".into(),
+                    current: false,
+                },
+            ],
+        });
+        assert_eq!(app.effort, "none");
+        assert_eq!(app.overlay_selection().as_deref(), Some("none"));
+        app.overlay_move(1);
+        assert_eq!(app.overlay_selection().as_deref(), Some("high"));
+        let out = render(&mut app, 72, 16);
+        assert!(out.contains("high"), "{out}");
+        assert!(out.contains("current"), "{out}");
+
+        app.apply_effort_set("high");
+        assert_eq!(app.effort, "high");
+        assert!(app.status.contains("high"), "{}", app.status);
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn unknown_slash_is_a_local_error_and_tab_completes() {
+        let mut app = App::new(SessionInfo::default());
+        app.slash_commands.push(SlashCommand {
+            name: "review".into(),
+            summary: "review changes".into(),
+            exclusive: true,
+            aliases: vec![],
+        });
+        app.note_unknown_slash("bogus");
+        let note = match app.entries.last() {
+            Some(Entry::Note(text)) => text.clone(),
+            other => panic!("want note, got {other:?}"),
+        };
+        assert!(note.contains("unknown /bogus"), "{note}");
+        assert!(note.contains("/effort"), "{note}");
+        assert!(note.contains("/review"), "{note}");
+
+        app.set_input("/eff".into());
+        app.complete_slash();
+        assert_eq!(app.input, "/effort ");
+        app.set_input("/".into());
+        app.complete_slash();
+        assert!(matches!(app.overlay, Overlay::Completions { .. }));
+    }
+
+    #[test]
     fn permission_overlay_shows_args_and_guards_early_keys() {
         let mut app = App::new(SessionInfo::default());
         app.on_notification(&Notification {
@@ -1979,11 +2563,11 @@ mod tests {
     fn ctrl_j_grows_the_input_area() {
         let mut app = App::new(SessionInfo::default());
         app.theme = Theme { colored: true };
-        assert_eq!(input_height(&app), 1);
+        assert_eq!(input_height(&app, 56), 1);
         app.input.push_str("one");
         app.input.push('\n');
         app.input.push_str("two");
-        assert_eq!(input_height(&app), 2);
+        assert_eq!(input_height(&app, 56), 2);
         let out = render(&mut app, 60, 16);
         assert!(out.contains("❯ one"), "{out}");
         assert!(out.contains("  two"), "{out}");
@@ -2045,18 +2629,24 @@ mod tests {
     #[test]
     fn quit_commands_are_local_and_never_reach_the_wire() {
         for name in ["quit", "exit", "q"] {
-            assert_eq!(slash_route(name), SlashRoute::Quit, "/{name}");
+            assert_eq!(slash_route(name, &[]), SlashRoute::Quit, "/{name}");
         }
-        // Everything the UI answers itself stays off the wire too.
         for name in [
             "help", "search", "copy", "retry", "edit", "steer", "sessions", "status", "model",
+            "effort", "clear",
         ] {
-            assert_eq!(slash_route(name), SlashRoute::Local, "/{name}");
+            assert_eq!(slash_route(name, &[]), SlashRoute::Local, "/{name}");
         }
-        // Pack commands are forwarded to the host.
-        for name in ["review", "sec", "goal"] {
-            assert_eq!(slash_route(name), SlashRoute::Rpc, "/{name}");
-        }
+        let packs = [SlashCommand {
+            name: "review".into(),
+            summary: "review changes".into(),
+            exclusive: true,
+            aliases: vec![],
+        }];
+        assert_eq!(slash_route("review", &packs), SlashRoute::Rpc);
+        assert_eq!(slash_route("review", &[]), SlashRoute::Unknown);
+        assert_eq!(slash_route("bogus", &[]), SlashRoute::Unknown);
+        assert_eq!(slash_route("goal", &[]), SlashRoute::Unknown);
     }
 
     #[test]

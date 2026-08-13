@@ -92,6 +92,21 @@ pub struct ModelList {
     pub current: String,
 }
 
+/// One effort from `effort.list`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EffortInfo {
+    pub id: String,
+    pub current: bool,
+}
+
+/// `effort.list` result.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EffortList {
+    pub efforts: Vec<EffortInfo>,
+    pub current: String,
+    pub default: String,
+}
+
 /// A slash command advertised by `slash.list`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SlashCommand {
@@ -513,6 +528,27 @@ impl Client {
             .to_string())
     }
 
+    /// List reasoning efforts the host can switch to.
+    pub fn effort_list(&mut self, timeout: Duration) -> Result<EffortList, Error> {
+        let value = self.call("effort.list", None, timeout)?;
+        decode_effort_list(&value)
+    }
+
+    /// Switch the session effort. Control method: answered while busy.
+    pub fn effort_set(&mut self, id: &str, timeout: Duration) -> Result<String, Error> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(Error::Protocol("effort id must not be empty".into()));
+        }
+        let value = self.call("effort.set", Some(json!({ "id": id })), timeout)?;
+        Ok(value
+            .get("effort")
+            .and_then(Value::as_str)
+            .filter(|effort| !effort.is_empty())
+            .unwrap_or(id)
+            .to_string())
+    }
+
     /// Start a turn. The result arrives later (the channel stays open while
     /// `event` notifications stream).
     pub fn prompt(&mut self, text: &str) -> Result<Receiver<Result<Value, Error>>, Error> {
@@ -571,6 +607,44 @@ pub fn decode_model_list(value: &Value) -> Result<ModelList, Error> {
         })
         .unwrap_or_default();
     Ok(ModelList { models, current })
+}
+
+pub fn decode_effort_list(value: &Value) -> Result<EffortList, Error> {
+    let rows = value
+        .get("efforts")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::Protocol("effort.list result has no efforts array".into()))?;
+    let efforts: Vec<EffortInfo> = rows
+        .iter()
+        .map(|row| {
+            Ok::<_, Error>(EffortInfo {
+                id: string_field(row, "id")?,
+                current: row.get("current").and_then(Value::as_bool).unwrap_or(false),
+            })
+        })
+        .collect::<Result<Vec<EffortInfo>, Error>>()?;
+    let current = value
+        .get("current")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            efforts
+                .iter()
+                .find(|effort| effort.current)
+                .map(|effort| effort.id.clone())
+        })
+        .unwrap_or_default();
+    let default = value
+        .get("default")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    Ok(EffortList {
+        efforts,
+        current,
+        default,
+    })
 }
 
 fn decode_sessions(value: &Value) -> Result<Vec<SessionSummary>, Error> {
@@ -749,5 +823,22 @@ mod tests {
         assert_eq!(list.models[0].wire, "openai-responses");
         assert_eq!(list.models[1].id, "claude-sonnet-4");
         assert!(list.models[1].wire.is_empty());
+    }
+
+    #[test]
+    fn parses_effort_list_shape() {
+        let list = decode_effort_list(&serde_json::json!({
+            "efforts": [
+                {"id": "none", "current": false},
+                {"id": "high", "current": true}
+            ],
+            "current": "high",
+            "default": "none"
+        }))
+        .unwrap();
+        assert_eq!(list.current, "high");
+        assert_eq!(list.default, "none");
+        assert_eq!(list.efforts.len(), 2);
+        assert!(list.efforts[1].current);
     }
 }

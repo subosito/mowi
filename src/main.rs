@@ -7,6 +7,7 @@
 mod app;
 mod render;
 mod rpc;
+mod slash;
 mod theme;
 
 use std::io::{self, Write};
@@ -174,6 +175,9 @@ fn tui(cli: &Cli) -> Result<(), rpc::Error> {
     // Splash only for a fresh session (no transcript seed).
     app.welcome = app.entries.is_empty();
     app.slash_commands = client.slash_list(HANDSHAKE_TIMEOUT)?;
+    if let Ok(list) = client.effort_list(HANDSHAKE_TIMEOUT) {
+        app.effort = list.current;
+    }
 
     enable_raw_mode().map_err(rpc::Error::Io)?;
     let mut stdout = io::stdout();

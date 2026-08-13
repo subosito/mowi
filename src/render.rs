@@ -53,19 +53,19 @@ pub fn split_markdown_and_diffs(text: &str) -> Vec<Segment> {
     let mut i = 0;
     while i < lines.len() {
         if let Some(info) = fence_info(lines[i]) {
-            if !in_code && is_diff_fence_lang(info) {
-                if let Some(rel) = lines[i + 1..]
+            if !in_code
+                && is_diff_fence_lang(info)
+                && let Some(rel) = lines[i + 1..]
                     .iter()
                     .position(|line| fence_info(line).is_some())
-                {
-                    flush_md(&mut out, &mut md);
-                    let body = lines[i + 1..i + 1 + rel].join("\n");
-                    if !body.trim().is_empty() {
-                        out.push(Segment::Diff(body));
-                    }
-                    i += rel + 2;
-                    continue;
+            {
+                flush_md(&mut out, &mut md);
+                let body = lines[i + 1..i + 1 + rel].join("\n");
+                if !body.trim().is_empty() {
+                    out.push(Segment::Diff(body));
                 }
+                i += rel + 2;
+                continue;
             }
             in_code = !in_code;
         }
@@ -288,7 +288,7 @@ fn expand_tabs(text: &str, mut col: usize) -> String {
     for ch in text.chars() {
         if ch == '\t' {
             let n = TAB - (col % TAB);
-            out.extend(std::iter::repeat(' ').take(n));
+            out.extend(std::iter::repeat_n(' ', n));
             col += n;
         } else {
             out.push(ch);
