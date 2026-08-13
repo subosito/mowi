@@ -7,11 +7,7 @@ use ratatui::{
 use crate::theme::Theme;
 
 pub fn is_unified_diff(text: &str) -> bool {
-    let has_hunk = text.lines().any(|line| line.starts_with("@@"));
-    let has_change = text
-        .lines()
-        .any(|line| line.starts_with('+') || line.starts_with('-'));
-    has_hunk || (has_change && text.lines().count() > 1)
+    text.lines().any(|line| line.starts_with("@@"))
 }
 
 pub fn markdown_lines(text: &str, theme: Theme) -> Vec<Line<'static>> {
@@ -87,4 +83,24 @@ pub fn diff_lines(text: &str, theme: Theme) -> Vec<Line<'static>> {
             }
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_unified_diff;
+
+    #[test]
+    fn requires_a_hunk_header() {
+        assert!(is_unified_diff("@@ -1,1 +1,1 @@\n-old\n+new"));
+    }
+
+    #[test]
+    fn prose_plus_minus_is_not_a_diff() {
+        assert!(!is_unified_diff("use + and - in prose\nsecond line"));
+    }
+
+    #[test]
+    fn markdown_list_is_not_a_diff() {
+        assert!(!is_unified_diff("- item\n- item2"));
+    }
 }
