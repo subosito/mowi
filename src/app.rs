@@ -62,7 +62,7 @@ fn format_tokens(tokens: u64) -> String {
 }
 
 /// UI state. `draw` is pure over this struct so `TestBackend` can assert on it.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct App {
     pub session: SessionInfo,
     pub entries: Vec<Entry>,
@@ -78,6 +78,27 @@ pub struct App {
     pub pending_perm: Option<PermissionRequest>,
     pub usage: Usage,
     pub slash_commands: Vec<SlashCommand>,
+    pub last_view_h: u16,
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self {
+            session: SessionInfo::default(),
+            entries: Vec::new(),
+            input: String::new(),
+            busy: false,
+            live: String::new(),
+            status: String::new(),
+            scroll: 0,
+            follow: false,
+            quit: false,
+            pending_perm: None,
+            usage: Usage::default(),
+            slash_commands: Vec::new(),
+            last_view_h: 1,
+        }
+    }
 }
 
 impl App {
@@ -183,18 +204,25 @@ impl App {
             self.usage.peer_tokens += token_count(params, "output_tokens");
         }
         match kind {
-            "run.start" => {
+            "loop.run.start" | "run.start" => {
                 self.busy = true;
                 self.status = "running".into();
             }
-            "run.end" => {
+            "loop.run.end" | "run.end" => {
                 self.busy = false;
                 self.status.clear();
             }
-            "tool.start" => {
-                if let Some(name) = params.get("name").and_then(|v| v.as_str()) {
+            k if k.ends_with("tool.start") || k == "tool.start" => {
+                if let Some(name) = params
+                    .get("tool")
+                    .or_else(|| params.get("name"))
+                    .and_then(|v| v.as_str())
+                {
                     self.status = format!("tool · {name}");
                 }
+            }
+            k if k.ends_with("tool.end") || k == "tool.end" => {
+                self.status.clear();
             }
             _ => {}
         }
@@ -266,7 +294,35 @@ fn token_count(value: &Value, field: &str) -> u64 {
 }
 
 /// Paint header / transcript / input / footer.
-pub fn draw(frame: &mut Frame<'_>, app: &App) {
+
+fn max_scroll(app: &App) -> u16 {
+    let n = app.transcript_lines().len() as u16;
+    let h = app.last_view_h.max(1);
+    n.saturating_sub(h)
+}
+
+fn leave_follow(app: &mut App, n: u16) {
+    if app.follow {
+        app.follow = false;
+        app.scroll = max_scroll(app).saturating_sub(n);
+        return;
+    }
+    app.scroll = app.scroll.saturating_sub(n);
+}
+
+fn scroll_down(app: &mut App, n: u16) {
+    if app.follow {
+        return;
+    }
+    let max = max_scroll(app);
+    app.scroll = app.scroll.saturating_add(n).min(max);
+    if app.scroll >= max {
+        app.follow = true;
+        app.scroll = 0;
+    }
+}
+
+pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -282,12 +338,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
         areas[0],
     );
 
+    app.last_view_h = areas[1].height.max(1);
     let lines = app.transcript_lines();
-    let height = areas[1].height.max(1) as usize;
-    let scroll = if app.follow || app.scroll == u16::MAX {
+    let height = app.last_view_h as usize;
+    let scroll = if app.follow {
         lines.len().saturating_sub(height) as u16
     } else {
-        app.scroll
+        app.scroll.min(lines.len().saturating_sub(height) as u16)
     };
     frame.render_widget(
         Paragraph::new(lines)
@@ -446,23 +503,16 @@ fn handle_key(
             app.input.pop();
         }
         KeyCode::Char('u') if ctrl => {
-            app.follow = false;
-            app.scroll = app.scroll.saturating_sub(5);
+            leave_follow(app, 5);
         }
         KeyCode::Char('d') if ctrl => {
-            app.scroll = app.scroll.saturating_add(5);
-            if app.scroll as usize >= app.transcript_lines().len() {
-                app.follow = true;
-                app.scroll = u16::MAX;
-            }
+            scroll_down(app, 5);
         }
         KeyCode::Up => {
-            app.follow = false;
-            app.scroll = app.scroll.saturating_sub(1);
+            leave_follow(app, 1);
         }
         KeyCode::Down => {
-            app.follow = false;
-            app.scroll = app.scroll.saturating_add(1);
+            scroll_down(app, 1);
         }
         KeyCode::Char(c) => app.input.push(c),
         _ => {}
@@ -527,7 +577,7 @@ mod tests {
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
 
-    fn render(app: &App, w: u16, h: u16) -> String {
+    fn render(app: &mut App, w: u16, h: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
         terminal.draw(|f| draw(f, app)).unwrap();
         let buf = terminal.backend().buffer().clone();
@@ -552,7 +602,7 @@ mod tests {
         app.entries.push(Entry::User("hi".into()));
         app.live.push_str("hello");
 
-        let out = render(&app, 48, 6);
+        let out = render(&mut app, 48, 6);
         assert!(out.contains("mowi"), "{out}");
         assert!(out.contains("gpt-5-mini"), "{out}");
         assert!(out.contains("abcdef01"), "{out}");

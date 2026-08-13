@@ -227,15 +227,22 @@ impl SessionInfo {
 /// Peer chunks (`harness.delegate.*`) are deliberately excluded: they are not
 /// the host answer.
 pub fn token_delta(params: &Value) -> Option<&str> {
-    let kind = params.get("type").and_then(|t| t.as_str()).unwrap_or("");
-    if kind.starts_with("harness.delegate") {
+    let kind = event_type(params);
+    if kind.contains("delegate") {
         return None;
     }
-    let delta = params.get("delta").and_then(|d| d.as_str());
-    if kind.contains("token") {
-        return delta.or_else(|| params.get("text").and_then(|t| t.as_str()));
+    // Only host answer tokens. Reasoning / tool deltas must not weld into the live answer.
+    if !kind.contains("token") {
+        return None;
     }
-    delta
+    params
+        .get("delta")
+        .and_then(|d| d.as_str())
+        .filter(|d| !d.is_empty())
+}
+
+fn event_type(params: &Value) -> &str {
+    params.get("type").and_then(|t| t.as_str()).unwrap_or("")
 }
 
 type Pending = Arc<Mutex<HashMap<u64, Sender<Result<Value, Error>>>>>;
@@ -375,36 +382,13 @@ impl Client {
     /// Return the resumable sessions known to the host.
     pub fn sessions(&mut self, timeout: Duration) -> Result<Vec<SessionSummary>, Error> {
         let value = self.call("sessions", None, timeout)?;
-        let rows = value
-            .get("sessions")
-            .and_then(Value::as_array)
-            .ok_or_else(|| Error::Protocol("sessions result has no sessions array".into()))?;
-        rows.iter()
-            .map(|row| {
-                Ok(SessionSummary {
-                    id: string_field(row, "id")?,
-                    updated: string_field(row, "updated")?,
-                    preview: string_field(row, "preview")?,
-                })
-            })
-            .collect()
+        decode_sessions(&value)
     }
 
     /// Return the stored transcript.
     pub fn transcript(&mut self, timeout: Duration) -> Result<Vec<TranscriptMessage>, Error> {
         let value = self.call("transcript", None, timeout)?;
-        let rows = value
-            .get("messages")
-            .and_then(Value::as_array)
-            .ok_or_else(|| Error::Protocol("transcript result has no messages array".into()))?;
-        rows.iter()
-            .map(|row| {
-                Ok(TranscriptMessage {
-                    role: string_field(row, "role")?,
-                    content: string_field(row, "content")?,
-                })
-            })
-            .collect()
+        decode_transcript(&value)
     }
 
     /// Redirect the active turn.
@@ -519,6 +503,37 @@ fn string_field(value: &Value, field: &str) -> Result<String, Error> {
         .ok_or_else(|| Error::Protocol(format!("missing string field {field:?}")))
 }
 
+fn decode_sessions(value: &Value) -> Result<Vec<SessionSummary>, Error> {
+    let rows = value
+        .get("sessions")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::Protocol("sessions result has no sessions array".into()))?;
+    rows.iter()
+        .map(|row| {
+            Ok(SessionSummary {
+                id: string_field(row, "id")?,
+                updated: string_field(row, "updated")?,
+                preview: string_field(row, "preview")?,
+            })
+        })
+        .collect()
+}
+
+fn decode_transcript(value: &Value) -> Result<Vec<TranscriptMessage>, Error> {
+    let rows = value
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::Protocol("transcript result has no messages array".into()))?;
+    rows.iter()
+        .map(|row| {
+            Ok(TranscriptMessage {
+                role: string_field(row, "role")?,
+                content: string_field(row, "content")?,
+            })
+        })
+        .collect()
+}
+
 impl Drop for Client {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -631,14 +646,20 @@ mod tests {
 
     #[test]
     fn parses_sessions_and_transcript_shapes() {
-        let sessions = serde_json::json!({
+        let sessions = decode_sessions(&serde_json::json!({
             "sessions": [{"id":"s1","updated":"today","preview":"hello"}]
-        });
-        assert_eq!(sessions["sessions"][0]["id"], "s1");
+        }))
+        .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "s1");
+        assert_eq!(sessions[0].preview, "hello");
 
-        let transcript = serde_json::json!({
+        let turns = decode_transcript(&serde_json::json!({
             "messages": [{"role":"user","content":"hi"},{"role":"assistant","content":"hello"}]
-        });
-        assert_eq!(transcript["messages"][1]["role"], "assistant");
+        }))
+        .unwrap();
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[1].content, "hello");
     }
 }
