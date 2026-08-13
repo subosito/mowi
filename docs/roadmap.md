@@ -76,6 +76,22 @@ Ratatui widgets carry the chrome; the transcript stays the product.
 Still deliberately out: `/model` catalog (not on the wire), a remappable
 keymap file, PTY cell smoke.
 
+## Phase 5 — production chrome & flashdiff bands ✓
+
+- **`/quit` `/exit` `/q` are local.** A `slash_route` name router runs before
+  the RPC fallback, so a UI command can never be forwarded to the host as an
+  unknown slash. Quit cancels an in-flight turn first, like ctrl+c.
+- **Flashdiff bands** — add/del rows pad to the transcript width so the wash is
+  a rectangle, with `+` / `−` (U+2212) signs in accent, muted `@@` and file
+  headers, unwashed context rows, and an inverted word chip on the changed span
+  of a `-`/`+` pair. `NO_COLOR` keeps signs and structure without RGB.
+- **Chrome** — header chips close with a hairline rule; the transcript reserves
+  the scrollbar column so bands never run under the thumb; the input sits in a
+  bordered block with a `❯` glyph (`>` when colour is off); the footer goes
+  quiet while the permission overlay owns the decision.
+- **Permission overlay** — the tool name titles the block and `y/n/a` sits on
+  the title-right, with args as a wrapped Paragraph.
+
 ## Non-goals
 
 - In-app Engine

@@ -75,6 +75,61 @@ impl Theme {
         }
     }
 
+    /// Diff meta rows: `@@` hunk headers and `---` / `+++` file headers.
+    pub fn diff_meta(self) -> Style {
+        if self.colored {
+            Style::default().fg(Color::Rgb(127, 132, 156))
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        }
+    }
+
+    /// Sign column of an added line: accent on the add band.
+    pub fn add_sign(self) -> Style {
+        if self.colored {
+            Style::default()
+                .fg(Color::Rgb(166, 227, 161))
+                .bg(Color::Rgb(51, 65, 56))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        }
+    }
+
+    /// Sign column of a removed line: accent on the del band.
+    pub fn del_sign(self) -> Style {
+        if self.colored {
+            Style::default()
+                .fg(Color::Rgb(243, 139, 168))
+                .bg(Color::Rgb(77, 50, 64))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        }
+    }
+
+    /// Word-diff chip inside an added line: inverted against the band.
+    pub fn add_chip(self) -> Style {
+        if self.colored {
+            Style::default()
+                .fg(Color::Rgb(30, 30, 46))
+                .bg(Color::Rgb(166, 227, 161))
+        } else {
+            Style::default().add_modifier(Modifier::REVERSED)
+        }
+    }
+
+    /// Word-diff chip inside a removed line: inverted against the band.
+    pub fn del_chip(self) -> Style {
+        if self.colored {
+            Style::default()
+                .fg(Color::Rgb(30, 30, 46))
+                .bg(Color::Rgb(243, 139, 168))
+        } else {
+            Style::default().add_modifier(Modifier::REVERSED)
+        }
+    }
+
     /// Quiet chrome: block borders, rules, hints.
     pub fn chrome(self) -> Style {
         if self.colored {
