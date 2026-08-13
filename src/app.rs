@@ -21,6 +21,7 @@ use ratatui::{
     Frame, Terminal,
     backend::Backend,
     layout::{Alignment, Constraint, Direction, Flex, Layout, Rect},
+    style::Style,
     text::{Line, Span},
     widgets::{
         Block, BorderType, Clear, List, ListItem, Padding, Paragraph, Scrollbar,
@@ -29,7 +30,7 @@ use ratatui::{
 };
 use serde_json::Value;
 
-use crate::render::{Segment, diff_title, fill_span, markdown_lines, split_markdown_and_diffs};
+use crate::render::{Segment, diff_title, markdown_lines, split_markdown_and_diffs};
 use crate::rpc::{
     Client, Error, Notification, PermissionRequest, SessionInfo, SessionSummary, SlashCommand,
     TranscriptMessage, token_delta,
@@ -307,15 +308,21 @@ impl App {
     }
 
     fn entry_lines<'a>(&self, entry: &'a Entry) -> Vec<Line<'a>> {
+        let width = self.last_view_w.max(8) as usize;
         match entry {
             Entry::User(t) => self.user_lines(t),
             Entry::Assistant(t) => self.assistant_lines(t),
-            Entry::Note(t) => vec![Line::styled(t.as_str(), self.theme.note())],
+            Entry::Note(t) => {
+                wrap_styled_line(Line::styled(t.to_string(), self.theme.note()), width)
+            }
             Entry::Tool { name, duration_ms } => {
                 let suffix = duration_ms
                     .map(|ms| format!(" · {:.1}s", ms as f64 / 1000.0))
                     .unwrap_or_default();
-                vec![Line::styled(format!("⚙ {name}{suffix}"), self.theme.note())]
+                wrap_styled_line(
+                    Line::styled(format!("⚙ {name}{suffix}"), self.theme.note()),
+                    width,
+                )
             }
         }
     }
@@ -339,7 +346,7 @@ impl App {
     fn user_band_row(&self, body: &str, width: usize) -> Line<'static> {
         let mut spans = Vec::new();
         if self.theme.colored {
-            spans.push(fill_span(1, self.theme.overlay()));
+            spans.push(Span::styled(" ", self.theme.overlay()));
         }
         let used: usize = spans.iter().map(Span::width).sum();
         let room = width.saturating_sub(used);
@@ -353,9 +360,9 @@ impl App {
         let painted: usize = spans.iter().map(Span::width).sum();
         let pad = width.saturating_sub(painted);
         if pad > 0 {
-            spans.push(fill_span(pad, self.theme.user()));
+            spans.push(Span::styled(" ".repeat(pad), self.theme.user()));
         }
-        Line::from(spans)
+        Line::from(spans).style(self.theme.user())
     }
 
     /// Markdown by default; only fenced or bare unified-diff bodies become cards.
@@ -366,7 +373,12 @@ impl App {
                 out.push(Line::raw(""));
             }
             match segment {
-                Segment::Md(md) => out.extend(markdown_lines(&md, self.theme)),
+                Segment::Md(md) => {
+                    let width = self.last_view_w.max(8) as usize;
+                    for line in markdown_lines(&md, self.theme) {
+                        out.extend(wrap_styled_line(line, width));
+                    }
+                }
                 Segment::Diff(diff) => out.extend(self.diff_card(&diff)),
             }
         }
@@ -383,15 +395,16 @@ impl App {
         let width = self.last_view_w.max(8);
         let title = diff_title(text);
         let head = format!("─ {title} ");
-        // One column short of the pane so wrap does not insert a blank row.
-        let band_w = (width as usize).saturating_sub(1).max(8);
-        let fill = band_w.saturating_sub(head.chars().count());
+        let fill = (width as usize).saturating_sub(head.chars().count());
         let mut out = vec![Line::styled(
             format!("{head}{}", "─".repeat(fill)),
             self.theme.chrome(),
         )];
-        out.extend(crate::render::diff_lines(text, self.theme, band_w as u16));
-        out.push(Line::styled("─".repeat(band_w), self.theme.chrome()));
+        out.extend(crate::render::diff_lines(text, self.theme, width));
+        out.push(Line::styled(
+            "─".repeat(width as usize),
+            self.theme.chrome(),
+        ));
         out
     }
 
@@ -926,6 +939,45 @@ fn wrap_cols(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
+/// Wrap a styled line to `width` without using Paragraph wrap, so space-padded
+/// bands keep their background instead of being reflowed into a hole.
+fn wrap_styled_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        return vec![line];
+    }
+    let line_style = line.style;
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut style = Style::default();
+    let mut col = 0usize;
+
+    let flush_span = |spans: &mut Vec<Span<'static>>, buf: &mut String, style: Style| {
+        if !buf.is_empty() {
+            spans.push(Span::styled(std::mem::take(buf), style));
+        }
+    };
+
+    for span in line.spans {
+        if span.style != style {
+            flush_span(&mut spans, &mut buf, style);
+            style = span.style;
+        }
+        for ch in span.content.chars() {
+            if col >= width {
+                flush_span(&mut spans, &mut buf, style);
+                rows.push(Line::from(std::mem::take(&mut spans)).style(line_style));
+                col = 0;
+            }
+            buf.push(ch);
+            col += 1;
+        }
+    }
+    flush_span(&mut spans, &mut buf, style);
+    rows.push(Line::from(spans).style(line_style));
+    rows
+}
+
 const MIN_WIDTH: u16 = 40;
 const MIN_HEIGHT: u16 = 10;
 
@@ -987,9 +1039,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let input_inner = input_block.inner(input_area);
     frame.render_widget(input_block, input_area);
     frame.render_widget(
-        Paragraph::new(prompt_text(app, input_inner.width))
-            .style(app.theme.surface())
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(prompt_text(app, input_inner.width)).style(app.theme.surface()),
         input_inner,
     );
 
@@ -1083,7 +1133,6 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     frame.render_widget(
         Paragraph::new(lines)
             .style(app.theme.base())
-            .wrap(Wrap { trim: false })
             .scroll((scroll, 0)),
         inner,
     );
@@ -1685,11 +1734,11 @@ mod tests {
             wire: "openai-responses".into(),
         });
         app.theme = Theme { colored: true };
-        let mut terminal = Terminal::new(TestBackend::new(80, 14)).unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer();
         let mantle = Color::Rgb(0x18, 0x18, 0x25);
-        for x in 0..80 {
+        for x in 0..100 {
             assert_eq!(
                 buf[(x, 0)].bg,
                 mantle,
@@ -1722,10 +1771,14 @@ mod tests {
         assert_eq!(buf[(x, y)].bg, user_bg, "text cell {x},{y}");
         // Inner transcript starts at x=1 (left pad); the band fills across.
         assert_eq!(buf[(1, y)].bg, overlay, "accent bar");
-        assert_eq!(buf[(x + 4, y)].bg, user_bg, "pad cell after text");
+        let pad_cell = &buf[(x + 4, y)];
+        assert_eq!(pad_cell.bg, user_bg, "pad cell after text");
+        assert_eq!(pad_cell.symbol(), " ", "pad with spaces, not blocks");
         // Blank rows inside the band, above and below the text.
         assert_eq!(buf[(x, y - 1)].bg, user_bg, "pad row above");
+        assert_eq!(buf[(x, y - 1)].symbol(), " ", "pad row is spaces");
         assert_eq!(buf[(x, y + 1)].bg, user_bg, "pad row below");
+        assert_eq!(buf[(x, y + 1)].symbol(), " ", "pad row is spaces");
     }
 
     #[test]

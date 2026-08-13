@@ -333,24 +333,9 @@ fn band(
     let painted: usize = spans.iter().map(Span::width).sum();
     let pad = (width as usize).saturating_sub(painted);
     if pad > 0 {
-        spans.push(fill_span(pad, band));
+        spans.push(Span::styled(" ".repeat(pad), band));
     }
-    Line::from(spans)
-}
-
-/// Pad that WordWrapper will not treat as wrapping whitespace.
-///
-/// A run of spaces at `>= pane width` makes ratatui emit an extra empty row.
-/// A full-block with matching fg/bg reads as a solid wash and stays one line.
-pub(crate) fn fill_span(cols: usize, style: Style) -> Span<'static> {
-    if cols == 0 {
-        return Span::raw("");
-    }
-    let (ch, style) = match style.bg {
-        Some(bg) => ('█', style.fg(bg)),
-        None => (' ', style),
-    };
-    Span::styled(ch.to_string().repeat(cols), style)
+    Line::from(spans).style(band)
 }
 
 /// Byte range of the changed span in each row of a `-`/`+` pair.
@@ -522,6 +507,11 @@ mod tests {
         // Padding carries the band background, not a default style.
         let tail = lines[1].spans.last().unwrap();
         assert_eq!(tail.style.bg, theme.del().bg);
+        assert!(
+            tail.content.chars().all(|ch| ch == ' '),
+            "pad with spaces, not blocks: {:?}",
+            tail.content
+        );
     }
 
     #[test]
