@@ -2559,6 +2559,13 @@ pub fn run<B: Backend>(
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
+                    // The child died mid-turn. Its stderr is captured (never
+                    // inherited, or it would paint over this frame), so show
+                    // the tail instead of a bare "closed".
+                    for line in client.stderr_tail() {
+                        app.entries
+                            .push(Entry::Note(format!("mow: {}", sanitize_preview(&line))));
+                    }
                     app.finish_turn(Err(Error::Closed));
                     turn = None;
                     if let Some(next) = app.next_queued_prompt() {

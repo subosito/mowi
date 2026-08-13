@@ -220,15 +220,6 @@ pub struct VersionInfo {
     pub control_methods: Vec<String>,
 }
 
-impl VersionInfo {
-    /// Feature-detect a method. Servers older than the capability list
-    /// advertise nothing, so assume support there and let the call fail with
-    /// -32601 rather than disabling UI against a server that may well have it.
-    pub fn supports(&self, method: &str) -> bool {
-        self.methods.is_empty() || self.methods.iter().any(|m| m == method)
-    }
-}
-
 /// Pull a `[String]` field, tolerating absence and non-string members.
 fn string_list(v: &Value, key: &str) -> Vec<String> {
     v.get(key)
@@ -331,9 +322,15 @@ fn event_type(params: &Value) -> &str {
 
 type Pending = Arc<Mutex<HashMap<u64, Sender<Result<Value, Error>>>>>;
 
+/// Lines of child stderr retained for diagnostics (bounded: a stuck child
+/// must not grow this without limit).
+const STDERR_TAIL_LINES: usize = 50;
+
 /// A spawned `mow rpc` child plus its reader thread.
 pub struct Client {
     child: Child,
+    /// Bounded tail of the child's stderr, for diagnosing an early exit.
+    errlog: Arc<Mutex<Vec<String>>>,
     stdin: ChildStdin,
     next_id: u64,
     pending: Pending,
@@ -348,7 +345,10 @@ impl Client {
             .args(engine_flags)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            // Never inherit: the child shares our terminal, so anything it
+            // writes to stderr is painted straight onto the screen, outside
+            // the TUI frame. Capture it and keep only the tail for diagnostics.
+            .stderr(Stdio::piped());
         let mut child = cmd.spawn().map_err(|e| {
             if e.kind() == io::ErrorKind::NotFound {
                 Error::Spawn(format!(
@@ -360,8 +360,29 @@ impl Client {
         })?;
         let stdin = child.stdin.take().ok_or(Error::Closed)?;
         let stdout = child.stdout.take().ok_or(Error::Closed)?;
+        let stderr = child.stderr.take();
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
         let (ntx, nrx) = channel();
+
+        // Drain stderr so a chatty child cannot block on a full pipe, keeping
+        // a bounded tail for the "child died" message.
+        let errlog: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        if let Some(stderr) = stderr {
+            let sink = Arc::clone(&errlog);
+            std::thread::spawn(move || {
+                for line in BufReader::new(stderr).lines() {
+                    let Ok(line) = line else { break };
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let mut buf = sink.lock().unwrap();
+                    if buf.len() == STDERR_TAIL_LINES {
+                        buf.remove(0);
+                    }
+                    buf.push(line);
+                }
+            });
+        }
 
         let reader_pending = Arc::clone(&pending);
         std::thread::spawn(move || {
@@ -399,7 +420,15 @@ impl Client {
             next_id: 0,
             pending,
             notifications: nrx,
+            errlog,
         })
+    }
+
+    /// Tail of the child's stderr. Empty in normal operation — `mow rpc`
+    /// keeps stderr quiet precisely so a TUI can own the terminal — so a
+    /// non-empty tail is a real diagnostic (bad flag, panic, missing config).
+    pub fn stderr_tail(&self) -> Vec<String> {
+        self.errlog.lock().unwrap().clone()
     }
 
     /// Notification stream (events, `perm.ask`).
@@ -895,14 +924,30 @@ mod tests {
     }
 
     #[test]
+    fn child_stderr_is_captured_not_inherited() {
+        // Inheriting stderr lets the child paint over the TUI frame: that is
+        // exactly how "→ bash cd …" ended up on screen. Assert the spawn
+        // policy at the source level, since Stdio has no getter.
+        // Build the needle at runtime: a literal would appear in this file
+        // and match itself.
+        let src = include_str!("rpc.rs");
+        let bad = format!(".stderr(Stdio::{}", "inherit");
+        assert!(
+            !src.contains(&bad),
+            "child stderr must be piped, never inherited"
+        );
+        assert!(src.contains(".stderr(Stdio::piped())"));
+    }
+
+    #[test]
     fn handshake_requires_rpc_3() {
         let ok = serde_json::json!({"name":"mow","version":"0.1.0","rpc":"3"});
         let info = check_version(&ok).unwrap();
         assert_eq!(info.rpc, "3");
-        // No capability list (older server): assume support rather than
-        // disabling features we cannot prove absent.
+        // No capability list (older server): App::supports treats this as
+        // "assume everything" rather than hiding features it cannot prove
+        // absent.
         assert!(info.methods.is_empty());
-        assert!(info.supports("compact"));
 
         let modern = serde_json::json!({
             "name":"mow","version":"0.1.0","rpc":"4",
@@ -910,8 +955,7 @@ mod tests {
             "control_methods":["context"],
         });
         let info = check_version(&modern).unwrap();
-        assert!(info.supports("context"));
-        assert!(!info.supports("skill.list"));
+        assert_eq!(info.methods, vec!["prompt", "context", "compact"]);
         assert_eq!(info.control_methods, vec!["context".to_string()]);
 
         // Additive protocol: a newer server is fine, an older one is not.

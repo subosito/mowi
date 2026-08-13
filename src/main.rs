@@ -190,7 +190,7 @@ fn ping(cli: &Cli) -> Result<(), rpc::Error> {
 }
 
 fn tui(cli: &Cli) -> Result<(), rpc::Error> {
-    let (mut client, session, _version) = connect(cli)?;
+    let (mut client, session, version) = connect(cli)?;
     let mode = if cli.auto { "auto" } else { "ask" };
     client.perm_set(mode, HANDSHAKE_TIMEOUT)?;
     let resuming = cli.session.is_some() || cli.continue_session;
@@ -200,6 +200,8 @@ fn tui(cli: &Cli) -> Result<(), rpc::Error> {
     } else {
         App::new(session)
     };
+    // Feature-detect once from the handshake instead of probing for -32601.
+    app.set_capabilities(&version.methods);
     app.ask_mode = !cli.auto;
     app.allow_write = cli.allow_write;
     app.allow_shell = cli.allow_shell;
