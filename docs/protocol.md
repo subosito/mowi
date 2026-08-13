@@ -14,7 +14,7 @@ Stderr is Engine logs — do not parse it.
 
 ## Handshake
 
-1. `{"id":1,"method":"version"}` → `rpc` must be `"3"`.
+1. `{"id":1,"method":"version"}` → `rpc` must be `"3"` or newer (additive protocol).
 2. `{"id":2,"method":"session"}` → workspace, model, session_id.
 3. `{"id":3,"method":"status"}` → busy, allow_write, allow_shell, ask_mode.
 4. If the UI wants ask mode: `perm.set` `{mode:"ask"}` (default server is

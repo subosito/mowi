@@ -22,6 +22,8 @@ use ratatui::{
     },
 };
 use serde_json::Value;
+use unicode_width::UnicodeWidthChar;
+use unicode_width::UnicodeWidthStr;
 
 use crate::render::{Segment, diff_title, markdown_lines, split_markdown_and_diffs};
 use crate::rpc::{
@@ -31,7 +33,10 @@ use crate::rpc::{
 use crate::slash::{
     SlashRoute, canonical_slash, slash_completions, slash_route, unknown_slash_message,
 };
-use crate::theme::Theme;
+use crate::theme::{SPINNER, TYPING, Theme, Tone};
+
+/// Display columns allowed for a collapsed peer preview.
+const PEER_PREVIEW: usize = 48;
 
 /// One painted transcript block.
 #[derive(Debug, Clone, PartialEq)]
@@ -457,8 +462,24 @@ impl App {
         }
         push_sep(&mut spans);
         if self.busy {
-            spans.push(Span::styled("busy", self.theme.warn()));
+            // Spinner + elapsed: the developer can tell "thinking" from "hung".
+            spans.push(Span::styled(
+                format!("{} ", self.spinner_frame()),
+                self.theme.spinner(),
+            ));
+            spans.push(Span::styled("busy", self.theme.badge(Tone::Active)));
+            if let Some(elapsed) = self.elapsed() {
+                spans.push(Span::styled(format!(" ⏱ {elapsed}"), self.theme.timing()));
+            }
+            // Typing pulse only while tokens are actually arriving.
+            if !self.live.is_empty() {
+                spans.push(Span::styled(
+                    format!(" {}", self.typing_frame()),
+                    self.theme.typing(),
+                ));
+            }
         } else {
+            spans.push(Span::styled("● ", self.theme.badge(Tone::Ok)));
             spans.push(Span::styled("idle", self.theme.note()));
         }
         spans.push(Span::styled("  ", self.theme.chrome()));
@@ -468,9 +489,33 @@ impl App {
         ));
         if !self.status.is_empty() {
             spans.push(Span::styled(" — ", self.theme.chrome()));
-            spans.push(Span::styled(self.status.clone(), self.theme.note()));
+            let tone = if self.peers.is_empty() {
+                self.theme.note()
+            } else {
+                self.theme.peer()
+            };
+            spans.push(Span::styled(clip_display(&self.status, 48), tone));
         }
         Line::from(spans)
+    }
+
+    /// Wall-clock for the running turn, e.g. `4.2s` / `1m03s`.
+    pub fn elapsed(&self) -> Option<String> {
+        let secs = self.activity_started?.elapsed().as_secs_f64();
+        Some(if secs >= 60.0 {
+            format!("{}m{:02}s", (secs / 60.0) as u64, (secs % 60.0) as u64)
+        } else {
+            format!("{secs:.1}s")
+        })
+    }
+
+    /// Typing-indicator frame, frozen when animation is off.
+    pub fn typing_frame(&self) -> &'static str {
+        if self.animate {
+            TYPING[(self.tick as usize / 3) % TYPING.len()]
+        } else {
+            TYPING[2]
+        }
     }
 
     /// Transcript as wrapped-source lines (live answer last).
@@ -496,13 +541,25 @@ impl App {
                 wrap_styled_line(Line::styled(t.to_string(), self.theme.note()), width)
             }
             Entry::Tool { name, duration_ms } => {
-                let suffix = duration_ms
-                    .map(|ms| format!(" · {:.1}s", ms as f64 / 1000.0))
-                    .unwrap_or_default();
-                wrap_styled_line(
-                    Line::styled(format!("⚙ {name}{suffix}"), self.theme.note()),
-                    width,
-                )
+                // Finished tools get a check + timing; a tool still running
+                // gets the live spinner so a stall is visible.
+                let (glyph, glyph_style) = match duration_ms {
+                    Some(_) => ("✓", self.theme.badge(Tone::Ok)),
+                    None => (self.spinner_frame(), self.theme.spinner()),
+                };
+                let mut spans = vec![
+                    Span::styled(format!("{glyph} "), glyph_style),
+                    Span::styled("⚙ ", self.theme.tool()),
+                    Span::styled(sanitize_preview(name), self.theme.tool()),
+                ];
+                match duration_ms {
+                    Some(ms) => spans.push(Span::styled(
+                        format!(" · {:.1}s", *ms as f64 / 1000.0),
+                        self.theme.timing(),
+                    )),
+                    None => spans.push(Span::styled(" · running", self.theme.timing())),
+                }
+                wrap_styled_line(Line::from(spans), width)
             }
         }
     }
@@ -664,27 +721,42 @@ impl App {
 
     /// Collapsed peer rows: one line per agent. `ctrl+p` opens the full
     /// buffer in an overlay — peer text never welds onto the host answer.
+    ///
+    /// Peer deltas are *foreign bytes*: ACP agents emit ANSI colour, cursor
+    /// moves, carriage returns and tabs. Painting those raw is what garbles
+    /// the frame, so every preview goes through `sanitize_preview` first.
     fn peer_lines(&self) -> Vec<Line<'static>> {
         let mut agents: Vec<&String> = self.peers.keys().collect();
         agents.sort();
+        let frame = self.spinner_frame();
         agents
             .into_iter()
             .map(|agent| {
-                let preview = self.peers[agent]
-                    .lines()
-                    .next_back()
-                    .unwrap_or("")
-                    .chars()
-                    .take(48)
-                    .collect::<String>();
+                let preview = last_visible_line(&self.peers[agent]);
                 let preview = if preview.is_empty() {
                     "working".to_string()
                 } else {
                     preview
                 };
-                Line::styled(format!("→ {agent} · {preview} (ctrl+p)"), self.theme.note())
+                Line::from(vec![
+                    Span::styled(format!("{frame} "), self.theme.spinner()),
+                    Span::styled("⇄ ", self.theme.peer()),
+                    Span::styled(agent.clone(), self.theme.peer()),
+                    Span::styled(" · ", self.theme.chrome()),
+                    Span::styled(preview, self.theme.note()),
+                    Span::styled("  (ctrl+p)", self.theme.timing()),
+                ])
             })
             .collect()
+    }
+
+    /// Current spinner glyph, frozen to a stable frame when animation is off.
+    pub fn spinner_frame(&self) -> &'static str {
+        if self.animate {
+            SPINNER[(self.tick as usize / 2) % SPINNER.len()]
+        } else {
+            SPINNER[0]
+        }
     }
 
     /// Toggle the expanded peer buffer (`ctrl+p`).
@@ -810,7 +882,7 @@ impl App {
                 .entry(agent.clone())
                 .or_default()
                 .push_str(params.get("delta").and_then(Value::as_str).unwrap_or(""));
-            self.status = format!("→ {agent} · receiving");
+            self.status = format!("⇄ {} · receiving", sanitize_preview(&agent));
         } else if kind.contains("delegate") && kind.contains("progress") {
             let agent = params
                 .get("agent")
@@ -820,7 +892,11 @@ impl App {
                 .get("phase")
                 .and_then(Value::as_str)
                 .unwrap_or("working");
-            self.status = format!("→ {agent} · {phase}");
+            self.status = format!(
+                "⇄ {} · {}",
+                sanitize_preview(agent),
+                sanitize_preview(phase)
+            );
         }
         if let Some(d) = token_delta(params) {
             self.live.push_str(d);
@@ -833,7 +909,10 @@ impl App {
     fn finish_peers(&mut self) {
         self.peer_focus = None;
         for (agent, _) in self.peers.drain() {
-            self.entries.push(Entry::Note(format!("→ {agent} · done")));
+            self.entries.push(Entry::Note(format!(
+                "⇄ {} · done",
+                sanitize_preview(&agent)
+            )));
         }
     }
 
@@ -1152,6 +1231,86 @@ impl App {
 
 fn token_count(value: &Value, field: &str) -> u64 {
     value.get(field).and_then(Value::as_u64).unwrap_or(0)
+}
+
+/// Strip terminal control sequences from foreign (ACP peer) text.
+///
+/// Peers stream whatever their CLI writes: SGR colour, cursor moves, erase
+/// codes, OSC title sets, backspaces, bare CR progress bars. Those bytes must
+/// never reach the backend — they move the real cursor and shear the frame.
+/// This keeps printable text (and tabs, widened to spaces) and drops the rest.
+pub fn sanitize_preview(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            // ESC: swallow the whole escape sequence.
+            '\u{1b}' => match chars.next() {
+                // CSI ... final byte in @..~
+                Some('[') => {
+                    for c in chars.by_ref() {
+                        if ('\u{40}'..='\u{7e}').contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                // OSC ... terminated by BEL or ST (ESC \).
+                Some(']') => {
+                    while let Some(c) = chars.next() {
+                        if c == '\u{7}' {
+                            break;
+                        }
+                        if c == '\u{1b}' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // Two-char escape: already consumed.
+                _ => {}
+            },
+            '\t' => out.push_str("    "),
+            // Backspace / CR: treat as "redraw this line" like a terminal would.
+            '\r' => out.clear(),
+            '\u{8}' => {
+                out.pop();
+            }
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// The last non-empty sanitized line of a peer buffer, clipped to `PEER_PREVIEW`
+/// display columns (not chars — CJK and emoji are double-width).
+fn last_visible_line(buffer: &str) -> String {
+    let line = buffer
+        .lines()
+        .map(sanitize_preview)
+        .filter(|l| !l.trim().is_empty())
+        .next_back()
+        .unwrap_or_default();
+    clip_display(line.trim(), PEER_PREVIEW)
+}
+
+/// Truncate to `max` display columns, appending `…` when clipped.
+fn clip_display(text: &str, max: usize) -> String {
+    if text.width() <= max {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut w = 0;
+    for ch in text.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if w + cw > max.saturating_sub(1) {
+            break;
+        }
+        w += cw;
+        out.push(ch);
+    }
+    out.push('…');
+    out
 }
 
 fn entry_text(entry: &Entry) -> String {
@@ -1772,10 +1931,20 @@ fn draw_peer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
     frame.render_widget(Clear, spot);
     let agent = app.peer_focus.clone().unwrap_or_else(|| "peer".to_string());
-    let body = app.peers.get(&agent).cloned().unwrap_or_default();
+    let raw = app.peers.get(&agent).cloned().unwrap_or_default();
+    // Same rule as the collapsed row: foreign bytes are stripped per line
+    // before they can reach the backend.
+    let body: Vec<Line<'static>> = raw
+        .lines()
+        .map(|line| Line::styled(sanitize_preview(line), app.theme.context()))
+        .collect();
+    let tail = body
+        .len()
+        .saturating_sub(spot.height.saturating_sub(2) as usize);
     frame.render_widget(
         Paragraph::new(body)
             .style(app.theme.context())
+            .scroll((tail as u16, 0))
             .wrap(Wrap { trim: false })
             .block(overlay_block(app, &format!("⇄ {agent} · esc to close"))),
         spot,
@@ -2599,12 +2768,99 @@ mod tests {
             }),
         });
         let out = render(&mut app, 70, 16);
-        assert!(out.contains("→ peer-agent"), "{out}");
+        assert!(out.contains("⇄ peer-agent"), "{out}");
 
         assert!(app.toggle_peer_expand());
         assert_eq!(app.peer_focus.as_deref(), Some("peer-agent"));
         assert!(app.toggle_peer_expand());
         assert!(app.peer_focus.is_none());
+    }
+
+    #[test]
+    fn running_and_finished_tools_read_differently() {
+        let mut app = App::new(SessionInfo::default());
+        app.animate = false;
+        app.entries.push(Entry::Tool {
+            name: "read".into(),
+            duration_ms: Some(1500),
+        });
+        app.entries.push(Entry::Tool {
+            name: "bash".into(),
+            duration_ms: None,
+        });
+        let out = render(&mut app, 70, 16);
+        assert!(out.contains("✓"), "finished tool needs a check: {out}");
+        assert!(out.contains("1.5s"), "finished tool needs timing: {out}");
+        assert!(
+            out.contains("running"),
+            "in-flight tool needs a state: {out}"
+        );
+    }
+
+    #[test]
+    fn ansi_from_a_tool_name_cannot_reach_the_frame() {
+        let mut app = App::new(SessionInfo::default());
+        app.animate = false;
+        app.entries.push(Entry::Tool {
+            name: "\u{1b}[31mevil\u{1b}[0m".into(),
+            duration_ms: Some(10),
+        });
+        let out = render(&mut app, 70, 16);
+        assert!(out.contains("evil"));
+        assert!(!out.contains('\u{1b}'), "escape leaked from a tool name");
+    }
+
+    #[test]
+    fn ansi_escapes_from_a_peer_never_reach_the_frame() {
+        // A cursor-agent style chunk: SGR colour, a cursor move, an erase-line
+        // and an OSC title set. Painting any of these raw shears the TUI.
+        let dirty = "\u{1b}[32mbuilding\u{1b}[0m\u{1b}[2K\u{1b}[1;5H\u{1b}]0;title\u{7} ok";
+        let clean = sanitize_preview(dirty);
+        assert_eq!(clean, "building ok");
+        assert!(!clean.contains('\u{1b}'));
+        assert!(!clean.chars().any(char::is_control));
+    }
+
+    #[test]
+    fn carriage_returns_redraw_rather_than_concatenate() {
+        // Progress bars stream "10%\r20%\r30%" — we want the final state only.
+        assert_eq!(sanitize_preview("10%\r20%\r30%"), "30%");
+        assert_eq!(sanitize_preview("abcX\u{8} "), "abc ");
+        assert_eq!(sanitize_preview("a\tb"), "a    b");
+    }
+
+    #[test]
+    fn peer_preview_clips_by_display_width_not_char_count() {
+        // Double-width CJK: 40 chars = 80 columns, must clip to PEER_PREVIEW.
+        let wide = "宽".repeat(40);
+        let clipped = clip_display(&wide, PEER_PREVIEW);
+        assert!(clipped.width() <= PEER_PREVIEW, "{}", clipped.width());
+        assert!(clipped.ends_with('…'));
+        assert_eq!(clip_display("short", PEER_PREVIEW), "short");
+    }
+
+    #[test]
+    fn peer_row_shows_the_last_meaningful_line() {
+        let buffer = "first\n\u{1b}[31msecond\u{1b}[0m\n\n   \n";
+        assert_eq!(last_visible_line(buffer), "second");
+    }
+
+    #[test]
+    fn garbled_peer_chunk_renders_a_clean_single_row() {
+        let mut app = App::new(SessionInfo::default());
+        app.animate = false;
+        app.on_notification(&Notification {
+            method: "event".into(),
+            params: serde_json::json!({
+                "type": "harness.delegate.chunk",
+                "agent": "kimi",
+                "delta": "\u{1b}[2K\rreading app.rs\u{1b}[0m\n",
+            }),
+        });
+        let out = render(&mut app, 70, 16);
+        assert!(out.contains("reading app.rs"), "{out}");
+        assert!(!out.contains('\u{1b}'), "escape leaked into the frame");
+        assert!(!out.contains("[2K"), "raw CSI leaked into the frame: {out}");
     }
 
     #[test]
@@ -2778,7 +3034,7 @@ mod tests {
             app.entries,
             vec![
                 Entry::Assistant("hello".into()),
-                Entry::Note("→ peer · done".into())
+                Entry::Note("⇄ peer · done".into())
             ]
         );
         assert!(app.live.is_empty());

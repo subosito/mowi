@@ -15,7 +15,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 /// Protocol version this client speaks.
-pub const RPC_VERSION: &str = "3";
+pub const RPC_MIN_VERSION: u32 = 3;
 
 #[derive(Debug)]
 pub enum Error {
@@ -196,15 +196,21 @@ pub struct VersionInfo {
     pub rpc: String,
 }
 
-/// Validate a `version` result: `rpc` must be `"3"`.
+/// Validate a `version` result. The protocol is additive: a server newer than
+/// `RPC_MIN_VERSION` still speaks every method we send, so accept `>=` rather
+/// than pinning equality (which made each new method a breaking change).
 pub fn check_version(v: &Value) -> Result<VersionInfo, Error> {
     let rpc = v
         .get("rpc")
         .and_then(|r| r.as_str())
         .ok_or_else(|| Error::Protocol("mow rpc: version result has no \"rpc\" field".into()))?;
-    if rpc != RPC_VERSION {
+    let n: u32 = rpc
+        .trim()
+        .parse()
+        .map_err(|_| Error::Protocol(format!("mow rpc: unrecognized protocol version {rpc:?}")))?;
+    if n < RPC_MIN_VERSION {
         return Err(Error::Protocol(format!(
-            "mow rpc protocol {rpc:?}, need {RPC_VERSION:?}: rebuild mow with a current ext/rpc"
+            "mow rpc protocol {rpc:?}, need >= {RPC_MIN_VERSION}: rebuild mow with a current ext/rpc"
         )));
     }
     Ok(VersionInfo {
@@ -741,6 +747,12 @@ mod tests {
     fn handshake_requires_rpc_3() {
         let ok = serde_json::json!({"name":"mow","version":"0.1.0","rpc":"3"});
         assert_eq!(check_version(&ok).unwrap().rpc, "3");
+
+        // Additive protocol: a newer server is fine, an older one is not.
+        let newer = serde_json::json!({"name":"mow","version":"0.1.0","rpc":"4"});
+        assert_eq!(check_version(&newer).unwrap().rpc, "4");
+        let older = serde_json::json!({"name":"mow","version":"0.1.0","rpc":"2"});
+        assert!(check_version(&older).is_err());
 
         let old = serde_json::json!({"name":"mow","version":"0.1.0","rpc":"2"});
         let err = check_version(&old).unwrap_err();
