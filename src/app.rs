@@ -4,11 +4,19 @@
 //! message from the `mow rpc` child (`rpc::Client`).
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
+use std::io::Write;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 use std::time::Instant;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::{
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers, MouseEventKind,
+    },
+    execute,
+};
 use ratatui::{
     Frame, Terminal,
     backend::Backend,
@@ -89,6 +97,12 @@ pub struct App {
     pub theme: Theme,
     pub activity_started: Option<Instant>,
     pub peers: HashMap<String, String>,
+    pub queue: VecDeque<String>,
+    pub select_mode: bool,
+    pub search_term: String,
+    pub search_hits: Vec<usize>,
+    pub search_cursor: usize,
+    pub last_copy: String,
 }
 
 impl Default for App {
@@ -110,6 +124,12 @@ impl Default for App {
             theme: Theme::detect(),
             activity_started: None,
             peers: HashMap::new(),
+            queue: VecDeque::new(),
+            select_mode: false,
+            search_term: String::new(),
+            search_hits: Vec::new(),
+            search_cursor: 0,
+            last_copy: String::new(),
         }
     }
 }
@@ -158,6 +178,9 @@ impl App {
             s.push_str(" · ");
             s.push_str(&self.usage.chip());
         }
+        if self.select_mode {
+            s.push_str(" · select");
+        }
         s
     }
 
@@ -165,7 +188,7 @@ impl App {
         let hints = if let Some(permission) = &self.pending_perm {
             return format!("y allow · n deny · a always · {}", permission.name);
         } else {
-            "enter send · esc cancel · q quit"
+            "enter send · esc cancel · q quit · ctrl+s select"
         };
         if self.status.is_empty() {
             hints.to_string()
@@ -322,15 +345,23 @@ impl App {
                 }
             }
             k if k.ends_with("tool.end") || k == "tool.end" => {
-                if let Some(Entry::Tool { duration_ms, .. }) = self
-                    .entries
-                    .iter_mut()
-                    .rev()
-                    .find(|entry| matches!(entry, Entry::Tool { .. }))
+                let tool_name = params
+                    .get("tool")
+                    .or_else(|| params.get("name"))
+                    .and_then(Value::as_str);
+                if let Some(Entry::Tool { duration_ms, .. }) =
+                    self.entries
+                        .iter_mut()
+                        .rev()
+                        .find(|entry| match (entry, tool_name) {
+                            (Entry::Tool { name, .. }, Some(end_name)) => name == end_name,
+                            (Entry::Tool { .. }, None) => true,
+                            _ => false,
+                        })
                 {
                     *duration_ms = params.get("duration_ms").and_then(Value::as_u64);
                 }
-                if params.get("name").and_then(Value::as_str) == Some("acp_delegate") {
+                if tool_name == Some("acp_delegate") {
                     self.finish_peers();
                 }
                 self.status.clear();
@@ -410,6 +441,104 @@ impl App {
         }
     }
 
+    pub fn enqueue_prompt(&mut self, text: String) -> bool {
+        if self.queue.len() >= 16 {
+            self.status = "queue full".into();
+            return false;
+        }
+        self.queue.push_back(text);
+        self.status = format!("queued {}", self.queue.len());
+        true
+    }
+
+    pub fn next_queued_prompt(&mut self) -> Option<String> {
+        let next = self.queue.pop_front();
+        if next.is_some() {
+            self.status = if self.queue.is_empty() {
+                "running".into()
+            } else {
+                format!("queued {}", self.queue.len())
+            };
+        }
+        next
+    }
+
+    pub fn last_user_prompt(&self) -> Option<String> {
+        self.entries.iter().rev().find_map(|entry| match entry {
+            Entry::User(text) => Some(text.clone()),
+            _ => None,
+        })
+    }
+
+    pub fn edit_last_prompt(&mut self) -> bool {
+        if let Some(prompt) = self.last_user_prompt() {
+            self.input = prompt;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn copy_last_assistant(&mut self) -> bool {
+        let text = if !self.live.is_empty() {
+            self.live.clone()
+        } else {
+            self.entries
+                .iter()
+                .rev()
+                .find_map(|entry| match entry {
+                    Entry::Assistant(text) => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default()
+        };
+        if text.is_empty() {
+            self.status = "nothing to copy".into();
+            return false;
+        }
+        self.last_copy = text;
+        self.status = "copied locally".into();
+        true
+    }
+
+    pub fn search(&mut self, term: &str) -> Option<(usize, usize)> {
+        let term = term.trim();
+        if !term.is_empty() && term != self.search_term {
+            self.search_term = term.to_string();
+            self.search_hits = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| {
+                    entry_text(entry)
+                        .to_lowercase()
+                        .contains(&term.to_lowercase())
+                })
+                .map(|(index, _)| index)
+                .collect();
+            self.search_cursor = 0;
+        } else if !self.search_hits.is_empty() {
+            self.search_cursor = (self.search_cursor + 1) % self.search_hits.len();
+        }
+        if self.search_hits.is_empty() {
+            self.status = "0/0".into();
+            return None;
+        }
+        let hit = self.search_hits[self.search_cursor];
+        self.follow = false;
+        self.scroll = self.entries[..hit]
+            .iter()
+            .map(|entry| self.estimated_entry_lines(entry))
+            .sum::<usize>()
+            .min(u16::MAX as usize) as u16;
+        self.status = format!("{}/{}", self.search_cursor + 1, self.search_hits.len());
+        Some((self.search_cursor + 1, self.search_hits.len()))
+    }
+
+    pub fn toggle_select_mode(&mut self) {
+        self.select_mode = !self.select_mode;
+    }
+
     pub fn permission_decision(
         &mut self,
         decision: &str,
@@ -432,6 +561,13 @@ impl App {
 
 fn token_count(value: &Value, field: &str) -> u64 {
     value.get(field).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn entry_text(entry: &Entry) -> String {
+    match entry {
+        Entry::User(text) | Entry::Assistant(text) | Entry::Note(text) => text.clone(),
+        Entry::Tool { name, .. } => name.clone(),
+    }
 }
 
 /// Paint header / transcript / input / footer.
@@ -529,7 +665,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 }
 
 /// Terminal loop: keys in, RPC messages out, one repaint per tick.
-pub fn run<B: Backend>(
+pub fn run<B: Backend + Write>(
     terminal: &mut Terminal<B>,
     client: &mut Client,
     app: &mut App,
@@ -558,11 +694,17 @@ pub fn run<B: Backend>(
                 Ok(res) => {
                     app.finish_turn(res);
                     turn = None;
+                    if let Some(next) = app.next_queued_prompt() {
+                        turn = Some(start_prompt(client, app, &next)?);
+                    }
                 }
                 Err(TryRecvError::Empty) => {}
                 Err(TryRecvError::Disconnected) => {
                     app.finish_turn(Err(Error::Closed));
                     turn = None;
+                    if let Some(next) = app.next_queued_prompt() {
+                        turn = Some(start_prompt(client, app, &next)?);
+                    }
                 }
             }
         }
@@ -597,10 +739,26 @@ pub fn run<B: Backend>(
         }
 
         if event::poll(Duration::from_millis(50)).map_err(Error::Io)? {
-            if let Event::Key(key) = event::read().map_err(Error::Io)? {
-                if key.kind == KeyEventKind::Press {
+            match event::read().map_err(Error::Io)? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    let select_before = app.select_mode;
                     handle_key(key, client, app, &mut turn, &mut slash_rx)?;
+                    if select_before != app.select_mode {
+                        if app.select_mode {
+                            execute!(terminal.backend_mut(), DisableMouseCapture)
+                                .map_err(Error::Io)?;
+                        } else {
+                            execute!(terminal.backend_mut(), EnableMouseCapture)
+                                .map_err(Error::Io)?;
+                        }
+                    }
                 }
+                Event::Mouse(mouse) if !app.select_mode => match mouse.kind {
+                    MouseEventKind::ScrollUp => leave_follow(app, 3),
+                    MouseEventKind::ScrollDown => scroll_down(app, 3),
+                    _ => {}
+                },
+                _ => {}
             }
         }
     }
@@ -624,6 +782,9 @@ fn handle_key(
         }
     }
     match key.code {
+        KeyCode::Char('s') if ctrl => {
+            app.toggle_select_mode();
+        }
         KeyCode::Char('c') if ctrl => {
             if app.busy || turn.is_some() {
                 let _ = client.cancel();
@@ -648,24 +809,21 @@ fn handle_key(
                         client.steer(steer_text, Duration::from_secs(20))?;
                         app.status = "steered".into();
                     }
-                    app.input.clear();
+                } else {
+                    app.status = "no turn in flight".into();
                 }
+                app.input.clear();
             } else if text.starts_with('/') {
-                handle_slash(&text, client, app, slash_rx)?;
+                handle_slash(&text, client, app, turn, slash_rx)?;
                 app.input.clear();
             } else if app.busy || turn.is_some() {
-                app.status = "turn in flight (esc cancel · /steer)".into();
+                if !text.is_empty() {
+                    app.enqueue_prompt(text);
+                }
                 app.input.clear();
             } else if !text.is_empty() {
-                app.entries.push(Entry::User(text.clone()));
+                *turn = Some(start_prompt(client, app, &text)?);
                 app.input.clear();
-                app.live.clear();
-                app.busy = true;
-                app.follow = true;
-                app.scroll = u16::MAX;
-                app.status = "running".into();
-                app.activity_started = Some(Instant::now());
-                *turn = Some(client.prompt(&text)?);
             }
         }
         KeyCode::Backspace => {
@@ -693,6 +851,7 @@ fn handle_slash(
     text: &str,
     client: &mut Client,
     app: &mut App,
+    turn: &mut Option<Receiver<Result<Value, Error>>>,
     slash_rx: &mut Option<Receiver<Result<Value, Error>>>,
 ) -> Result<(), Error> {
     let mut words = text[1..].split_whitespace();
@@ -701,6 +860,28 @@ fn handle_slash(
     };
     let args: Vec<String> = words.map(ToString::to_string).collect();
     match name {
+        "search" => {
+            app.search(&args.join(" "));
+        }
+        "copy" => {
+            app.copy_last_assistant();
+        }
+        "edit" => {
+            if !app.edit_last_prompt() {
+                app.status = "no user prompt to edit".into();
+            }
+        }
+        "retry" => {
+            if let Some(prompt) = app.last_user_prompt() {
+                if app.busy || turn.is_some() {
+                    app.enqueue_prompt(prompt);
+                } else {
+                    *turn = Some(start_prompt(client, app, &prompt)?);
+                }
+            } else {
+                app.status = "no user prompt to retry".into();
+            }
+        }
         "help" => {
             app.slash_commands = client.slash_list(Duration::from_secs(20))?;
             let body = app
@@ -739,6 +920,21 @@ fn handle_slash(
         }
     }
     Ok(())
+}
+
+fn start_prompt(
+    client: &mut Client,
+    app: &mut App,
+    text: &str,
+) -> Result<Receiver<Result<Value, Error>>, Error> {
+    app.entries.push(Entry::User(text.to_string()));
+    app.live.clear();
+    app.busy = true;
+    app.follow = true;
+    app.scroll = u16::MAX;
+    app.status = "running".into();
+    app.activity_started = Some(Instant::now());
+    client.prompt(text)
 }
 
 #[cfg(test)]
@@ -944,5 +1140,40 @@ mod tests {
         };
         assert_eq!(app.usage.chip(), "12.3k tok (⇄ 1.2k)");
         assert!(app.header().contains("12.3k tok"));
+    }
+
+    #[test]
+    fn queue_is_capped_and_drains_in_order() {
+        let mut app = App::new(SessionInfo::default());
+        for index in 0..16 {
+            assert!(app.enqueue_prompt(format!("prompt-{index}")));
+        }
+        assert!(!app.enqueue_prompt("overflow".into()));
+        assert_eq!(app.queue.len(), 16);
+        assert_eq!(app.next_queued_prompt().as_deref(), Some("prompt-0"));
+        assert_eq!(app.queue.len(), 15);
+    }
+
+    #[test]
+    fn search_cycles_and_edit_remembers_last_user() {
+        let mut app = App::new(SessionInfo::default());
+        app.entries.push(Entry::User("find this".into()));
+        app.entries.push(Entry::Assistant("find that".into()));
+        app.entries.push(Entry::Note("other".into()));
+        assert_eq!(app.search("find"), Some((1, 2)));
+        assert_eq!(app.search(""), Some((2, 2)));
+        assert!(app.edit_last_prompt());
+        assert_eq!(app.input, "find this");
+        assert_eq!(app.last_user_prompt().as_deref(), Some("find this"));
+    }
+
+    #[test]
+    fn select_mode_and_copy_state_are_local() {
+        let mut app = App::new(SessionInfo::default());
+        app.entries.push(Entry::Assistant("answer".into()));
+        app.toggle_select_mode();
+        assert!(app.select_mode);
+        assert!(app.copy_last_assistant());
+        assert_eq!(app.last_copy, "answer");
     }
 }

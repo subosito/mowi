@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use crossterm::{
+    event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -152,13 +153,17 @@ fn tui(cli: &Cli) -> Result<(), rpc::Error> {
 
     enable_raw_mode().map_err(rpc::Error::Io)?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).map_err(rpc::Error::Io)?;
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture).map_err(rpc::Error::Io)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout)).map_err(rpc::Error::Io)?;
 
     let res = app::run(&mut terminal, &mut client, &mut app);
 
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    );
     let _ = terminal.show_cursor();
     client.shutdown();
     res
