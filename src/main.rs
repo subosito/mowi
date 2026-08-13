@@ -8,6 +8,7 @@ mod app;
 mod render;
 mod rpc;
 mod slash;
+mod snapshot;
 mod theme;
 
 use std::io::{self, Write};
@@ -81,6 +82,16 @@ struct Cli {
 enum Command {
     /// Spawn mow rpc, handshake, print session/model, exit.
     Ping,
+    /// Paint a scripted UI state to stdout as ANSI (no Engine needed).
+    Snapshot {
+        /// Scene name, or `all` for every scene.
+        #[arg(long, default_value = "all")]
+        scene: String,
+        #[arg(long, default_value_t = 100)]
+        width: u16,
+        #[arg(long, default_value_t = 30)]
+        height: u16,
+    },
 }
 
 impl Cli {
@@ -120,6 +131,15 @@ impl Cli {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    if let Some(Command::Snapshot {
+        scene,
+        width,
+        height,
+    }) = &cli.command
+    {
+        print_snapshots(scene, *width, *height);
+        return ExitCode::SUCCESS;
+    }
     let ping_only = cli.no_tui || matches!(cli.command, Some(Command::Ping));
     let res = if ping_only { ping(&cli) } else { tui(&cli) };
     match res {
@@ -128,6 +148,20 @@ fn main() -> ExitCode {
             eprintln!("mowi: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Print one scene, or every scene with a caption, as ANSI blocks.
+fn print_snapshots(scene: &str, width: u16, height: u16) {
+    let mut out = io::stdout();
+    let scenes: Vec<&str> = if scene == "all" {
+        snapshot::SCENES.to_vec()
+    } else {
+        vec![scene]
+    };
+    for name in scenes {
+        let _ = writeln!(out, "\n=== {name} ({width}x{height}) ===");
+        let _ = write!(out, "{}", snapshot::render(name, width, height));
     }
 }
 

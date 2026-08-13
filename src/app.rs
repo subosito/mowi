@@ -33,10 +33,19 @@ use crate::rpc::{
 use crate::slash::{
     SlashRoute, canonical_slash, slash_completions, slash_route, unknown_slash_message,
 };
-use crate::theme::{SPINNER, TYPING, Theme, Tone};
+use crate::theme::{SPINNER, SPINNER_STATIC, TYPING, Theme, Tone};
 
 /// Display columns allowed for a collapsed peer preview.
 const PEER_PREVIEW: usize = 48;
+/// Cells in the header context meter.
+const CTX_CELLS: usize = 5;
+/// Below this context percentage the footer stays quiet — the header gauge is
+/// enough, and a number that is always on screen stops being read.
+const CTX_FOOTER_PCT: f64 = 60.0;
+/// Terminals narrower than this drop the header gauge before they drop the
+/// session identity: knowing *which* model you are talking to outranks knowing
+/// how full its window is.
+const GAUGE_MIN_COLS: u16 = 100;
 
 /// Compact token count for status text: 950 -> "950", 12_300 -> "12.3k".
 fn human_tokens(n: u64) -> String {
@@ -123,7 +132,7 @@ impl Overlay {
         !matches!(self, Overlay::None)
     }
 
-    fn help() -> Self {
+    pub(crate) fn help() -> Self {
         let mut state = TableState::default();
         state.select(Some(0));
         Overlay::Help(state)
@@ -240,6 +249,8 @@ pub struct App {
     pub effort: String,
     /// Latest `context` result, for the gauge and /context.
     pub ctx: Option<ContextUsage>,
+    /// Methods the connected server advertises (empty = assume everything).
+    pub caps: Vec<String>,
     /// Character index into `input`.
     pub cursor: usize,
     /// Ratatui frame counter, used for the busy spinner.
@@ -282,6 +293,7 @@ impl Default for App {
             animate: std::env::var_os("MOW_NO_ANIM").is_none(),
             effort: String::new(),
             ctx: None,
+            caps: Vec::new(),
             cursor: 0,
             tick: 0,
             scrollbar_state: ScrollbarState::default(),
@@ -372,6 +384,16 @@ impl App {
         self.overlay = Overlay::None;
     }
 
+    /// Record the server's advertised method surface for feature detection.
+    pub fn set_capabilities(&mut self, methods: &[String]) {
+        self.caps = methods.to_vec();
+    }
+
+    /// Feature-detect a method; an empty list (older server) means assume yes.
+    pub fn supports(&self, method: &str) -> bool {
+        self.caps.is_empty() || self.caps.iter().any(|m| m == method)
+    }
+
     /// Store a `context` result for the gauge.
     pub fn apply_context(&mut self, usage: &ContextUsage) {
         self.ctx = Some(usage.clone());
@@ -412,24 +434,74 @@ impl App {
         if self.theme.colored { "❯ " } else { "> " }
     }
 
-    /// Vanity chips, widest-first. These drop on a narrow terminal.
-    fn vanity_chips(&self) -> Vec<String> {
+    /// Compact context meter for the header, e.g. `▰▰▰▱▱ 58%`.
+    ///
+    /// Returns `None` until the Engine reports a window, so the chip never
+    /// shows a fake zero.
+    pub fn context_chip(&self) -> Option<String> {
+        let ctx = self.ctx.as_ref()?;
+        let pct = match (ctx.context_window, ctx.percent) {
+            (Some(_), Some(pct)) => pct,
+            (Some(window), None) if window > 0 => (ctx.tokens as f64 / window as f64) * 100.0,
+            _ => return None,
+        }
+        .clamp(0.0, 100.0);
+        let filled = ((pct / 100.0) * CTX_CELLS as f64).round() as usize;
+        Some(format!(
+            "{}{} {:.0}%",
+            "▰".repeat(filled),
+            "▱".repeat(CTX_CELLS.saturating_sub(filled)),
+            pct
+        ))
+    }
+
+    /// Severity of context pressure, so the meter warns before it truncates.
+    pub fn context_tone(&self) -> Tone {
+        let pct = self.ctx.as_ref().and_then(|c| c.percent).unwrap_or(0.0);
+        if pct >= 90.0 {
+            Tone::Error
+        } else if pct >= 75.0 {
+            Tone::Warn
+        } else {
+            Tone::Muted
+        }
+    }
+
+    /// Vanity chips in **drop order**: least important first.
+    ///
+    /// The drop loop peels from the front, so this list is ordered by what a
+    /// developer can most afford to lose. Token usage and the session id are
+    /// trivia; the model is identity — "which brain am I talking to" is the
+    /// last thing to go, because answering it wrong is how you ship a patch
+    /// written by the wrong model.
+    ///
+    /// `width` also decides whether the context gauge is offered at all: below
+    /// `GAUGE_MIN_COLS` it is suppressed up front, so the remaining columns go
+    /// to identity rather than a meter.
+    fn vanity_chips(&self, width: u16) -> Vec<String> {
         let mut chips = Vec::new();
-        if !self.session.workspace.is_empty() {
-            chips.push(self.session.workspace.clone());
-        }
-        if !self.session.model.is_empty() {
-            chips.push(self.session.model.clone());
-        }
-        if !self.effort.is_empty() {
-            chips.push(self.effort.clone());
+        if self.usage.total() > 0 || self.usage.peer_tokens > 0 {
+            chips.push(self.usage.chip());
         }
         let short = self.session.short_id();
         if !short.is_empty() {
             chips.push(short);
         }
-        if self.usage.total() > 0 || self.usage.peer_tokens > 0 {
-            chips.push(self.usage.chip());
+        if !self.session.workspace.is_empty() {
+            chips.push(self.session.workspace.clone());
+        }
+        if !self.effort.is_empty() {
+            chips.push(self.effort.clone());
+        }
+        if !self.session.model.is_empty() {
+            chips.push(self.session.model.clone());
+        }
+        // Context pressure sits closest to the safety chips: it is the last
+        // vanity chip to drop, because it is the one that predicts trouble.
+        if width >= GAUGE_MIN_COLS
+            && let Some(ctx) = self.context_chip()
+        {
+            chips.push(ctx);
         }
         chips
     }
@@ -438,8 +510,10 @@ impl App {
     /// chips fall off left-to-right until the row fits `width`.
     pub fn header_line(&self, width: u16) -> Line<'static> {
         let safety = format!("{} · {}", self.capability_chip(), self.mode_chip());
-        let mut vanity = self.vanity_chips();
+        let mut vanity = self.vanity_chips(width);
         let width = width as usize;
+        // The context meter is styled by pressure, not by the vanity style.
+        let ctx_chip = self.context_chip();
         loop {
             let left = if vanity.is_empty() {
                 "mowi".to_string()
@@ -450,11 +524,30 @@ impl App {
             let safety_w = Span::raw(safety.as_str()).width();
             if left_w + safety_w < width || vanity.is_empty() {
                 let pad = width.saturating_sub(left_w + safety_w);
-                return Line::from(vec![
-                    Span::styled(left, self.theme.header()),
-                    Span::styled(" ".repeat(pad), self.theme.header_bg()),
-                    Span::styled(safety, self.theme.chip().patch(self.theme.header_bg())),
-                ]);
+                // Split the meter off the tail so it can carry its own tone.
+                let ctx_tail = ctx_chip
+                    .as_ref()
+                    .filter(|chip| left.ends_with(chip.as_str()))
+                    .map(|chip| left.len() - chip.len());
+                let mut spans = Vec::new();
+                match ctx_tail {
+                    Some(at) => {
+                        spans.push(Span::styled(left[..at].to_string(), self.theme.header()));
+                        spans.push(Span::styled(
+                            left[at..].to_string(),
+                            self.theme
+                                .badge(self.context_tone())
+                                .patch(self.theme.header_bg()),
+                        ));
+                    }
+                    None => spans.push(Span::styled(left, self.theme.header())),
+                }
+                spans.push(Span::styled(" ".repeat(pad), self.theme.header_bg()));
+                spans.push(Span::styled(
+                    safety,
+                    self.theme.chip().patch(self.theme.header_bg()),
+                ));
+                return Line::from(spans);
             }
             vanity.remove(0);
         }
@@ -464,88 +557,103 @@ impl App {
     /// without pinning spans.
     #[allow(dead_code)]
     pub fn footer(&self) -> String {
-        self.footer_line()
+        self.footer_line(120)
             .spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
     }
 
-    pub fn footer_line(&self) -> Line<'static> {
+    /// Status footer, laid out as a real status bar: live state on the left,
+    /// key hints flushed right, and the gap between them filled so the row is
+    /// one continuous surface instead of a ragged sentence.
+    ///
+    /// The hints are the first thing to go when the terminal is narrow — a
+    /// developer who has run out of columns still needs to see whether the
+    /// turn is running, not to be reminded that `enter` sends.
+    pub fn footer_line(&self, width: u16) -> Line<'static> {
         if let Some(permission) = &self.pending_perm {
-            return Line::from(vec![Span::styled(
-                format!("y allow · n deny · a always · {}", permission.name),
-                self.theme.warn(),
-            )]);
+            return decision_line(self.theme, width, Some(&permission.name));
         }
-        let mut spans: Vec<Span<'static>> = Vec::new();
-        let push_sep = |spans: &mut Vec<Span<'static>>| {
+
+        let mut left: Vec<Span<'static>> = Vec::new();
+        let sep = |spans: &mut Vec<Span<'static>>| {
             if !spans.is_empty() {
                 spans.push(Span::styled(" · ", self.theme.chrome()));
             }
         };
-        if !self.session.model.is_empty() {
-            push_sep(&mut spans);
-            spans.push(Span::styled(self.session.model.clone(), self.theme.chip()));
-        }
-        if !self.effort.is_empty() {
-            push_sep(&mut spans);
-            spans.push(Span::styled(self.effort.clone(), self.theme.chip()));
-        }
-        let short = self.session.short_id();
-        if !short.is_empty() {
-            push_sep(&mut spans);
-            spans.push(Span::styled(short, self.theme.note()));
-        }
-        // Context pressure: warn once the window is mostly consumed.
-        if let Some(ctx) = &self.ctx
-            && let Some(pct) = ctx.percent
-        {
-            push_sep(&mut spans);
-            let style = if pct >= 85.0 {
-                self.theme.warn()
-            } else {
-                self.theme.note()
-            };
-            spans.push(Span::styled(format!("ctx {pct:.0}%"), style));
-        }
-        push_sep(&mut spans);
+
+        // The activity band above the transcript owns the live turn readout
+        // (spinner, elapsed, current tool). Repeating it here would give the
+        // operator two clocks that tick out of step, so the footer carries
+        // only the coarse state word.
         if self.busy {
-            // Spinner + elapsed: the developer can tell "thinking" from "hung".
-            spans.push(Span::styled(
-                format!("{} ", self.spinner_frame()),
-                self.theme.spinner(),
-            ));
-            spans.push(Span::styled("busy", self.theme.badge(Tone::Active)));
-            if let Some(elapsed) = self.elapsed() {
-                spans.push(Span::styled(format!(" ⏱ {elapsed}"), self.theme.timing()));
-            }
-            // Typing pulse only while tokens are actually arriving.
-            if !self.live.is_empty() {
-                spans.push(Span::styled(
-                    format!(" {}", self.typing_frame()),
-                    self.theme.typing(),
-                ));
-            }
+            left.push(Span::styled("● ", self.theme.badge(Tone::Active)));
+            left.push(Span::styled("busy", self.theme.badge(Tone::Active)));
         } else {
-            spans.push(Span::styled("● ", self.theme.badge(Tone::Ok)));
-            spans.push(Span::styled("idle", self.theme.note()));
+            left.push(Span::styled("● ", self.theme.badge(Tone::Ok)));
+            left.push(Span::styled("idle", self.theme.note()));
         }
-        spans.push(Span::styled("  ", self.theme.chrome()));
-        spans.push(Span::styled(
-            "enter send · esc cancel · ? help · /quit",
-            self.theme.note(),
-        ));
-        if !self.status.is_empty() {
-            spans.push(Span::styled(" — ", self.theme.chrome()));
+
+        if !self.queue.is_empty() {
+            sep(&mut left);
+            left.push(Span::styled(
+                format!("{} queued", self.queue.len()),
+                self.theme.badge(Tone::Warn),
+            ));
+        }
+        // Status text is only news when the band is not already showing it.
+        if !self.status.is_empty() && !self.busy {
+            sep(&mut left);
             let tone = if self.peers.is_empty() {
                 self.theme.note()
             } else {
                 self.theme.peer()
             };
-            spans.push(Span::styled(clip_display(&self.status, 48), tone));
+            left.push(Span::styled(clip_display(&self.status, 40), tone));
+        }
+        // Context pressure earns a footer slot only once it starts to matter:
+        // the header gauge covers the normal case, and a percentage that is
+        // always on screen stops being read.
+        if let Some(ctx) = &self.ctx
+            && let Some(pct) = ctx.percent
+            && pct >= CTX_FOOTER_PCT
+        {
+            sep(&mut left);
+            let style = if pct >= 85.0 {
+                self.theme.warn()
+            } else {
+                self.theme.note()
+            };
+            left.push(Span::styled(format!("ctx {pct:.0}%"), style));
+        }
+
+        let hints = self.footer_hints();
+        let left_w: usize = left.iter().map(Span::width).sum();
+        let width = width as usize;
+        let mut spans = left;
+        for hint in hints {
+            let hint_w = Span::raw(hint.as_str()).width();
+            // +2 keeps a breathing gap between state and hints.
+            if left_w + hint_w + 2 > width {
+                continue;
+            }
+            let pad = width.saturating_sub(left_w + hint_w);
+            spans.push(Span::styled(" ".repeat(pad), self.theme.chrome()));
+            spans.push(Span::styled(hint, self.theme.note()));
+            break;
         }
         Line::from(spans)
+    }
+
+    /// Key hints, widest first: the widest one that still fits is painted.
+    fn footer_hints(&self) -> Vec<String> {
+        vec![
+            "enter send · esc cancel · ctrl+u/d scroll · ? help".to_string(),
+            "enter send · esc cancel · ? help".to_string(),
+            "enter · esc · ?".to_string(),
+            "?".to_string(),
+        ]
     }
 
     /// Wall-clock for the running turn, e.g. `4.2s` / `1m03s`.
@@ -590,23 +698,33 @@ impl App {
                 wrap_styled_line(Line::styled(t.to_string(), self.theme.note()), width)
             }
             Entry::Tool { name, duration_ms } => {
-                // Finished tools get a check + timing; a tool still running
-                // gets the live spinner so a stall is visible.
+                // One glyph, not two: state is carried by colour and shape.
+                // A running tool gets the spinner so a stall is visible.
                 let (glyph, glyph_style) = match duration_ms {
-                    Some(_) => ("✓", self.theme.badge(Tone::Ok)),
+                    Some(_) => ("✓", self.theme.badge(Tone::Ok).patch(self.theme.base())),
                     None => (self.spinner_frame(), self.theme.spinner()),
+                };
+                // Split "cmd rest" so the verb reads and the argument recedes.
+                let clean = sanitize_preview(name);
+                let (verb, rest) = match clean.split_once(' ') {
+                    Some((verb, rest)) => (verb.to_string(), rest.to_string()),
+                    None => (clean, String::new()),
                 };
                 let mut spans = vec![
                     Span::styled(format!("{glyph} "), glyph_style),
-                    Span::styled("⚙ ", self.theme.tool()),
-                    Span::styled(sanitize_preview(name), self.theme.tool()),
+                    Span::styled(verb, self.theme.tool()),
                 ];
+                if !rest.is_empty() {
+                    spans.push(Span::styled(format!(" {rest}"), self.theme.note()));
+                }
                 match duration_ms {
+                    // The spec keeps sub-second timings: "0.4s" is how an
+                    // operator tells a cached read from a real one.
                     Some(ms) => spans.push(Span::styled(
-                        format!(" · {:.1}s", *ms as f64 / 1000.0),
+                        format!("  {:.1}s", *ms as f64 / 1000.0),
                         self.theme.timing(),
                     )),
-                    None => spans.push(Span::styled(" · running", self.theme.timing())),
+                    None => spans.push(Span::styled("  running", self.theme.timing())),
                 }
                 wrap_styled_line(Line::from(spans), width)
             }
@@ -631,8 +749,11 @@ impl App {
 
     fn user_band_row(&self, body: &str, width: usize) -> Line<'static> {
         let mut spans = Vec::new();
+        // A saturated one-column rail on the left edge. This is the only
+        // full-height accent in the transcript, so scanning up the pane the
+        // eye can find "where did I last speak" without reading a word.
         if self.theme.colored {
-            spans.push(Span::styled(" ", self.theme.overlay()));
+            spans.push(Span::styled("▎", self.theme.user_rail()));
         }
         let used: usize = spans.iter().map(Span::width).sum();
         let room = width.saturating_sub(used);
@@ -743,31 +864,31 @@ impl App {
             + usize::from(!self.live.is_empty())
     }
 
+    /// The activity band: the single live readout for a running turn.
+    ///
+    /// This is the only place spinner, elapsed time and the typing pulse are
+    /// painted. The footer deliberately carries just the coarse state word, so
+    /// there is never a second clock ticking out of step with this one.
     pub fn activity(&self) -> String {
         if !self.busy {
             return String::new();
         }
-        let elapsed = self
-            .activity_started
-            .map(|start| start.elapsed().as_secs_f32())
-            .unwrap_or(0.0);
-        format!(
-            "{} {:.1}s · {}",
-            self.spinner(),
+        let elapsed = self.elapsed().unwrap_or_else(|| "0.0s".into());
+        let mut out = format!(
+            "{} {} · {}",
+            self.spinner_frame(),
             elapsed,
             self.status_or_default()
-        )
+        );
+        // The pulse only runs while tokens are actually landing, so a stalled
+        // turn looks different from a streaming one.
+        if !self.live.is_empty() {
+            out.push_str(&format!(" {}", self.typing_frame()));
+        }
+        out
     }
 
     /// Spinner frame. `MOW_NO_ANIM=1` pins a static `●`; elapsed still ticks.
-    fn spinner(&self) -> &'static str {
-        const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
-        if !self.animate {
-            return "●";
-        }
-        FRAMES[(self.tick as usize) % FRAMES.len()]
-    }
-
     /// Collapsed peer rows: one line per agent. `ctrl+p` opens the full
     /// buffer in an overlay — peer text never welds onto the host answer.
     ///
@@ -800,11 +921,16 @@ impl App {
     }
 
     /// Current spinner glyph, frozen to a stable frame when animation is off.
+    /// Spinner frame for the running turn.
+    ///
+    /// With animation disabled (`MOW_NO_ANIM=1`, or a recording/CI terminal) a
+    /// frozen braille glyph reads as a stuck spinner. A solid `●` reads as a
+    /// deliberate state light instead, so the pause is not mistaken for a hang.
     pub fn spinner_frame(&self) -> &'static str {
         if self.animate {
             SPINNER[(self.tick as usize / 2) % SPINNER.len()]
         } else {
-            SPINNER[0]
+            "●"
         }
     }
 
@@ -1337,8 +1463,7 @@ fn last_visible_line(buffer: &str) -> String {
     let line = buffer
         .lines()
         .map(sanitize_preview)
-        .filter(|l| !l.trim().is_empty())
-        .next_back()
+        .rfind(|l| !l.trim().is_empty())
         .unwrap_or_default();
     clip_display(line.trim(), PEER_PREVIEW)
 }
@@ -1360,6 +1485,50 @@ fn clip_display(text: &str, max: usize) -> String {
     }
     out.push('…');
     out
+}
+
+/// The y/a/n decision row, rendered so that **all three keys always survive**.
+///
+/// A consent surface that clips the reject key is a safety bug, not a layout
+/// bug: the operator must never be in a state where "allow" is on screen and
+/// "deny" is not. So the labels degrade (full words → single letters → the
+/// bare keycaps) and the tool name is dropped, but the three badges are never
+/// truncated. If even the bare keycaps do not fit, they are still emitted —
+/// a clipped-but-present row beats a silently missing option.
+fn decision_line(theme: Theme, width: u16, tool: Option<&str>) -> Line<'static> {
+    let width = width as usize;
+    let keys = [
+        ("y", Tone::Ok, "allow once", "allow"),
+        ("a", Tone::Warn, "always allow", "always"),
+        ("n", Tone::Error, "deny", "deny"),
+    ];
+
+    // Widest-first label plans; the first that fits wins.
+    for plan in 0..4 {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for (index, (key, tone, long, short)) in keys.iter().enumerate() {
+            if index > 0 {
+                spans.push(Span::styled("  ", theme.note()));
+            }
+            spans.push(Span::styled(format!(" {key} "), theme.badge_solid(*tone)));
+            match plan {
+                0 => spans.push(Span::styled(format!(" {long}"), theme.note())),
+                1 => spans.push(Span::styled(format!(" {short}"), theme.note())),
+                _ => {}
+            }
+        }
+        // The tool name is context, not a control: it goes first.
+        if plan == 0
+            && let Some(name) = tool
+        {
+            spans.push(Span::styled(format!("   ·   {name}"), theme.note()));
+        }
+        let painted: usize = spans.iter().map(Span::width).sum();
+        if painted <= width || plan == 3 {
+            return Line::from(spans);
+        }
+    }
+    Line::from(Vec::new())
 }
 
 fn entry_text(entry: &Entry) -> String {
@@ -1415,24 +1584,78 @@ fn input_height(app: &App, width: u16) -> u16 {
 fn overlay_block(app: &App, title: &str) -> Block<'static> {
     Block::bordered()
         .border_type(BorderType::Rounded)
-        .border_style(app.theme.chrome())
+        .border_style(app.theme.chrome_focus())
         .style(app.theme.overlay())
-        .padding(Padding::horizontal(1))
-        .title(Span::styled(format!(" {title} "), app.theme.accent()))
+        .padding(Padding::new(1, 1, 0, 0))
+        .title(Span::styled(
+            format!(" {title} "),
+            app.theme.overlay_title(),
+        ))
 }
 
-/// Hard-wrap `text` to `width` columns (character cells, ASCII-sized).
+/// Modal chrome with the hint text parked on the bottom rail instead of buried
+/// in the title. Titles name the thing; the rail names the keys.
+fn overlay_block_hint(app: &App, title: &str, hint: &str) -> Block<'static> {
+    overlay_block(app, title).title_bottom(
+        Line::from(vec![Span::styled(
+            format!(" {hint} "),
+            app.theme.note().patch(app.theme.overlay()),
+        )])
+        .alignment(Alignment::Right),
+    )
+}
+
+/// Dim the document behind a modal so the eye lands on the overlay.
+///
+/// Only the document region is scrimmed. The header safety chips and the
+/// footer decision keys are chrome the operator must still be able to read
+/// *while* the modal is up — dimming them would hide the very keys the modal
+/// is asking them to press.
+///
+/// The scrim keeps the glyphs: the frame stays recognisable, it just recedes.
+fn draw_scrim(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let buffer = frame.buffer_mut();
+    let scrim = app.theme.scrim();
+    for y in area.y..area.bottom() {
+        for x in area.x..area.right() {
+            let cell = &mut buffer[(x, y)];
+            if app.theme.colored {
+                if let Some(fg) = scrim.fg {
+                    cell.set_fg(fg);
+                }
+                if let Some(bg) = scrim.bg {
+                    cell.set_bg(bg);
+                }
+                cell.modifier = Modifier::empty();
+            } else {
+                // No colour to recede with: fall back to the dim attribute so
+                // the document still drops behind the modal.
+                cell.modifier = Modifier::DIM;
+            }
+        }
+    }
+}
+
+/// Hard-wrap `text` to `width` *display columns*.
+///
+/// Columns, not runes: a CJK ideograph or an emoji occupies two cells, so
+/// counting characters overruns the pane and shears any background band that
+/// was padded to match.
 fn wrap_cols(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![text.to_string()];
     }
     let mut rows = Vec::new();
     let mut current = String::new();
+    let mut col = 0usize;
     for ch in text.chars() {
-        if current.chars().count() >= width {
+        let cw = ch.width().unwrap_or(0);
+        if col + cw > width && !current.is_empty() {
             rows.push(std::mem::take(&mut current));
+            col = 0;
         }
         current.push(ch);
+        col += cw;
     }
     rows.push(current);
     rows
@@ -1463,13 +1686,16 @@ fn wrap_styled_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
             style = span.style;
         }
         for ch in span.content.chars() {
-            if col >= width {
+            let cw = ch.width().unwrap_or(0);
+            // Wrap on display columns so double-width glyphs do not overrun
+            // the pane and shear the padded band behind them.
+            if col + cw > width && col > 0 {
                 flush_span(&mut spans, &mut buf, style);
                 rows.push(Line::from(std::mem::take(&mut spans)).style(line_style));
                 col = 0;
             }
             buf.push(ch);
-            col += 1;
+            col += cw;
         }
     }
     flush_span(&mut spans, &mut buf, style);
@@ -1549,32 +1775,50 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         frame.set_cursor_position(input_cursor_pos(app, input_inner));
     }
 
-    // The permission overlay owns the decision hints; keep the footer quiet.
-    if app.pending_perm.is_none() {
-        frame.render_widget(
-            Paragraph::new(app.footer_line())
-                .style(app.theme.note())
-                .block(Block::new().padding(Padding::horizontal(1))),
-            footer_area,
-        );
-    }
+    // While a decision is pending the footer becomes the decision bar: the
+    // keys stay visible even if the overlay is scrolled past or dimmed.
+    // The block eats one column of padding on each side.
+    frame.render_widget(
+        Paragraph::new(app.footer_line(footer_area.width.saturating_sub(2)))
+            .style(app.theme.footer_bg())
+            .block(Block::new().padding(Padding::horizontal(1))),
+        footer_area,
+    );
 
+    // The scrim covers the document only: header safety chips, the composer
+    // and the footer decision bar all stay sharp, because those are what the
+    // operator reads and types into while a modal is up. `doc` is the
+    // activity band plus the transcript.
+    let doc = Rect {
+        x: area.x,
+        y: areas[0].height + areas[1].height,
+        width: area.width,
+        height: (transcript_area.y + transcript_area.height)
+            .saturating_sub(areas[0].height + areas[1].height),
+    };
     if app.welcome {
-        draw_welcome(frame, app, area);
+        draw_scrim(frame, app, doc);
+        draw_welcome(frame, app, doc);
         return;
     }
     if app.pending_perm.is_some() {
-        draw_permission(frame, app, area);
+        draw_scrim(frame, app, doc);
+        draw_permission(frame, app, transcript_area);
         return;
     }
     let mut overlay = std::mem::replace(&mut app.overlay, Overlay::None);
+    if overlay.is_open() {
+        draw_scrim(frame, app, doc);
+    }
+    // Overlays sit on the document, not over the whole frame: the composer
+    // and the status bar stay readable underneath.
     match &mut overlay {
-        Overlay::Help(state) => draw_help(frame, app, state, area),
-        Overlay::Sessions { items, state } => draw_sessions(frame, app, items, state, area),
-        Overlay::Models { list, state } => draw_models(frame, app, list, state, area),
-        Overlay::Efforts { list, state } => draw_efforts(frame, app, list, state, area),
-        Overlay::Completions { items, state } => draw_completions(frame, app, items, state, area),
-        Overlay::Peer => draw_peer(frame, app, area),
+        Overlay::Help(state) => draw_help(frame, app, state, doc),
+        Overlay::Sessions { items, state } => draw_sessions(frame, app, items, state, doc),
+        Overlay::Models { list, state } => draw_models(frame, app, list, state, doc),
+        Overlay::Efforts { list, state } => draw_efforts(frame, app, list, state, doc),
+        Overlay::Completions { items, state } => draw_completions(frame, app, items, state, doc),
+        Overlay::Peer => draw_peer(frame, app, doc),
         Overlay::None => {}
     }
     app.overlay = overlay;
@@ -1599,11 +1843,25 @@ fn paint_filled_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
 /// columns. Only the very first row carries the prompt glyph; every later row —
 /// whether it came from a newline or from soft wrapping — is gutter-aligned, so
 /// long text expands downward instead of running off the right edge.
-fn prompt_rows(app: &App, width: u16) -> Vec<(bool, String)> {
+/// One visual row of the composer: whether it carries the prompt glyph, its
+/// text, and the char offset into `input` where it starts.
+struct PromptRow {
+    first: bool,
+    text: String,
+    start: usize,
+}
+
+/// Lay the composer out into visual rows once, so the painted text and the
+/// caret can never disagree about where a row begins.
+///
+/// Rows break on display columns, and each row records the char offset it
+/// started at — that offset is what turns `app.cursor` back into an (x, y).
+fn prompt_layout(app: &App, width: u16) -> Vec<PromptRow> {
     // Two columns go to the glyph/continuation gutter, one is kept free on the
     // right so the caret at end-of-line still has a cell to sit in.
     let usable = (width as usize).saturating_sub(3).max(1);
-    let mut rows: Vec<(bool, String)> = Vec::new();
+    let mut rows: Vec<PromptRow> = Vec::new();
+    let mut offset = 0usize;
     for (line_idx, logical) in app.input.split('\n').enumerate() {
         let chunks = if logical.is_empty() {
             vec![String::new()]
@@ -1611,13 +1869,32 @@ fn prompt_rows(app: &App, width: u16) -> Vec<(bool, String)> {
             wrap_cols(logical, usable)
         };
         for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
-            rows.push((line_idx == 0 && chunk_idx == 0, chunk));
+            let len = chunk.chars().count();
+            rows.push(PromptRow {
+                first: line_idx == 0 && chunk_idx == 0,
+                text: chunk,
+                start: offset,
+            });
+            offset += len;
         }
+        // Step over the newline that separated this logical line.
+        offset += 1;
     }
     if rows.is_empty() {
-        rows.push((true, String::new()));
+        rows.push(PromptRow {
+            first: true,
+            text: String::new(),
+            start: 0,
+        });
     }
     rows
+}
+
+fn prompt_rows(app: &App, width: u16) -> Vec<(bool, String)> {
+    prompt_layout(app, width)
+        .into_iter()
+        .map(|row| (row.first, row.text))
+        .collect()
 }
 
 fn prompt_text(app: &App, width: u16) -> Vec<Line<'static>> {
@@ -1643,43 +1920,40 @@ fn prompt_text(app: &App, width: u16) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// Screen position of the caret.
+///
+/// Derived from the same `prompt_layout` the text is painted from, so the
+/// caret follows soft-wrapped rows and double-width glyphs instead of drifting
+/// off the character it is supposed to be sitting on.
 fn input_cursor_pos(app: &App, inner: Rect) -> Position {
-    let mut remaining = app.cursor;
-    let mut row = 0u16;
-    let lines: Vec<&str> = app.input.split('\n').collect();
-    if lines.is_empty() {
-        return Position {
-            x: inner.x + app.prompt_glyph().chars().count() as u16,
-            y: inner.y,
-        };
-    }
-    for (index, line) in lines.iter().enumerate() {
-        let len = line.chars().count();
-        let glyph = if index == 0 {
-            app.prompt_glyph().chars().count()
-        } else {
-            2
-        };
-        if remaining <= len {
-            let x = inner.x.saturating_add((glyph + remaining) as u16);
-            let y = inner
-                .y
-                .saturating_add(row)
-                .min(inner.y.saturating_add(inner.height.saturating_sub(1)));
-            return Position {
-                x: x.min(inner.x.saturating_add(inner.width.saturating_sub(1))),
-                y,
-            };
-        }
-        remaining = remaining.saturating_sub(len + 1);
-        row = row.saturating_add(1);
-    }
-    Position {
-        x: inner
-            .x
-            .saturating_add(app.prompt_glyph().chars().count() as u16),
-        y: inner.y,
-    }
+    let rows = prompt_layout(app, inner.width);
+    let visible = INPUT_MAX_ROWS as usize;
+    let skip = rows.len().saturating_sub(visible);
+    let glyph_w = app.prompt_glyph().width();
+
+    // The row containing the caret is the last one that starts at or before
+    // it; `find` from the back keeps end-of-input on the final row.
+    let (index, row) = rows
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, row)| row.start <= app.cursor)
+        .unwrap_or((0, &rows[0]));
+
+    let gutter = if row.first { glyph_w } else { 2 };
+    // Columns, not chars: measure the text actually left of the caret.
+    let into = app.cursor.saturating_sub(row.start);
+    let col: usize = row.text.chars().take(into).map(|c| c.width().unwrap_or(0)).sum();
+
+    let y = inner
+        .y
+        .saturating_add(index.saturating_sub(skip) as u16)
+        .min(inner.y.saturating_add(inner.height.saturating_sub(1)));
+    let x = inner
+        .x
+        .saturating_add((gutter + col) as u16)
+        .min(inner.x.saturating_add(inner.width.saturating_sub(1)));
+    Position { x, y }
 }
 
 fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -1757,38 +2031,94 @@ fn draw_too_small(frame: &mut Frame<'_>, app: &App, area: Rect) {
     );
 }
 
+/// First-run splash.
+///
+/// A new session should answer three questions before anything is typed: where
+/// am I, what am I talking to, and what is it allowed to do. Capability is
+/// shown as a badge because "this agent can run shell commands" is a safety
+/// fact, not a decoration.
 fn draw_welcome(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let spot = centered(
-        area,
-        Constraint::Length(area.width.saturating_sub(6).min(52)),
-        Constraint::Length(6),
-    );
-    frame.render_widget(Clear, spot);
     let workspace = if app.session.workspace.is_empty() {
         "workspace".to_string()
     } else {
         app.session.workspace.clone()
     };
+    let model = if app.session.model.is_empty() {
+        "model unknown".to_string()
+    } else {
+        app.session.model.clone()
+    };
+
+    let cap_tone = if app.allow_shell || app.allow_write {
+        Tone::Warn
+    } else {
+        Tone::Ok
+    };
+    let mut body = vec![
+        Line::from(Span::styled(
+            "mowi",
+            app.theme.accent().add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "ratatui client for the mow harness",
+            app.theme.note().patch(app.theme.overlay()),
+        )),
+        Line::raw(""),
+        field_row(app, "workspace", &workspace),
+        field_row(app, "model", &model),
+    ];
+    if !app.effort.is_empty() {
+        body.push(field_row(app, "effort", &app.effort));
+    }
+    body.push(Line::from(vec![
+        Span::styled(
+            format!("{:<10}", "access"),
+            app.theme.note().patch(app.theme.overlay()),
+        ),
+        Span::styled(
+            format!(" {} ", app.capability_chip()),
+            app.theme.badge_solid(cap_tone),
+        ),
+        Span::styled(
+            format!("  {} mode", app.mode_chip()),
+            app.theme.note().patch(app.theme.overlay()),
+        ),
+    ]));
+    body.push(Line::raw(""));
+    body.push(Line::from(vec![
+        Span::styled("type to begin", app.theme.text().patch(app.theme.overlay())),
+        Span::styled(
+            "  ·  ? for keys  ·  / for commands",
+            app.theme.note().patch(app.theme.overlay()),
+        ),
+    ]));
+
+    let height = (body.len() as u16 + 2).min(area.height);
+    let spot = centered(
+        area,
+        Constraint::Length(area.width.saturating_sub(6).clamp(24, 60)),
+        Constraint::Length(height),
+    );
+    frame.render_widget(Clear, spot);
     frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(vec![
-                Span::styled("◇ ", app.theme.accent()),
-                Span::styled(workspace, app.theme.assistant()),
-            ]),
-            Line::from(vec![
-                Span::styled(app.session.model.clone(), app.theme.note()),
-                Span::raw("  "),
-                Span::styled(
-                    format!("{} · {}", app.capability_chip(), app.mode_chip()),
-                    app.theme.chip(),
-                ),
-            ]),
-            Line::styled("ask anything · ? help", app.theme.note()),
-        ])
-        .wrap(Wrap { trim: true })
-        .block(overlay_block(app, "mowi")),
+        Paragraph::new(body).block(overlay_block(app, "session")),
         spot,
     );
+}
+
+/// `label      value` with the label in a fixed gutter, so stacked fields read
+/// as a table instead of drifting text.
+fn field_row(app: &App, label: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{label:<10}"),
+            app.theme.note().patch(app.theme.overlay()),
+        ),
+        Span::styled(
+            value.to_string(),
+            app.theme.text().patch(app.theme.overlay()),
+        ),
+    ])
 }
 
 fn draw_help(frame: &mut Frame<'_>, app: &App, state: &mut TableState, area: Rect) {
@@ -1813,9 +2143,13 @@ fn draw_help(frame: &mut Frame<'_>, app: &App, state: &mut TableState, area: Rec
             Row::new(vec!["key", "action"]).style(app.theme.accent().add_modifier(Modifier::BOLD)),
         )
         .column_spacing(1)
-        .row_highlight_style(app.theme.accent().add_modifier(Modifier::BOLD))
+        .row_highlight_style(app.theme.selected())
         .highlight_symbol("▸ ")
-        .block(overlay_block(app, "help · ↑↓/jk · esc to close"));
+        .block(overlay_block_hint(
+            app,
+            "keyboard reference",
+            "↑↓/jk scroll · esc close",
+        ));
     frame.render_stateful_widget(table, spot, state);
 }
 
@@ -1854,7 +2188,11 @@ fn draw_sessions(
     let list = List::new(items)
         .highlight_symbol("▸ ")
         .highlight_style(app.theme.accent().add_modifier(Modifier::BOLD))
-        .block(overlay_block(app, "sessions · mowi --session <id> · esc"));
+        .block(overlay_block_hint(
+            app,
+            "sessions",
+            "enter resume · mowi --session <id> · esc close",
+        ));
     frame.render_stateful_widget(list, spot, state);
 }
 
@@ -1866,12 +2204,9 @@ fn draw_models(
     area: Rect,
 ) {
     let title = if list.current.is_empty() {
-        "models · enter set · /model <id> · esc".to_string()
+        "models".to_string()
     } else {
-        format!(
-            "models · current {} · enter set · /model <id> · esc",
-            list.current
-        )
+        format!("models · {}", list.current)
     };
     let spot = centered(
         area,
@@ -1885,23 +2220,40 @@ fn draw_models(
         list.models
             .iter()
             .map(|model| {
-                let mark = if model.current || model.id == list.current {
-                    "●"
-                } else {
-                    "·"
-                };
-                let mut label = format!("{mark} {}", model.id);
+                let active = model.current || model.id == list.current;
+                let mut spans = vec![
+                    Span::styled(
+                        if active { "● " } else { "  " },
+                        app.theme.badge(Tone::Ok).patch(app.theme.overlay()),
+                    ),
+                    Span::styled(
+                        model.id.clone(),
+                        if active {
+                            app.theme.text().add_modifier(Modifier::BOLD)
+                        } else {
+                            app.theme.text()
+                        },
+                    ),
+                ];
+                // The wire name is provenance, not identity: keep it quiet.
                 if !model.wire.is_empty() {
-                    label.push_str(&format!("  {}", model.wire));
+                    spans.push(Span::styled(
+                        format!("  {}", model.wire),
+                        app.theme.note().patch(app.theme.overlay()),
+                    ));
                 }
-                ListItem::new(Line::styled(label, app.theme.chip()))
+                ListItem::new(Line::from(spans))
             })
             .collect()
     };
     let widget = List::new(items)
         .highlight_symbol("▸ ")
         .highlight_style(app.theme.accent().add_modifier(Modifier::BOLD))
-        .block(overlay_block(app, &title));
+        .block(overlay_block_hint(
+            app,
+            &title,
+            "enter set · /model <id> · esc close",
+        ));
     frame.render_stateful_widget(widget, spot, state);
 }
 
@@ -1913,9 +2265,9 @@ fn draw_efforts(
     area: Rect,
 ) {
     let title = if list.current.is_empty() {
-        "effort · enter set · esc".to_string()
+        "reasoning effort".to_string()
     } else {
-        format!("effort · current {} · enter set · esc", list.current)
+        format!("reasoning effort · {}", list.current)
     };
     let spot = centered(
         area,
@@ -1929,22 +2281,28 @@ fn draw_efforts(
         list.efforts
             .iter()
             .map(|effort| {
-                let mark = if effort.current || effort.id == list.current {
-                    "●"
-                } else {
-                    "·"
-                };
-                ListItem::new(Line::styled(
-                    format!("{mark} {}", effort.id),
-                    app.theme.chip(),
-                ))
+                let active = effort.current || effort.id == list.current;
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        if active { "● " } else { "  " },
+                        app.theme.badge(Tone::Ok).patch(app.theme.overlay()),
+                    ),
+                    Span::styled(
+                        effort.id.clone(),
+                        if active {
+                            app.theme.text().add_modifier(Modifier::BOLD)
+                        } else {
+                            app.theme.text()
+                        },
+                    ),
+                ]))
             })
             .collect()
     };
     let widget = List::new(items)
         .highlight_symbol("▸ ")
         .highlight_style(app.theme.accent().add_modifier(Modifier::BOLD))
-        .block(overlay_block(app, &title));
+        .block(overlay_block_hint(app, &title, "enter set · esc close"));
     frame.render_stateful_widget(widget, spot, state);
 }
 
@@ -1968,7 +2326,7 @@ fn draw_completions(
     let widget = List::new(rows)
         .highlight_symbol("▸ ")
         .highlight_style(app.theme.accent().add_modifier(Modifier::BOLD))
-        .block(overlay_block(app, "commands · enter · esc"));
+        .block(overlay_block_hint(app, "commands", "enter run · esc close"));
     frame.render_stateful_widget(widget, spot, state);
 }
 
@@ -1995,48 +2353,65 @@ fn draw_peer(frame: &mut Frame<'_>, app: &App, area: Rect) {
             .style(app.theme.context())
             .scroll((tail as u16, 0))
             .wrap(Wrap { trim: false })
-            .block(overlay_block(app, &format!("⇄ {agent} · esc to close"))),
+            .block(overlay_block_hint(app, &format!("⇄ {agent}"), "esc close")),
         spot,
     );
 }
 
+/// The approval prompt.
+///
+/// This is the highest-stakes surface in the client: it is the moment a human
+/// grants an agent the ability to touch their machine. It is sized to its
+/// content (never a fixed 14-row slab), the payload is the visual focus, and
+/// the decision keys are a labelled row rather than border decoration.
 fn draw_permission(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let Some(permission) = &app.pending_perm else {
         return;
     };
-    let spot = centered(
-        area,
-        Constraint::Length(area.width.saturating_sub(4).min(70)),
-        Constraint::Length(area.height.saturating_sub(2).min(14)),
-    );
-    frame.render_widget(Clear, spot);
-    let mut lines = vec![Line::styled(
-        format!("▲ {} wants to run", permission.name),
-        app.theme.warn(),
-    )];
+    let width = area.width.saturating_sub(6).clamp(24, 76);
+    // Inner width: two border columns and two padding columns.
+    let inner_w = width.saturating_sub(4).max(8) as usize;
+
+    let mut body: Vec<Line<'static>> = Vec::new();
+    body.push(Line::from(vec![
+        Span::styled("▲ ", app.theme.warn()),
+        Span::styled(
+            permission.name.clone(),
+            app.theme.text().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" wants to run", app.theme.note()),
+    ]));
+    body.push(Line::raw(""));
+    // The payload is what is actually being consented to — give it the code
+    // treatment so it cannot be confused with the surrounding prose.
     for line in permission_preview(permission).lines() {
-        lines.push(Line::styled(line.to_string(), app.theme.context()));
+        for chunk in wrap_cols(&sanitize_preview(line), inner_w) {
+            // Pad by display columns: a CJK or emoji argument is double-width,
+            // so counting runes would leave a ragged code band.
+            let pad = inner_w.saturating_sub(chunk.width());
+            body.push(Line::from(vec![
+                Span::styled(chunk, app.theme.md_code_block()),
+                Span::styled(" ".repeat(pad), app.theme.md_code_block()),
+            ]));
+        }
     }
-    // Tool name on the left, the decision keys on the right of the border.
+    body.push(Line::raw(""));
+    body.push(decision_line(app.theme, inner_w as u16, None));
+
+    // Fit to content, but never taller than the pane it is shown over.
+    let height = (body.len() as u16 + 2).min(area.height.max(3));
+    let spot = centered(area, Constraint::Length(width), Constraint::Length(height));
+    frame.render_widget(Clear, spot);
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(app.theme.warn())
         .style(app.theme.surface())
         .padding(Padding::horizontal(1))
         .title(Span::styled(
-            format!(" {} ", permission.name),
-            app.theme.warn(),
-        ))
-        .title(
-            Line::styled(" y allow · n deny · a always ", app.theme.chip())
-                .alignment(Alignment::Right),
-        );
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .block(block),
-        spot,
-    );
+            " approval required ",
+            app.theme.warn().patch(app.theme.surface()),
+        ));
+    frame.render_widget(Paragraph::new(body).block(block), spot);
 }
 
 /// Command string when the tool has one, else pretty-printed args JSON.
@@ -2084,7 +2459,9 @@ pub fn run<B: Backend>(
                     turn = None;
                     // Usage only moves at turn end; refresh the gauge here
                     // rather than polling. A failure is not fatal to the UI.
-                    if let Ok(usage) = client.context(Duration::from_secs(5)) {
+                    if app.supports("context")
+                        && let Ok(usage) = client.context(Duration::from_secs(5))
+                    {
                         app.apply_context(&usage);
                     }
                     if let Some(next) = app.next_queued_prompt() {
@@ -2521,6 +2898,17 @@ mod tests {
     }
 
     #[test]
+    fn capabilities_gate_unknown_methods() {
+        let mut app = App::new(SessionInfo::default());
+        // No list yet (or a pre-capabilities server): assume support rather
+        // than hiding features we cannot prove absent.
+        assert!(app.supports("compact"));
+        app.set_capabilities(&["prompt".into(), "context".into()]);
+        assert!(app.supports("context"));
+        assert!(!app.supports("compact"));
+    }
+
+    #[test]
     fn context_summary_renders_window_when_known() {
         let mut app = App::new(SessionInfo::default());
         assert_eq!(app.context_summary(), "context: unknown");
@@ -2531,11 +2919,141 @@ mod tests {
     }
 
     #[test]
-    fn footer_shows_context_percent_when_known() {
+    fn caret_tracks_wrapped_and_wide_text() {
+        let mut app = App::new(SessionInfo::default());
+        app.theme = Theme { colored: true };
+        let inner = Rect {
+            x: 1,
+            y: 5,
+            width: 20,
+            height: 10,
+        };
+
+        // Empty input: caret sits just past the prompt glyph.
+        assert_eq!(input_cursor_pos(&app, inner), Position { x: 3, y: 5 });
+
+        // ASCII on the first row advances one column per char.
+        app.input = "abc".into();
+        app.cursor = 3;
+        assert_eq!(input_cursor_pos(&app, inner), Position { x: 6, y: 5 });
+
+        // Double-width glyphs advance two columns each, not one.
+        app.input = "日本".into();
+        app.cursor = 2;
+        assert_eq!(input_cursor_pos(&app, inner), Position { x: 7, y: 5 });
+
+        // An explicit newline moves to the continuation gutter on the next row.
+        app.input = "ab\ncd".into();
+        app.cursor = 4;
+        let pos = input_cursor_pos(&app, inner);
+        assert_eq!(pos.y, 6, "caret should be on the second row");
+        assert_eq!(pos.x, 4, "continuation gutter is two columns");
+
+        // Soft wrap: the caret follows onto the wrapped row rather than
+        // running off the right edge of the composer.
+        app.input = "x".repeat(40);
+        app.cursor = 40;
+        let pos = input_cursor_pos(&app, inner);
+        assert!(pos.y > 5, "caret should have wrapped down");
+        assert!(
+            pos.x < inner.x + inner.width,
+            "caret escaped the composer: {pos:?}"
+        );
+    }
+
+    #[test]
+    fn deny_survives_every_supported_width() {
+        // A consent surface that clips the reject key is a safety bug. At no
+        // width the client claims to support may "allow" be reachable while
+        // "deny" is off screen.
+        for width in MIN_WIDTH..=120 {
+            let line = decision_line(Theme { colored: true }, width, Some("bash"));
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            for key in [" y ", " a ", " n "] {
+                assert!(text.contains(key), "width {width} lost {key}: {text:?}");
+            }
+            let painted: usize = line.spans.iter().map(Span::width).sum();
+            assert!(
+                painted <= width as usize,
+                "width {width} overflowed to {painted}: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn permission_modal_shows_all_decisions_when_narrow() {
+        let mut app = App::new(SessionInfo::default());
+        app.theme = Theme { colored: true };
+        app.pending_perm = Some(PermissionRequest {
+            id: "perm-1".into(),
+            name: "bash".into(),
+            args: serde_json::json!({"command": "cargo test"}),
+            tool_call_id: "call-1".into(),
+        });
+        // MIN_WIDTH is the narrowest frame the client will paint at all.
+        let out = render(&mut app, MIN_WIDTH, 20);
+        for key in ["y", "a", "n"] {
+            assert!(out.contains(key), "{out}");
+        }
+    }
+
+    #[test]
+    fn narrow_header_drops_the_gauge_before_the_model() {
+        let mut app = App::new(SessionInfo {
+            session_id: "abcdef0123456789".into(),
+            workspace: "/very/long/workspace/path/that/eats/columns".into(),
+            model: "gpt-5-mini".into(),
+            wire: "openai-responses".into(),
+        });
+        app.apply_context(&usage(100_000, Some(200_000), Some(50.0)));
+        // Usage must be present: it is the chip that previously outlived the
+        // model, because the drop loop peels from the front.
+        app.usage.input_tokens = 41_500;
+        app.usage.output_tokens = 3_200;
+
+        for width in [48u16, 60, 70] {
+            let line = app.header_line(width);
+            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            // Identity outranks both the meter and the token counter.
+            assert!(text.contains("gpt-5-mini"), "width {width}: {text}");
+            assert!(!text.contains('▰'), "width {width} kept the gauge: {text}");
+            // Safety chips never drop, at any width.
+            assert!(text.contains("read-only"), "width {width}: {text}");
+            assert!(text.contains("ask"), "width {width}: {text}");
+        }
+    }
+
+    #[test]
+    fn wrap_cols_counts_display_columns_not_runes() {
+        // Each ideograph is two cells wide, so four of them fill 8 columns.
+        let rows = wrap_cols("日本語文字", 8);
+        assert_eq!(rows[0], "日本語文");
+        assert_eq!(rows[1], "字");
+    }
+
+    #[test]
+    fn overlays_leave_the_composer_and_status_bar_alone() {
+        let mut app = App::new(SessionInfo::default());
+        app.theme = Theme { colored: true };
+        app.input.push_str("draft text");
+        app.cursor = app.input.chars().count();
+        app.overlay = Overlay::help();
+        let out = render(&mut app, 80, 24);
+        // The modal must not swallow the thing the operator was typing.
+        assert!(out.contains("draft text"), "{out}");
+        assert!(out.contains("idle"), "{out}");
+    }
+
+    #[test]
+    fn footer_shows_context_percent_only_under_pressure() {
         let mut app = App::new(SessionInfo::default());
         assert!(!app.footer().contains("ctx "));
-        app.apply_context(&usage(100_000, Some(200_000), Some(50.0)));
-        assert!(app.footer().contains("ctx 50%"), "footer: {}", app.footer());
+        // Quiet while there is plenty of headroom: the header gauge covers it.
+        app.apply_context(&usage(40_000, Some(200_000), Some(20.0)));
+        assert!(!app.footer().contains("ctx "), "footer: {}", app.footer());
+        // Once the window is filling up the footer speaks.
+        app.apply_context(&usage(150_000, Some(200_000), Some(75.0)));
+        assert!(app.footer().contains("ctx 75%"), "footer: {}", app.footer());
     }
     use ratatui::{Terminal, backend::TestBackend, style::Color};
 
@@ -2611,7 +3129,7 @@ mod tests {
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer();
         let user_bg = Color::Rgb(0x31, 0x32, 0x44);
-        let overlay = Color::Rgb(0x45, 0x47, 0x5a);
+        let rail_fg = Color::Rgb(0xb4, 0xbe, 0xfe);
         let mut found = None;
         for y in 0..16u16 {
             let row: String = (0..60).map(|x| buf[(x, y)].symbol().to_string()).collect();
@@ -2622,8 +3140,11 @@ mod tests {
         }
         let (x, y) = found.expect("user text not painted");
         assert_eq!(buf[(x, y)].bg, user_bg, "text cell {x},{y}");
-        // Inner transcript starts at x=1 (left pad); the band fills across.
-        assert_eq!(buf[(1, y)].bg, overlay, "accent bar");
+        // Inner transcript starts at x=1 (left pad); the rail is a lavender
+        // glyph on the band ground, not a differently-coloured cell.
+        assert_eq!(buf[(1, y)].symbol(), "▎", "accent rail glyph");
+        assert_eq!(buf[(1, y)].fg, rail_fg, "accent rail colour");
+        assert_eq!(buf[(1, y)].bg, user_bg, "rail sits on the band");
         let pad_cell = &buf[(x + 4, y)];
         assert_eq!(pad_cell.bg, user_bg, "pad cell after text");
         assert_eq!(pad_cell.symbol(), " ", "pad with spaces, not blocks");
@@ -2678,7 +3199,9 @@ mod tests {
         app.theme = Theme { colored: true };
         app.welcome = true;
         let out = render(&mut app, 60, 16);
-        assert!(out.contains("ask anything"), "{out}");
+        assert!(out.contains("type to begin"), "{out}");
+        assert!(out.contains("workspace"), "{out}");
+        assert!(out.contains("read-only"), "{out}");
         assert!(!out.contains("any key"), "{out}");
 
         // Typing clears the banner and still lands in the composer: no key is
@@ -2716,11 +3239,17 @@ mod tests {
         });
         app.overlay = Overlay::help();
         let out = render(&mut app, 70, 24);
-        assert!(out.contains("help"), "{out}");
+        assert!(out.contains("help") || out.contains("keyboard"), "{out}");
         assert!(out.contains("ctrl+j"), "{out}");
-        assert!(out.contains("/review"), "{out}");
-        assert!(out.contains("/model"), "{out}");
-        assert!(out.contains("/quit"), "{out}");
+        // The table is longer than any overlay: the tail is reachable by
+        // scrolling, not by being painted at once.
+        for _ in 0..app.help_rows().len() {
+            app.overlay_move(1);
+        }
+        let tail = render(&mut app, 70, 24);
+        assert!(tail.contains("/review"), "{tail}");
+        assert!(tail.contains("/model"), "{tail}");
+        assert!(tail.contains("/quit"), "{tail}");
         assert!(!out.contains("ctrl+s"), "{out}");
 
         assert!(app.dismiss_overlay());
@@ -2767,7 +3296,9 @@ mod tests {
         assert_eq!(app.session.model, "gpt-5-mini");
         let out = render(&mut app, 72, 16);
         assert!(out.contains("gpt-5-mini"), "{out}");
-        assert!(out.contains("current"), "{out}");
+        // Current model: named in the title, dotted in the list.
+        assert!(out.contains("models · gpt-5-mini"), "{out}");
+        assert!(out.contains("● gpt-5-mini"), "{out}");
         assert!(out.contains("claude-sonnet-4"), "{out}");
         assert!(out.contains("/model"), "{out}");
     }
@@ -2811,7 +3342,9 @@ mod tests {
         assert_eq!(app.overlay_selection().as_deref(), Some("high"));
         let out = render(&mut app, 72, 16);
         assert!(out.contains("high"), "{out}");
-        assert!(out.contains("current"), "{out}");
+        // The active effort is marked with a dot and named in the title.
+        assert!(out.contains("reasoning effort · none"), "{out}");
+        assert!(out.contains("● none"), "{out}");
 
         app.apply_effort_set("high");
         assert_eq!(app.effort, "high");
@@ -2859,11 +3392,14 @@ mod tests {
         });
         assert!(app.perm_guard_active(), "guard should swallow stray keys");
         let out = render(&mut app, 70, 16);
-        // Tool name titles the block; decisions sit on the title-right.
+        // The tool, the exact payload, and all three decisions are visible
+        // before the operator can approve anything.
         assert!(out.contains("bash"), "{out}");
         assert!(out.contains("build"), "{out}");
-        assert!(out.contains("y allow"), "{out}");
-        // The footer stays quiet while the overlay owns the decision.
+        assert!(out.contains("allow once"), "{out}");
+        assert!(out.contains("always allow"), "{out}");
+        assert!(out.contains("deny"), "{out}");
+        // Send hints are suppressed: the only live keys are the decisions.
         assert!(!out.contains("enter send"), "{out}");
     }
 
@@ -2913,6 +3449,73 @@ mod tests {
         assert_eq!(app.peer_focus.as_deref(), Some("peer-agent"));
         assert!(app.toggle_peer_expand());
         assert!(app.peer_focus.is_none());
+    }
+
+    #[test]
+    fn context_meter_paints_its_pressure_tone_in_the_header() {
+        let mut app = App::new(SessionInfo::default());
+        app.ctx = Some(ContextUsage {
+            tokens: 9_500,
+            context_window: Some(10_000),
+            percent: Some(95.0),
+            remaining: Some(500),
+        });
+        let line = app.header_line(120);
+        let meter = line
+            .spans
+            .iter()
+            .find(|s| s.content.contains("95%"))
+            .expect("meter missing from header");
+        // At 95% the meter must not look like ordinary chrome.
+        assert_eq!(meter.style.fg, app.theme.badge(Tone::Error).fg);
+    }
+
+    #[test]
+    fn context_meter_fills_and_escalates_tone() {
+        let mut app = App::new(SessionInfo::default());
+        // No context result yet: no chip, never a fake zero.
+        assert!(app.context_chip().is_none());
+
+        app.ctx = Some(ContextUsage {
+            tokens: 1_000,
+            context_window: Some(10_000),
+            percent: Some(10.0),
+            remaining: Some(9_000),
+        });
+        let chip = app.context_chip().unwrap();
+        assert!(chip.contains("10%"), "{chip}");
+        assert!(chip.starts_with('▰'), "{chip}");
+        assert_eq!(app.context_tone(), Tone::Muted);
+
+        app.ctx = Some(ContextUsage {
+            tokens: 8_000,
+            context_window: Some(10_000),
+            percent: Some(80.0),
+            remaining: Some(2_000),
+        });
+        assert_eq!(app.context_tone(), Tone::Warn);
+
+        app.ctx = Some(ContextUsage {
+            tokens: 9_500,
+            context_window: Some(10_000),
+            percent: Some(95.0),
+            remaining: Some(500),
+        });
+        assert_eq!(app.context_tone(), Tone::Error);
+        let full = app.context_chip().unwrap();
+        assert!(!full.contains('▱'), "95% should be nearly solid: {full}");
+    }
+
+    #[test]
+    fn context_meter_is_derived_when_percent_is_absent() {
+        let mut app = App::new(SessionInfo::default());
+        app.ctx = Some(ContextUsage {
+            tokens: 500,
+            context_window: Some(1_000),
+            percent: None,
+            remaining: None,
+        });
+        assert!(app.context_chip().unwrap().contains("50%"));
     }
 
     #[test]
@@ -3286,7 +3889,10 @@ mod tests {
                 "id": "perm-1", "name": "write", "args": {}, "tool_call_id": "call-1"
             }),
         });
-        assert_eq!(app.footer(), "y allow · n deny · a always · write");
+        let footer = app.footer();
+        for part in [" y ", "allow", " n ", "deny", " a ", "always", "write"] {
+            assert!(footer.contains(part), "{footer}");
+        }
     }
 
     #[test]
@@ -3338,6 +3944,7 @@ mod tests {
         assert!(app.copy_last_assistant());
         assert_eq!(app.last_copy, "answer");
         assert!(!app.footer().contains("ctrl+s"), "{}", app.footer());
-        assert!(app.footer().contains("/quit"), "{}", app.footer());
+        // The copy is a local state note, not an engine round trip.
+        assert!(app.footer().contains("copied locally"), "{}", app.footer());
     }
 }

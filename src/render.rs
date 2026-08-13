@@ -117,63 +117,450 @@ fn is_hunk_body(line: &str) -> bool {
         || (line.starts_with('-') && !line.starts_with("---"))
 }
 
+/// Inline emphasis state, rebuilt into a `Style` per span.
+#[derive(Default, Clone, Copy)]
+struct Inline {
+    strong: bool,
+    emphasis: bool,
+    strike: bool,
+}
+
+impl Inline {
+    fn style(self, theme: Theme) -> Style {
+        let mut style = theme.text();
+        if self.strike {
+            style = theme.md_strike();
+        }
+        if self.strong {
+            style = style.add_modifier(Modifier::BOLD);
+        }
+        if self.emphasis {
+            style = style.add_modifier(Modifier::ITALIC);
+        }
+        style
+    }
+}
+
+/// One open list level: `None` = bullet, `Some(n)` = next ordinal.
+type ListLevel = Option<u64>;
+
+/// Render markdown into styled lines.
+///
+/// Block structure (quote bars, list indents) becomes a *prefix* on every
+/// emitted line, so wrapped continuations stay visually inside their block.
+/// Blank lines are pushed through `push_blank`, which collapses runs — the
+/// document never shows two blanks in a row.
 pub fn markdown_lines(text: &str, theme: Theme) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    let mut current = Vec::new();
-    let mut style = theme.assistant();
-    let options = Options::ENABLE_STRIKETHROUGH;
+    let mut out: Vec<Line<'static>> = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut inline = Inline::default();
+    let mut lists: Vec<ListLevel> = Vec::new();
+    let mut quote_depth = 0usize;
+    let mut pending_marker: Option<Span<'static>> = None;
+    let mut link: Option<(usize, String)> = None;
+    let mut code: Option<String> = None;
+    let mut table: Option<TableAcc> = None;
+    let mut cell = String::new();
+
+    let options = Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES;
 
     for event in Parser::new_ext(text, options) {
         match event {
-            Event::Start(Tag::Heading { .. }) => {
-                style = theme.assistant().add_modifier(Modifier::BOLD);
+            // ---- blocks ------------------------------------------------
+            Event::Start(Tag::Heading { level, .. }) => {
+                flush(
+                    &mut out,
+                    &mut spans,
+                    &mut pending_marker,
+                    quote_depth,
+                    &lists,
+                );
+                push_blank(&mut out);
+                let depth = level as u8;
+                spans.push(Span::styled(
+                    format!("{} ", "#".repeat(depth as usize)),
+                    theme.md_heading(depth),
+                ));
+                inline = Inline {
+                    strong: true,
+                    ..Inline::default()
+                };
             }
-            Event::End(TagEnd::Heading(..)) => {
-                lines.push(Line::from(std::mem::take(&mut current)));
-                style = theme.assistant();
+            Event::End(TagEnd::Heading(level)) => {
+                // Re-style the heading body to match its level.
+                let depth = level as u8;
+                for span in &mut spans {
+                    span.style = theme.md_heading(depth);
+                }
+                flush(
+                    &mut out,
+                    &mut spans,
+                    &mut pending_marker,
+                    quote_depth,
+                    &lists,
+                );
+                inline = Inline::default();
             }
-            Event::Start(Tag::Strong) => style = style.add_modifier(Modifier::BOLD),
-            Event::End(TagEnd::Strong) => style = theme.assistant(),
-            Event::Start(Tag::Emphasis) => style = style.add_modifier(Modifier::ITALIC),
-            Event::End(TagEnd::Emphasis) => style = theme.assistant(),
-            Event::Code(code) => current.push(Span::styled(
-                code.into_string(),
-                if theme.colored {
-                    style.add_modifier(Modifier::REVERSED)
-                } else {
-                    style
-                },
-            )),
-            Event::Text(value) => current.push(Span::styled(value.into_string(), style)),
-            Event::SoftBreak | Event::HardBreak => {
-                lines.push(Line::from(std::mem::take(&mut current)));
-            }
-            Event::End(TagEnd::Paragraph) => {
-                if !current.is_empty() {
-                    lines.push(Line::from(std::mem::take(&mut current)));
+
+            Event::Start(Tag::Paragraph) => {
+                if pending_marker.is_none() {
+                    push_blank(&mut out);
                 }
             }
-            Event::Start(Tag::CodeBlock(kind)) => {
-                let label = match kind {
-                    CodeBlockKind::Fenced(lang) if !lang.is_empty() => format!("```{lang}"),
-                    _ => "```".into(),
+            Event::End(TagEnd::Paragraph) => {
+                flush(
+                    &mut out,
+                    &mut spans,
+                    &mut pending_marker,
+                    quote_depth,
+                    &lists,
+                );
+            }
+
+            Event::Start(Tag::BlockQuote(_)) => {
+                push_blank(&mut out);
+                quote_depth += 1;
+            }
+            Event::End(TagEnd::BlockQuote(_)) => {
+                flush(
+                    &mut out,
+                    &mut spans,
+                    &mut pending_marker,
+                    quote_depth,
+                    &lists,
+                );
+                quote_depth = quote_depth.saturating_sub(1);
+            }
+
+            Event::Start(Tag::List(first)) => {
+                // A nested list opens inside its parent item — flush the
+                // parent's text first or the two weld into one line.
+                flush(
+                    &mut out,
+                    &mut spans,
+                    &mut pending_marker,
+                    quote_depth,
+                    &lists,
+                );
+                if lists.is_empty() {
+                    push_blank(&mut out);
+                }
+                lists.push(first);
+            }
+            Event::End(TagEnd::List(_)) => {
+                lists.pop();
+            }
+            Event::Start(Tag::Item) => {
+                flush(
+                    &mut out,
+                    &mut spans,
+                    &mut pending_marker,
+                    quote_depth,
+                    &lists,
+                );
+                let depth = lists.len().saturating_sub(1);
+                let marker = match lists.last_mut() {
+                    Some(Some(n)) => {
+                        let text = format!("{n}. ");
+                        *n += 1;
+                        text
+                    }
+                    _ => {
+                        let glyph = if depth == 0 { '•' } else { '◦' };
+                        format!("{glyph} ")
+                    }
                 };
-                current.push(Span::styled(label, theme.note()));
+                pending_marker = Some(Span::styled(marker, theme.md_bullet()));
+            }
+            Event::End(TagEnd::Item) => {
+                flush(
+                    &mut out,
+                    &mut spans,
+                    &mut pending_marker,
+                    quote_depth,
+                    &lists,
+                );
+                pending_marker = None;
+            }
+
+            Event::Rule => {
+                push_blank(&mut out);
+                out.push(Line::styled("─".repeat(RULE_COLS), theme.md_rule()));
+                push_blank(&mut out);
+            }
+
+            // ---- code --------------------------------------------------
+            Event::Start(Tag::CodeBlock(kind)) => {
+                flush(
+                    &mut out,
+                    &mut spans,
+                    &mut pending_marker,
+                    quote_depth,
+                    &lists,
+                );
+                push_blank(&mut out);
+                let lang = match kind {
+                    CodeBlockKind::Fenced(lang) if !lang.is_empty() => lang.to_string(),
+                    _ => String::new(),
+                };
+                out.push(Line::from(vec![
+                    Span::styled(CODE_GUTTER.to_string(), theme.chrome()),
+                    Span::styled(
+                        if lang.is_empty() {
+                            " code".to_string()
+                        } else {
+                            format!(" {lang}")
+                        },
+                        theme.md_code_lang(),
+                    ),
+                ]));
+                code = Some(lang);
             }
             Event::End(TagEnd::CodeBlock) => {
-                lines.push(Line::from(std::mem::take(&mut current)));
-                lines.push(Line::from(Span::styled("```", theme.note())));
+                code = None;
+                push_blank(&mut out);
             }
+
+            // ---- tables ------------------------------------------------
+            Event::Start(Tag::Table(_)) => {
+                flush(
+                    &mut out,
+                    &mut spans,
+                    &mut pending_marker,
+                    quote_depth,
+                    &lists,
+                );
+                push_blank(&mut out);
+                table = Some(TableAcc::default());
+            }
+            Event::End(TagEnd::Table) => {
+                if let Some(acc) = table.take() {
+                    out.extend(acc.render(theme));
+                }
+                push_blank(&mut out);
+            }
+            Event::Start(Tag::TableHead) => {
+                if let Some(acc) = table.as_mut() {
+                    acc.in_head = true;
+                }
+            }
+            Event::End(TagEnd::TableHead) => {
+                if let Some(acc) = table.as_mut() {
+                    acc.finish_row();
+                    acc.in_head = false;
+                }
+            }
+            Event::End(TagEnd::TableRow) => {
+                if let Some(acc) = table.as_mut() {
+                    acc.finish_row();
+                }
+            }
+            Event::Start(Tag::TableCell) => cell.clear(),
+            Event::End(TagEnd::TableCell) => {
+                if let Some(acc) = table.as_mut() {
+                    acc.push_cell(std::mem::take(&mut cell));
+                }
+            }
+
+            // ---- inline ------------------------------------------------
+            Event::Start(Tag::Strong) => inline.strong = true,
+            Event::End(TagEnd::Strong) => inline.strong = false,
+            Event::Start(Tag::Emphasis) => inline.emphasis = true,
+            Event::End(TagEnd::Emphasis) => inline.emphasis = false,
+            Event::Start(Tag::Strikethrough) => inline.strike = true,
+            Event::End(TagEnd::Strikethrough) => inline.strike = false,
+
+            Event::Start(Tag::Link { dest_url, .. }) => {
+                link = Some((spans.len(), dest_url.to_string()));
+            }
+            Event::End(TagEnd::Link) => {
+                if let Some((start, url)) = link.take() {
+                    let shown: String = spans[start..].iter().map(|s| s.content.as_ref()).collect();
+                    for span in &mut spans[start..] {
+                        span.style = theme.md_link();
+                    }
+                    if shown.trim() != url.trim() && !url.is_empty() {
+                        spans.push(Span::styled(format!(" ({url})"), theme.note()));
+                    }
+                }
+            }
+
+            Event::Code(text) => {
+                spans.push(Span::styled(text.to_string(), theme.md_code()));
+            }
+
+            Event::Text(text) => {
+                if table.is_some() {
+                    cell.push_str(&text);
+                } else if code.is_some() {
+                    // Code bodies are literal: one output line per source line,
+                    // each on the code ground behind a gutter bar.
+                    for body in text.lines() {
+                        out.push(Line::from(vec![
+                            Span::styled(CODE_GUTTER.to_string(), theme.chrome()),
+                            Span::styled(format!(" {body}"), theme.md_code_block()),
+                        ]));
+                    }
+                } else {
+                    spans.push(Span::styled(text.to_string(), inline.style(theme)));
+                }
+            }
+
+            Event::SoftBreak | Event::HardBreak => {
+                if table.is_some() {
+                    cell.push(' ');
+                } else {
+                    flush(
+                        &mut out,
+                        &mut spans,
+                        &mut pending_marker,
+                        quote_depth,
+                        &lists,
+                    );
+                }
+            }
+
             _ => {}
         }
     }
-    if !current.is_empty() {
-        lines.push(Line::from(current));
+
+    flush(
+        &mut out,
+        &mut spans,
+        &mut pending_marker,
+        quote_depth,
+        &lists,
+    );
+    while out.last().is_some_and(is_blank) {
+        out.pop();
     }
-    if lines.is_empty() {
-        lines.push(Line::raw(""));
+    while out.first().is_some_and(is_blank) {
+        out.remove(0);
     }
-    lines
+    if out.is_empty() {
+        out.push(Line::raw(""));
+    }
+    out
+}
+
+/// Columns used by a thematic break.
+const RULE_COLS: usize = 40;
+/// Left bar drawn beside fenced code bodies.
+const CODE_GUTTER: &str = "▏";
+
+fn is_blank(line: &Line<'_>) -> bool {
+    line.spans.iter().all(|s| s.content.trim().is_empty())
+}
+
+/// Append a blank line, collapsing runs and never leading the document.
+fn push_blank(out: &mut Vec<Line<'static>>) {
+    if out.is_empty() || out.last().is_some_and(is_blank) {
+        return;
+    }
+    out.push(Line::raw(""));
+}
+
+/// Emit the buffered inline spans as one line, prefixed by the open block
+/// structure (quote bars, then list indent, then any pending list marker).
+fn flush(
+    out: &mut Vec<Line<'static>>,
+    spans: &mut Vec<Span<'static>>,
+    pending_marker: &mut Option<Span<'static>>,
+    quote_depth: usize,
+    lists: &[ListLevel],
+) {
+    if spans.is_empty() {
+        return;
+    }
+    let mut line: Vec<Span<'static>> = Vec::new();
+    for _ in 0..quote_depth {
+        line.push(Span::raw("▏ "));
+    }
+    let indent = lists.len().saturating_sub(1);
+    if indent > 0 {
+        line.push(Span::raw("  ".repeat(indent)));
+    }
+    match pending_marker.take() {
+        Some(marker) => line.push(marker),
+        // Continuation inside a list item aligns past the marker.
+        None if !lists.is_empty() => line.push(Span::raw("  ")),
+        None => {}
+    }
+    line.append(spans);
+    out.push(Line::from(line));
+}
+
+/// Accumulates table cells until the table closes and widths are known.
+#[derive(Default)]
+struct TableAcc {
+    in_head: bool,
+    head: Vec<String>,
+    rows: Vec<Vec<String>>,
+    row: Vec<String>,
+}
+
+impl TableAcc {
+    fn push_cell(&mut self, text: String) {
+        self.row.push(text.trim().to_string());
+    }
+
+    fn finish_row(&mut self) {
+        let row = std::mem::take(&mut self.row);
+        if row.is_empty() {
+            return;
+        }
+        if self.in_head {
+            self.head = row;
+        } else {
+            self.rows.push(row);
+        }
+    }
+
+    /// Pad every column to its widest cell so the grid lines up.
+    fn render(&self, theme: Theme) -> Vec<Line<'static>> {
+        let cols = self
+            .head
+            .len()
+            .max(self.rows.iter().map(Vec::len).max().unwrap_or(0));
+        if cols == 0 {
+            return Vec::new();
+        }
+        let mut widths = vec![0usize; cols];
+        for (i, w) in widths.iter_mut().enumerate() {
+            *w = self.head.get(i).map_or(0, |c| c.chars().count());
+            for row in &self.rows {
+                *w = (*w).max(row.get(i).map_or(0, |c| c.chars().count()));
+            }
+        }
+        let pad = |cells: &[String]| -> String {
+            (0..cols)
+                .map(|i| {
+                    let text = cells.get(i).map(String::as_str).unwrap_or("");
+                    format!("{text:<width$}", width = widths[i])
+                })
+                .collect::<Vec<_>>()
+                .join("  ")
+        };
+        let mut out = Vec::new();
+        if !self.head.is_empty() {
+            out.push(Line::styled(
+                pad(&self.head).trim_end().to_string(),
+                theme.md_table_head(),
+            ));
+            out.push(Line::styled(
+                widths
+                    .iter()
+                    .map(|w| "─".repeat(*w))
+                    .collect::<Vec<_>>()
+                    .join("  "),
+                theme.chrome(),
+            ));
+        }
+        for row in &self.rows {
+            out.push(Line::styled(pad(row).trim_end().to_string(), theme.text()));
+        }
+        out
+    }
 }
 
 /// File path of a unified diff, from `+++` / `---` / `diff --git` when present.
@@ -377,7 +764,10 @@ fn changed_span(old: &str, new: &str) -> Option<(Range<usize>, Range<usize>)> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Line, Segment, Theme, diff_lines, is_unified_diff, split_markdown_and_diffs};
+    use super::{
+        Line, Segment, Theme, diff_lines, is_unified_diff, markdown_lines, split_markdown_and_diffs,
+    };
+    use ratatui::style::Modifier;
 
     #[test]
     fn requires_a_hunk_header() {
@@ -493,6 +883,144 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect()
+    }
+
+    // ---- markdown ------------------------------------------------------
+
+    fn md(text: &str) -> Vec<Line<'static>> {
+        markdown_lines(text, Theme { colored: true })
+    }
+
+    fn md_text(text: &str) -> Vec<String> {
+        md(text).iter().map(plain).collect()
+    }
+
+    #[test]
+    fn headings_are_styled_by_level_and_spaced() {
+        let lines = md("# One\n\ntext\n\n## Two");
+        let joined = md_text("# One\n\ntext\n\n## Two").join("\n");
+        assert!(joined.contains("# One"), "{joined}");
+        assert!(joined.contains("## Two"), "{joined}");
+        // h1 and h2 must not paint identically.
+        let h1 = lines[0].spans[0].style;
+        let h2 = lines.last().unwrap().spans[0].style;
+        assert_ne!(h1.fg, h2.fg);
+        // No leading blank before the first heading.
+        assert!(!plain(&lines[0]).trim().is_empty());
+    }
+
+    #[test]
+    fn inline_emphasis_maps_to_modifiers() {
+        let lines = md("**bold** _it_ ~~gone~~ `code`");
+        let spans = &lines[0].spans;
+        let find = |needle: &str| {
+            spans
+                .iter()
+                .find(|s| s.content.contains(needle))
+                .unwrap_or_else(|| panic!("missing {needle}"))
+                .style
+        };
+        assert!(find("bold").add_modifier.contains(Modifier::BOLD));
+        assert!(find("it").add_modifier.contains(Modifier::ITALIC));
+        assert!(find("gone").add_modifier.contains(Modifier::CROSSED_OUT));
+        // Inline code is a tinted chip, not a modifier.
+        assert!(find("code").bg.is_some());
+    }
+
+    #[test]
+    fn fenced_code_keeps_a_gutter_and_shows_the_language() {
+        let lines = md_text("```rust\nlet x = 1;\nlet y = 2;\n```");
+        let joined = lines.join("\n");
+        assert!(joined.contains("rust"), "language tag missing: {joined}");
+        assert!(joined.contains("let x = 1;"), "{joined}");
+        assert!(joined.contains("let y = 2;"), "{joined}");
+        // Every body row carries the gutter bar.
+        for line in lines.iter().filter(|l| l.contains("let ")) {
+            assert!(line.starts_with('▏'), "no gutter: {line}");
+        }
+    }
+
+    #[test]
+    fn code_block_body_is_literal_not_reparsed() {
+        // `*` and `#` inside a fence must survive verbatim.
+        let joined = md_text("```\n# not a heading\n**not bold**\n```").join("\n");
+        assert!(joined.contains("# not a heading"), "{joined}");
+        assert!(joined.contains("**not bold**"), "{joined}");
+    }
+
+    #[test]
+    fn blockquotes_get_a_bar_per_level() {
+        let joined = md_text("> quoted").join("\n");
+        assert!(joined.contains('▏'), "{joined}");
+        assert!(joined.contains("quoted"), "{joined}");
+    }
+
+    #[test]
+    fn bullets_and_ordinals_indent_by_depth() {
+        let lines = md_text("- one\n- two\n  - deep");
+        let joined = lines.join("\n");
+        assert!(joined.contains("• one"), "{joined}");
+        assert!(joined.contains("• two"), "{joined}");
+        // Nested item uses the deeper glyph and is indented.
+        let deep = lines.iter().find(|l| l.contains("deep")).unwrap();
+        assert!(deep.contains('◦'), "{deep}");
+        assert!(deep.starts_with(' '), "not indented: {deep:?}");
+
+        let ordered = md_text("1. first\n2. second").join("\n");
+        assert!(ordered.contains("1. first"), "{ordered}");
+        assert!(ordered.contains("2. second"), "{ordered}");
+    }
+
+    #[test]
+    fn links_render_text_and_append_a_differing_url() {
+        let joined = md_text("[docs](https://x.dev)").join("\n");
+        assert!(joined.contains("docs"), "{joined}");
+        assert!(joined.contains("https://x.dev"), "{joined}");
+        // A bare autolink should not repeat itself.
+        let bare = md_text("<https://x.dev>").join("\n");
+        assert_eq!(bare.matches("https://x.dev").count(), 1, "{bare}");
+    }
+
+    #[test]
+    fn thematic_break_is_a_rule() {
+        let joined = md_text("a\n\n---\n\nb").join("\n");
+        assert!(joined.contains("─────"), "{joined}");
+    }
+
+    #[test]
+    fn tables_align_columns_under_a_header() {
+        let lines = md_text("| id | name |\n|----|------|\n| 1 | ada |\n| 20 | bo |");
+        let joined = lines.join("\n");
+        assert!(joined.contains("id"), "{joined}");
+        assert!(joined.contains("ada"), "{joined}");
+        // Column 2 starts at the same offset on both body rows.
+        let row1 = lines.iter().find(|l| l.contains("ada")).unwrap();
+        let row2 = lines.iter().find(|l| l.contains("bo")).unwrap();
+        assert_eq!(
+            row1.find("ada").unwrap(),
+            row2.find("bo").unwrap(),
+            "columns not aligned:\n{row1}\n{row2}"
+        );
+    }
+
+    #[test]
+    fn never_emits_two_blank_lines_in_a_row() {
+        let doc = "# H\n\n\npara one\n\n\n\n- a\n- b\n\n\n> q\n\n```\ncode\n```\n\n\nend";
+        let lines = md_text(doc);
+        let mut prev_blank = false;
+        for line in &lines {
+            let blank = line.trim().is_empty();
+            assert!(!(blank && prev_blank), "double blank in:\n{lines:#?}");
+            prev_blank = blank;
+        }
+        // And no blank at either edge.
+        assert!(!lines.first().unwrap().trim().is_empty());
+        assert!(!lines.last().unwrap().trim().is_empty());
+    }
+
+    #[test]
+    fn empty_input_still_yields_one_line() {
+        assert_eq!(md("").len(), 1);
     }
 
     #[test]

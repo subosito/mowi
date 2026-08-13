@@ -79,6 +79,12 @@ impl Tone {
 
 /// Braille spinner — one cell wide, no layout jitter.
 pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Frame used when animation is off (`MOW_NO_ANIM=1`, or a non-TTY capture).
+/// Deliberately not `SPINNER[0]`: a braille frame reads as a stalled spinner,
+/// while a filled dot reads as a steady "busy" light. The elapsed counter is
+/// what conveys progress in that mode.
+pub const SPINNER_STATIC: &str = "●";
 /// Typing indicator: a pulsing three-dot cycle for streaming assistant text.
 pub const TYPING: [&str; 4] = ["·  ", "·· ", "···", " ··"];
 
@@ -149,8 +155,37 @@ impl Theme {
         self.mantle()
     }
 
+    /// Status bar ground. Same sunk tone as the header so the frame reads as a
+    /// document held between two rails.
+    pub fn footer_bg(self) -> Style {
+        if self.colored {
+            Style::default().bg(mocha::MANTLE).fg(mocha::SUBTEXT0)
+        } else {
+            Style::default()
+        }
+    }
+
+    /// Scrim painted under a modal: the document stays visible but recedes, so
+    /// the overlay reads as "in front of" rather than "instead of".
+    pub fn scrim(self) -> Style {
+        if self.colored {
+            Style::default().bg(mocha::CRUST).fg(mocha::SURFACE1)
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        }
+    }
+
     pub fn user_bg(self) -> Style {
         self.surface()
+    }
+
+    /// The accent rail down the left edge of a user message.
+    pub fn user_rail(self) -> Style {
+        if self.colored {
+            Style::default().fg(mocha::LAVENDER).bg(mocha::SURFACE0)
+        } else {
+            Style::default()
+        }
     }
 
     /// Selected row in a list/table overlay.
@@ -224,6 +259,19 @@ impl Theme {
     pub fn accent(self) -> Style {
         if self.colored {
             Style::default().fg(mocha::MAUVE)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        }
+    }
+
+    /// Overlay title: accent on the overlay ground, so the title does not sit
+    /// in a differently-coloured hole in the border.
+    pub fn overlay_title(self) -> Style {
+        if self.colored {
+            Style::default()
+                .fg(mocha::MAUVE)
+                .bg(mocha::SURFACE1)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         }

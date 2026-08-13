@@ -214,6 +214,32 @@ pub struct VersionInfo {
     pub name: String,
     pub version: String,
     pub rpc: String,
+    /// Methods this server advertises (empty when it predates `capabilities`).
+    pub methods: Vec<String>,
+    /// Subset answered while a prompt is in flight.
+    pub control_methods: Vec<String>,
+}
+
+impl VersionInfo {
+    /// Feature-detect a method. Servers older than the capability list
+    /// advertise nothing, so assume support there and let the call fail with
+    /// -32601 rather than disabling UI against a server that may well have it.
+    pub fn supports(&self, method: &str) -> bool {
+        self.methods.is_empty() || self.methods.iter().any(|m| m == method)
+    }
+}
+
+/// Pull a `[String]` field, tolerating absence and non-string members.
+fn string_list(v: &Value, key: &str) -> Vec<String> {
+    v.get(key)
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Validate a `version` result. The protocol is additive: a server newer than
@@ -245,6 +271,8 @@ pub fn check_version(v: &Value) -> Result<VersionInfo, Error> {
             .unwrap_or("")
             .to_string(),
         rpc: rpc.to_string(),
+        methods: string_list(v, "methods"),
+        control_methods: string_list(v, "control_methods"),
     })
 }
 
@@ -869,7 +897,22 @@ mod tests {
     #[test]
     fn handshake_requires_rpc_3() {
         let ok = serde_json::json!({"name":"mow","version":"0.1.0","rpc":"3"});
-        assert_eq!(check_version(&ok).unwrap().rpc, "3");
+        let info = check_version(&ok).unwrap();
+        assert_eq!(info.rpc, "3");
+        // No capability list (older server): assume support rather than
+        // disabling features we cannot prove absent.
+        assert!(info.methods.is_empty());
+        assert!(info.supports("compact"));
+
+        let modern = serde_json::json!({
+            "name":"mow","version":"0.1.0","rpc":"4",
+            "methods":["prompt","context","compact"],
+            "control_methods":["context"],
+        });
+        let info = check_version(&modern).unwrap();
+        assert!(info.supports("context"));
+        assert!(!info.supports("skill.list"));
+        assert_eq!(info.control_methods, vec!["context".to_string()]);
 
         // Additive protocol: a newer server is fine, an older one is not.
         let newer = serde_json::json!({"name":"mow","version":"0.1.0","rpc":"4"});
