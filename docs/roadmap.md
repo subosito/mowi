@@ -3,7 +3,7 @@
 Ship a **running** UI against `mow rpc` v3, then climb toward Go mowi
 parity. Do not block v0 on diffs or `/model`.
 
-## Phase 0 — crate + spawn (now)
+## Phase 0 — crate + spawn ✓
 
 - Cargo bin `mowi`
 - Spawn `$MOW_BIN` or `mow` with `rpc` + passthrough engine flags
@@ -14,7 +14,7 @@ parity. Do not block v0 on diffs or `/model`.
 - Render `event` token deltas as live assistant text
 - Tests: client codec against fixture lines (no live mow required)
 
-## Phase 1 — host protocol in the UI
+## Phase 1 — host protocol in the UI ✓
 
 - `transcript` seed on `--session` / `--continue`
 - `perm.set` + `perm.ask` strip (y/n/a)
@@ -25,7 +25,7 @@ parity. Do not block v0 on diffs or `/model`.
 - Token chip from `prompt.usage` + delegate.usage events
 - Follow-bottom / scroll (ctrl+u/d)
 
-## Phase 2 — document quality
+## Phase 2 — document quality ✓
 
 - Markdown in assistant entries
 - Tool lines from tool.start/end
@@ -35,7 +35,7 @@ parity. Do not block v0 on diffs or `/model`.
 - Theme mocha + NO_COLOR
 - Virtualized transcript
 
-## Phase 3 — polish
+## Phase 3 — polish ✓
 
 - Queued prompts while busy
 - Select-mode mouse
