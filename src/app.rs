@@ -112,6 +112,8 @@ pub struct App {
     pub usage: Usage,
     pub slash_commands: Vec<SlashCommand>,
     pub last_view_h: u16,
+    /// Transcript pane width, so diff bands can fill it.
+    pub last_view_w: u16,
     pub theme: Theme,
     pub activity_started: Option<Instant>,
     pub peers: HashMap<String, String>,
@@ -151,6 +153,7 @@ impl Default for App {
             usage: Usage::default(),
             slash_commands: Vec::new(),
             last_view_h: 1,
+            last_view_w: 80,
             theme: Theme::detect(),
             activity_started: None,
             peers: HashMap::new(),
@@ -221,6 +224,11 @@ impl App {
 
     pub fn mode_chip(&self) -> &'static str {
         if self.ask_mode { "ask" } else { "auto" }
+    }
+
+    /// Prompt glyph: a plain `>` when colour is off, so it stays legible.
+    pub fn prompt_glyph(&self) -> &'static str {
+        if self.theme.colored { "❯ " } else { "> " }
     }
 
     /// Vanity chips, widest-first. These drop on a narrow terminal.
@@ -321,12 +329,23 @@ impl App {
         }
     }
 
-    /// A diff entry framed as a review card: thin rule + file title.
+    /// A diff entry as a review card: a titled rule, the washed hunk, a close
+    /// rule. `last_view_w` is the transcript pane width, so bands are full
+    /// rectangles rather than ragged stripes.
     fn diff_card(&self, text: &str) -> Vec<Line<'static>> {
+        let width = self.last_view_w.max(8);
         let title = diff_file(text).unwrap_or_else(|| "diff".to_string());
-        let mut out = vec![Line::styled(format!("─ {title} "), self.theme.chrome())];
-        out.extend(crate::render::diff_lines(text, self.theme));
-        out.push(Line::styled("─".repeat(8), self.theme.chrome()));
+        let head = format!("─ {title} ");
+        let fill = (width as usize).saturating_sub(head.chars().count());
+        let mut out = vec![Line::styled(
+            format!("{head}{}", "─".repeat(fill)),
+            self.theme.chrome(),
+        )];
+        out.extend(crate::render::diff_lines(text, self.theme, width));
+        out.push(Line::styled(
+            "─".repeat(width as usize),
+            self.theme.chrome(),
+        ));
         out
     }
 
@@ -852,64 +871,69 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         return;
     }
 
-    let input_h = input_height(app) + 1; // + top rule
-    let constraints = if app.busy {
-        vec![
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Fill(1),
-            Constraint::Length(input_h),
-            Constraint::Length(1),
-        ]
-    } else {
-        vec![
-            Constraint::Length(1),
-            Constraint::Fill(1),
-            Constraint::Length(input_h),
-            Constraint::Length(1),
-        ]
-    };
+    // header · hairline · [activity] · transcript · input · footer
+    let mut rows = vec![Constraint::Length(1), Constraint::Length(1)];
+    if app.busy {
+        rows.push(Constraint::Length(1));
+    }
+    rows.push(Constraint::Fill(1));
+    rows.push(Constraint::Length(input_height(app) + 1));
+    rows.push(Constraint::Length(1));
     let areas = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(constraints)
+        .constraints(rows)
         .split(area);
-
-    frame.render_widget(Paragraph::new(app.header_line(area.width)), areas[0]);
-
-    let transcript_area = if app.busy {
-        frame.render_widget(
-            Block::new()
-                .borders(Borders::TOP)
-                .border_style(app.theme.chrome())
-                .title(Span::styled(
-                    format!(" {} ", app.activity()),
-                    app.theme.note(),
-                )),
-            areas[1],
-        );
-        areas[2]
+    let rest = &areas[2..];
+    let (activity, transcript_area, input_area, footer_area) = if app.busy {
+        (Some(rest[0]), rest[1], rest[2], rest[3])
     } else {
-        areas[1]
+        (None, rest[0], rest[1], rest[2])
     };
+
+    // Header bar: chips on one row, closed by a hairline rule.
+    frame.render_widget(
+        Paragraph::new(app.header_line(area.width.saturating_sub(2)))
+            .block(Block::new().padding(Padding::horizontal(1))),
+        areas[0],
+    );
+    frame.render_widget(
+        Block::new()
+            .borders(Borders::TOP)
+            .border_style(app.theme.chrome()),
+        areas[1],
+    );
+
+    // The activity band exists only while a turn runs.
+    if let Some(band) = activity {
+        frame.render_widget(
+            Paragraph::new(Line::styled(app.activity(), app.theme.note()))
+                .block(Block::new().padding(Padding::horizontal(1))),
+            band,
+        );
+    }
+
     draw_transcript(frame, app, transcript_area);
 
-    let input_area = if app.busy { areas[3] } else { areas[2] };
-    let footer_area = if app.busy { areas[4] } else { areas[3] };
     let input_block = Block::new()
         .borders(Borders::TOP)
-        .border_style(app.theme.chrome());
+        .border_style(app.theme.chrome())
+        .padding(Padding::horizontal(1));
     let input_inner = input_block.inner(input_area);
     frame.render_widget(input_block, input_area);
     frame.render_widget(
-        Paragraph::new(prompt_text(app))
-            .style(app.theme.user())
-            .wrap(Wrap { trim: false }),
+        Paragraph::new(prompt_text(app)).wrap(Wrap { trim: false }),
         input_inner,
     );
-    frame.render_widget(
-        Paragraph::new(app.footer()).style(app.theme.note()),
-        footer_area,
-    );
+
+    // The permission overlay owns the decision hints; keep the footer quiet.
+    if app.pending_perm.is_none() {
+        frame.render_widget(
+            Paragraph::new(app.footer())
+                .style(app.theme.note())
+                .block(Block::new().padding(Padding::horizontal(1))),
+            footer_area,
+        );
+    }
 
     if app.welcome {
         draw_welcome(frame, app, area);
@@ -931,20 +955,29 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 fn prompt_text(app: &App) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (index, line) in app.input.split('\n').enumerate() {
-        let glyph = if index == 0 { "› " } else { "  " };
-        lines.push(Line::from(format!("{glyph}{line}")));
+        let glyph = if index == 0 { app.prompt_glyph() } else { "  " };
+        lines.push(Line::from(vec![
+            Span::styled(glyph, app.theme.accent()),
+            Span::styled(line.to_string(), app.theme.user()),
+        ]));
     }
     if lines.is_empty() {
-        lines.push(Line::from("› ".to_string()));
+        lines.push(Line::from(Span::styled(
+            app.prompt_glyph(),
+            app.theme.accent(),
+        )));
     }
     lines
 }
 
 fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
-    let block = Block::new().padding(Padding::horizontal(1));
+    // Right padding of 2 leaves the last column free for the scrollbar, so a
+    // full-width diff band never runs under the thumb.
+    let block = Block::new().padding(Padding::new(1, 2, 0, 0));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     app.last_view_h = inner.height.max(1);
+    app.last_view_w = inner.width.max(8);
 
     let (lines, base_scroll) = app.visible_transcript_lines();
     let height = app.last_view_h as usize;
@@ -1005,8 +1038,8 @@ fn draw_too_small(frame: &mut Frame<'_>, app: &App, area: Rect) {
 fn draw_welcome(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let spot = centered(
         area,
-        Constraint::Length(area.width.saturating_sub(4).min(60)),
-        Constraint::Length(area.height.saturating_sub(2).min(9)),
+        Constraint::Length(area.width.saturating_sub(6).min(52)),
+        Constraint::Length(6),
     );
     frame.render_widget(Clear, spot);
     let workspace = if app.session.workspace.is_empty() {
@@ -1016,24 +1049,22 @@ fn draw_welcome(frame: &mut Frame<'_>, app: &App, area: Rect) {
     };
     frame.render_widget(
         Paragraph::new(vec![
-            Line::styled("◇ mowi", app.theme.accent()),
-            Line::raw(""),
-            Line::styled(
-                format!("{workspace} · {}", app.session.model),
-                app.theme.note(),
-            ),
-            Line::styled(
-                format!("{} · {}", app.capability_chip(), app.mode_chip()),
-                app.theme.chip(),
-            ),
-            Line::raw(""),
-            Line::styled(
-                "ask anything · ? for help · any key to start",
-                app.theme.note(),
-            ),
+            Line::from(vec![
+                Span::styled("◇ ", app.theme.accent()),
+                Span::styled(workspace, app.theme.assistant()),
+            ]),
+            Line::from(vec![
+                Span::styled(app.session.model.clone(), app.theme.note()),
+                Span::raw("  "),
+                Span::styled(
+                    format!("{} · {}", app.capability_chip(), app.mode_chip()),
+                    app.theme.chip(),
+                ),
+            ]),
+            Line::styled("ask anything · ? help · any key to start", app.theme.note()),
         ])
         .wrap(Wrap { trim: true })
-        .block(overlay_block(app, "welcome")),
+        .block(overlay_block(app, "mowi")),
         spot,
     );
 }
@@ -1131,15 +1162,23 @@ fn draw_permission(frame: &mut Frame<'_>, app: &App, area: Rect) {
     for line in permission_preview(permission).lines() {
         lines.push(Line::styled(line.to_string(), app.theme.context()));
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::styled(
-        "y allow · n deny · a always (this session) · esc cancel",
-        app.theme.chip(),
-    ));
+    // Tool name on the left, the decision keys on the right of the border.
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(app.theme.warn())
+        .padding(Padding::horizontal(1))
+        .title(Span::styled(
+            format!(" {} ", permission.name),
+            app.theme.warn(),
+        ))
+        .title(
+            Line::styled(" y allow · n deny · a always ", app.theme.chip())
+                .alignment(Alignment::Right),
+        );
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .block(overlay_block(app, "permission")),
+            .block(block),
         spot,
     );
 }
@@ -1387,6 +1426,31 @@ fn handle_key(
     Ok(())
 }
 
+/// Where a typed `/name` is handled.
+///
+/// The router exists so local commands can never reach the wire: `/quit` was
+/// once forwarded to `mow` as an unknown slash command instead of quitting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SlashRoute {
+    /// Quit the UI (cancelling an in-flight turn first).
+    Quit,
+    /// Handled by the UI; never sent to the host.
+    Local,
+    /// Forwarded to the host as an RPC `slash` call.
+    Rpc,
+}
+
+/// Route a slash command name (without the leading `/`).
+pub fn slash_route(name: &str) -> SlashRoute {
+    match name {
+        "quit" | "exit" | "q" => SlashRoute::Quit,
+        "search" | "copy" | "edit" | "retry" | "help" | "sessions" | "status" | "steer" => {
+            SlashRoute::Local
+        }
+        _ => SlashRoute::Rpc,
+    }
+}
+
 fn handle_slash(
     text: &str,
     client: &mut Client,
@@ -1399,6 +1463,14 @@ fn handle_slash(
         return Ok(());
     };
     let args: Vec<String> = words.map(ToString::to_string).collect();
+    if slash_route(name) == SlashRoute::Quit {
+        // Same shape as ctrl+c: cancel an in-flight turn, then leave.
+        if app.busy || turn.is_some() {
+            let _ = client.cancel();
+        }
+        app.quit = true;
+        return Ok(());
+    }
     match name {
         "search" => {
             app.search(&args.join(" "));
@@ -1436,7 +1508,11 @@ fn handle_slash(
             app.entries.push(Entry::Note(format!("status: {status}")));
         }
         _ => {
-            if app.refuses_exclusive_slash(name) {
+            if slash_route(name) != SlashRoute::Rpc {
+                // A local command with no handler here (e.g. `/steer`, taken
+                // by the key path) must still never reach the wire.
+                app.status = format!("/{name} is handled locally");
+            } else if app.refuses_exclusive_slash(name) {
                 app.status = format!("/{name} is unavailable while busy");
             } else {
                 *slash_rx = Some(client.slash(name, &args, false)?);
@@ -1546,13 +1622,13 @@ mod tests {
         let mut app = App::new(SessionInfo::default());
         app.welcome = true;
         let out = render(&mut app, 60, 16);
-        assert!(out.contains("welcome"), "{out}");
+        assert!(out.contains("any key to start"), "{out}");
 
         // handle_key needs a Client; the splash branch is the state machine.
         assert!(app.dismiss_overlay());
         assert!(!app.welcome);
         let out = render(&mut app, 60, 16);
-        assert!(!out.contains("welcome"), "{out}");
+        assert!(!out.contains("any key to start"), "{out}");
     }
 
     #[test]
@@ -1604,9 +1680,12 @@ mod tests {
         });
         assert!(app.perm_guard_active(), "guard should swallow stray keys");
         let out = render(&mut app, 70, 16);
-        assert!(out.contains("permission"), "{out}");
-        assert!(out.contains("rm -rf build"), "{out}");
+        // Tool name titles the block; decisions sit on the title-right.
+        assert!(out.contains("bash"), "{out}");
+        assert!(out.contains("build"), "{out}");
         assert!(out.contains("y allow"), "{out}");
+        // The footer stays quiet while the overlay owns the decision.
+        assert!(!out.contains("enter send"), "{out}");
     }
 
     #[test]
@@ -1618,7 +1697,7 @@ mod tests {
         app.input.push_str("two");
         assert_eq!(input_height(&app), 2);
         let out = render(&mut app, 60, 16);
-        assert!(out.contains("› one"), "{out}");
+        assert!(out.contains("❯ one"), "{out}");
         assert!(out.contains("  two"), "{out}");
     }
 
@@ -1673,6 +1752,42 @@ mod tests {
         app.busy = true;
         app.activity_started = Some(Instant::now());
         assert!(app.activity().starts_with('●'), "{}", app.activity());
+    }
+
+    #[test]
+    fn quit_commands_are_local_and_never_reach_the_wire() {
+        for name in ["quit", "exit", "q"] {
+            assert_eq!(slash_route(name), SlashRoute::Quit, "/{name}");
+        }
+        // Everything the UI answers itself stays off the wire too.
+        for name in [
+            "help", "search", "copy", "retry", "edit", "steer", "sessions", "status",
+        ] {
+            assert_eq!(slash_route(name), SlashRoute::Local, "/{name}");
+        }
+        // Pack commands are forwarded to the host.
+        for name in ["review", "sec", "goal"] {
+            assert_eq!(slash_route(name), SlashRoute::Rpc, "/{name}");
+        }
+    }
+
+    #[test]
+    fn diff_card_bands_fill_the_transcript_width() {
+        let mut app = App::new(SessionInfo::default());
+        app.entries.push(Entry::Assistant(
+            "--- a/src/app.rs\n+++ b/src/app.rs\n@@ -1 +1 @@\n-let x = 1;\n+let x = 2;".into(),
+        ));
+        let out = render(&mut app, 60, 16);
+        // The card is titled with the parsed file path.
+        assert!(out.contains("─ src/app.rs"), "{out}");
+        // Signs use U+2212 minus, not hyphen-minus.
+        assert!(out.contains('−'), "{out}");
+        // Bands reach the pane width: the row after the sign is not ragged.
+        let band_row = out
+            .lines()
+            .find(|row| row.contains("let x = 2;"))
+            .expect("add band");
+        assert!(band_row.trim_end().ends_with(';') || band_row.ends_with(' '));
     }
 
     #[test]

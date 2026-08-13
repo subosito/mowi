@@ -28,6 +28,7 @@ operator experience**, not a subset that forgets permissions or resume.
 | ctrl+s | select mode — release mouse for native copy |
 | ctrl+/ or `?` on empty | help overlay (local keys + `slash.list`) |
 | ctrl+c | quit (cancel first if busy) |
+| `q` on empty input | quit when idle |
 | Arrow-up on empty | edit last prompt |
 | any key | dismiss the welcome splash |
 
@@ -45,8 +46,12 @@ Host-side (this crate, or slash if registered):
 | `/sessions` | RPC `sessions` — overlay list + `mowi --session <id>` hint |
 | `/search` | UI-local find in painted transcript |
 | `/copy` `/retry` `/edit` | UI-local / re-`prompt` |
+| `/quit` `/exit` `/q` | UI-local quit (cancels an in-flight turn first) |
 | `/model` `/effort` | later; Engine/CLI today |
 | `/review` `/sec` `/goal` … | RPC `slash` — only if `slash.list` has them |
+
+Local commands are routed by name before the RPC fallback, so `/quit` and
+friends can never be sent to the host as an unknown slash command.
 
 Exclusive slash: refuse while `status.busy`.
 
@@ -89,8 +94,12 @@ del `#f38ba8` on ~`#4d3240`. Syntax highlight **context only**. Word-diff:
 shared tokens stay full accent; changed tokens invert. Gutter unbanded,
 tinted numbers. See mow `packs/mowi/styles.go` / `diff_*.go`.
 
-Diff entries render as a review card: a thin `─ <file>` rule parsed from the
-`+++` header around the add/del lines. Full word-diff is still open.
+Diff entries render as a review card: a `─ <file>` rule parsed from the `+++`
+header, then full-width bands. Add/del rows are padded to the transcript width
+so the wash is a rectangle; the sign column uses `+` / `−` (U+2212) in accent;
+`@@` hunks and `---` / `+++` headers stay muted meta; context rows carry no
+wash. A `-` row followed by a `+` row gets its changed span inverted as a chip
+when the rows share enough affix to make a word-level edit meaningful.
 
 ## Resume / scroll
 
