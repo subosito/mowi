@@ -3,24 +3,27 @@
 //! The app owns no Engine. Every state change is either a local key edit or a
 //! message from the `mow rpc` child (`rpc::Client`).
 
+use std::collections::HashMap;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
+use std::time::Instant;
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame, Terminal,
     backend::Backend,
     layout::{Constraint, Direction, Layout},
-    style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
 };
 use serde_json::Value;
 
+use crate::render::{is_unified_diff, markdown_lines};
 use crate::rpc::{
     Client, Error, Notification, PermissionRequest, SessionInfo, SlashCommand, TranscriptMessage,
     token_delta,
 };
+use crate::theme::Theme;
 
 /// One painted transcript block.
 #[derive(Debug, Clone, PartialEq)]
@@ -28,6 +31,10 @@ pub enum Entry {
     User(String),
     Assistant(String),
     Note(String),
+    Tool {
+        name: String,
+        duration_ms: Option<u64>,
+    },
 }
 
 /// Host and delegated token usage for the header chip.
@@ -79,6 +86,9 @@ pub struct App {
     pub usage: Usage,
     pub slash_commands: Vec<SlashCommand>,
     pub last_view_h: u16,
+    pub theme: Theme,
+    pub activity_started: Option<Instant>,
+    pub peers: HashMap<String, String>,
 }
 
 impl Default for App {
@@ -97,6 +107,9 @@ impl Default for App {
             usage: Usage::default(),
             slash_commands: Vec::new(),
             last_view_h: 1,
+            theme: Theme::detect(),
+            activity_started: None,
+            peers: HashMap::new(),
         }
     }
 }
@@ -165,23 +178,78 @@ impl App {
     pub fn transcript_lines(&self) -> Vec<Line<'_>> {
         let mut out: Vec<Line<'_>> = Vec::new();
         for e in &self.entries {
-            match e {
-                Entry::User(t) => out.push(Line::from(vec![
-                    Span::styled("> ", Style::default().add_modifier(Modifier::BOLD)),
-                    Span::raw(t.as_str()),
-                ])),
-                Entry::Assistant(t) => out.push(Line::raw(t.as_str())),
-                Entry::Note(t) => out.push(Line::styled(
-                    t.as_str(),
-                    Style::default().add_modifier(Modifier::DIM),
-                )),
-            }
+            out.extend(self.entry_lines(e));
             out.push(Line::raw(""));
         }
         if !self.live.is_empty() {
-            out.push(Line::raw(self.live.as_str()));
+            out.extend(markdown_lines(self.live.as_str(), self.theme));
         }
         out
+    }
+
+    fn entry_lines<'a>(&self, entry: &'a Entry) -> Vec<Line<'a>> {
+        match entry {
+            Entry::User(t) => vec![Line::from(vec![
+                Span::styled("> ", self.theme.user()),
+                Span::styled(t.as_str(), self.theme.user()),
+            ])],
+            Entry::Assistant(t) => {
+                if is_unified_diff(t) {
+                    crate::render::diff_lines(t, self.theme)
+                } else {
+                    markdown_lines(t, self.theme)
+                }
+            }
+            Entry::Note(t) => vec![Line::styled(t.as_str(), self.theme.note())],
+            Entry::Tool { name, duration_ms } => {
+                let suffix = duration_ms
+                    .map(|ms| format!(" · {:.1}s", ms as f64 / 1000.0))
+                    .unwrap_or_default();
+                vec![Line::styled(format!("⚙ {name}{suffix}"), self.theme.note())]
+            }
+        }
+    }
+
+    /// Materialize only a bounded transcript window for painting large sessions.
+    fn visible_transcript_lines(&self) -> (Vec<Line<'_>>, u16) {
+        const OVERSCAN_ENTRIES: usize = 256;
+        let total = self.entries.len();
+        let start = if self.follow {
+            total.saturating_sub(OVERSCAN_ENTRIES)
+        } else {
+            ((self.scroll as usize) / 2)
+                .saturating_sub(OVERSCAN_ENTRIES / 4)
+                .min(total)
+        };
+        let end = (start + OVERSCAN_ENTRIES).min(total);
+        let mut lines = Vec::new();
+        for entry in &self.entries[start..end] {
+            lines.extend(self.entry_lines(entry));
+            lines.push(Line::raw(""));
+        }
+        if end == total && !self.live.is_empty() {
+            lines.extend(markdown_lines(self.live.as_str(), self.theme));
+        }
+        (lines, (start.saturating_mul(2)) as u16)
+    }
+
+    pub fn activity(&self) -> String {
+        if !self.busy {
+            return String::new();
+        }
+        let elapsed = self
+            .activity_started
+            .map(|start| start.elapsed().as_secs_f32())
+            .unwrap_or(0.0);
+        format!("● {:.1}s · {}", elapsed, self.status_or_default())
+    }
+
+    fn status_or_default(&self) -> &str {
+        if self.status.is_empty() {
+            "thinking"
+        } else {
+            &self.status
+        }
     }
 
     /// Apply an `event` / `perm.ask` notification.
@@ -207,10 +275,13 @@ impl App {
             "loop.run.start" | "run.start" => {
                 self.busy = true;
                 self.status = "running".into();
+                self.activity_started = Some(Instant::now());
             }
             "loop.run.end" | "run.end" => {
                 self.busy = false;
                 self.status.clear();
+                self.activity_started = None;
+                self.finish_peers();
             }
             k if k.ends_with("tool.start") || k == "tool.start" => {
                 if let Some(name) = params
@@ -219,12 +290,49 @@ impl App {
                     .and_then(|v| v.as_str())
                 {
                     self.status = format!("tool · {name}");
+                    self.entries.push(Entry::Tool {
+                        name: name.to_string(),
+                        duration_ms: None,
+                    });
                 }
             }
             k if k.ends_with("tool.end") || k == "tool.end" => {
+                if let Some(Entry::Tool { duration_ms, .. }) = self
+                    .entries
+                    .iter_mut()
+                    .rev()
+                    .find(|entry| matches!(entry, Entry::Tool { .. }))
+                {
+                    *duration_ms = params.get("duration_ms").and_then(Value::as_u64);
+                }
+                if params.get("name").and_then(Value::as_str) == Some("acp_delegate") {
+                    self.finish_peers();
+                }
                 self.status.clear();
             }
             _ => {}
+        }
+        if kind.contains("delegate") && kind.contains("chunk") {
+            let agent = params
+                .get("agent")
+                .and_then(Value::as_str)
+                .unwrap_or("peer")
+                .to_string();
+            self.peers
+                .entry(agent.clone())
+                .or_default()
+                .push_str(params.get("delta").and_then(Value::as_str).unwrap_or(""));
+            self.status = format!("→ {agent} · receiving");
+        } else if kind.contains("delegate") && kind.contains("progress") {
+            let agent = params
+                .get("agent")
+                .and_then(Value::as_str)
+                .unwrap_or("peer");
+            let phase = params
+                .get("phase")
+                .and_then(Value::as_str)
+                .unwrap_or("working");
+            self.status = format!("→ {agent} · {phase}");
         }
         if let Some(d) = token_delta(params) {
             self.live.push_str(d);
@@ -234,9 +342,16 @@ impl App {
         }
     }
 
+    fn finish_peers(&mut self) {
+        for (agent, _) in self.peers.drain() {
+            self.entries.push(Entry::Note(format!("→ {agent} · done")));
+        }
+    }
+
     /// Finish the turn: commit live text (or the final `prompt` result).
     pub fn finish_turn(&mut self, result: Result<Value, Error>) {
         self.busy = false;
+        self.activity_started = None;
         match result {
             Ok(v) => {
                 self.usage.input_tokens +=
@@ -264,6 +379,7 @@ impl App {
             }
         }
         self.status.clear();
+        self.finish_peers();
         if self.follow {
             self.scroll = u16::MAX;
         }
@@ -323,40 +439,67 @@ fn scroll_down(app: &mut App, n: u16) {
 }
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
-    let areas = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
+    let constraints = if app.busy {
+        vec![
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Min(1),
             Constraint::Length(1),
             Constraint::Length(1),
-        ])
+        ]
+    } else {
+        vec![
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ]
+    };
+    let areas = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
         .split(frame.area());
 
     frame.render_widget(
-        Paragraph::new(app.header()).style(Style::default().add_modifier(Modifier::BOLD)),
+        Paragraph::new(app.header()).style(app.theme.header()),
         areas[0],
     );
 
-    app.last_view_h = areas[1].height.max(1);
-    let lines = app.transcript_lines();
+    let transcript_area = if app.busy {
+        frame.render_widget(
+            Paragraph::new(app.activity()).style(app.theme.note()),
+            areas[1],
+        );
+        areas[2]
+    } else {
+        areas[1]
+    };
+    app.last_view_h = transcript_area.height.max(1);
+    let (lines, base_scroll) = app.visible_transcript_lines();
     let height = app.last_view_h as usize;
     let scroll = if app.follow {
         lines.len().saturating_sub(height) as u16
     } else {
-        app.scroll.min(lines.len().saturating_sub(height) as u16)
+        app.scroll
+            .saturating_sub(base_scroll)
+            .min(lines.len().saturating_sub(height) as u16)
     };
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0)),
-        areas[1],
+        transcript_area,
     );
 
-    frame.render_widget(Paragraph::new(format!("› {}", app.input)), areas[2]);
+    let input_area = if app.busy { areas[3] } else { areas[2] };
+    let footer_area = if app.busy { areas[4] } else { areas[3] };
     frame.render_widget(
-        Paragraph::new(app.footer()).style(Style::default().add_modifier(Modifier::DIM)),
-        areas[3],
+        Paragraph::new(format!("› {}", app.input)).style(app.theme.user()),
+        input_area,
+    );
+    frame.render_widget(
+        Paragraph::new(app.footer()).style(app.theme.note()),
+        footer_area,
     );
 }
 
@@ -496,6 +639,7 @@ fn handle_key(
                 app.follow = true;
                 app.scroll = u16::MAX;
                 app.status = "running".into();
+                app.activity_started = Some(Instant::now());
                 *turn = Some(client.prompt(&text)?);
             }
         }
@@ -636,8 +780,61 @@ mod tests {
 
         app.finish_turn(Ok(serde_json::json!({"text":"hello"})));
         assert!(!app.busy);
-        assert_eq!(app.entries, vec![Entry::Assistant("hello".into())]);
+        assert_eq!(
+            app.entries,
+            vec![
+                Entry::Assistant("hello".into()),
+                Entry::Note("→ peer · done".into())
+            ]
+        );
         assert!(app.live.is_empty());
+    }
+
+    #[test]
+    fn tool_events_add_and_complete_tool_line() {
+        let mut app = App::new(SessionInfo::default());
+        app.on_notification(&Notification {
+            method: "event".into(),
+            params: serde_json::json!({
+                "type": "loop.tool.start", "tool": "grep"
+            }),
+        });
+        assert_eq!(
+            app.entries,
+            vec![Entry::Tool {
+                name: "grep".into(),
+                duration_ms: None
+            }]
+        );
+        assert_eq!(app.status, "tool · grep");
+        app.on_notification(&Notification {
+            method: "event".into(),
+            params: serde_json::json!({
+                "type": "loop.tool.end", "duration_ms": 400
+            }),
+        });
+        assert_eq!(
+            app.entries,
+            vec![Entry::Tool {
+                name: "grep".into(),
+                duration_ms: Some(400)
+            }]
+        );
+    }
+
+    #[test]
+    fn markdown_and_diff_entries_render() {
+        let mut app = App::new(SessionInfo::default());
+        app.entries
+            .push(Entry::Assistant("**bold** and `code`".into()));
+        assert!(
+            app.transcript_lines()
+                .iter()
+                .any(|line| line.spans.len() > 1)
+        );
+        assert!(is_unified_diff("@@ -1 +1 @@\n+foo\n-bar"));
+        app.theme = Theme { colored: false };
+        let _ = app.transcript_lines();
     }
 
     #[test]

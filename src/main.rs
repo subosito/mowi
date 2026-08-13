@@ -5,7 +5,9 @@
 //! to peers — peer management belongs to mow.
 
 mod app;
+mod render;
 mod rpc;
+mod theme;
 
 use std::io::{self, Write};
 use std::process::ExitCode;
