@@ -24,7 +24,11 @@ use rpc::Client;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Parser)]
-#[command(name = "mowi", about = "Ratatui client for the mow harness (mow rpc)")]
+#[command(
+    name = "mowi",
+    version,
+    about = "Ratatui client for the mow harness (mow rpc)"
+)]
 struct Cli {
     /// mow binary to spawn (`mow rpc …`).
     #[arg(long, env = "MOW_BIN", default_value = "mow")]
@@ -134,7 +138,15 @@ fn ping(cli: &Cli) -> Result<(), rpc::Error> {
 
 fn tui(cli: &Cli) -> Result<(), rpc::Error> {
     let (mut client, session, _version) = connect(cli)?;
-    let mut app = App::new(session);
+    let mode = if cli.auto { "auto" } else { "ask" };
+    client.perm_set(mode, HANDSHAKE_TIMEOUT)?;
+    let mut app = if cli.session.is_some() || cli.continue_session {
+        let messages = client.transcript(HANDSHAKE_TIMEOUT)?;
+        App::from_transcript(session, messages)
+    } else {
+        App::new(session)
+    };
+    app.slash_commands = client.slash_list(HANDSHAKE_TIMEOUT)?;
 
     enable_raw_mode().map_err(rpc::Error::Io)?;
     let mut stdout = io::stdout();
@@ -172,7 +184,13 @@ mod tests {
         ]);
         assert_eq!(
             cli.engine_flags(),
-            vec!["--session", "abc", "--allow-write", "--allow-shell", "--ask"]
+            vec![
+                "--session",
+                "abc",
+                "--allow-write",
+                "--allow-shell",
+                "--ask"
+            ]
         );
         assert_eq!(cli.mow_bin, "mow");
     }

@@ -17,7 +17,10 @@ use ratatui::{
 };
 use serde_json::Value;
 
-use crate::rpc::{Client, Error, Notification, SessionInfo, token_delta};
+use crate::rpc::{
+    Client, Error, Notification, PermissionRequest, SessionInfo, SlashCommand, TranscriptMessage,
+    token_delta,
+};
 
 /// One painted transcript block.
 #[derive(Debug, Clone, PartialEq)]
@@ -25,6 +28,37 @@ pub enum Entry {
     User(String),
     Assistant(String),
     Note(String),
+}
+
+/// Host and delegated token usage for the header chip.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub peer_tokens: u64,
+}
+
+impl Usage {
+    pub fn total(self) -> u64 {
+        self.input_tokens + self.output_tokens
+    }
+
+    pub fn chip(self) -> String {
+        let host = format_tokens(self.total());
+        if self.peer_tokens > 0 {
+            format!("{host} tok (⇄ {})", format_tokens(self.peer_tokens))
+        } else {
+            format!("{host} tok")
+        }
+    }
+}
+
+fn format_tokens(tokens: u64) -> String {
+    if tokens >= 1000 {
+        format!("{:.1}k", tokens as f64 / 1000.0)
+    } else {
+        tokens.to_string()
+    }
 }
 
 /// UI state. `draw` is pure over this struct so `TestBackend` can assert on it.
@@ -41,6 +75,9 @@ pub struct App {
     /// Follow the bottom until the operator scrolls up.
     pub follow: bool,
     pub quit: bool,
+    pub pending_perm: Option<PermissionRequest>,
+    pub usage: Usage,
+    pub slash_commands: Vec<SlashCommand>,
 }
 
 impl App {
@@ -50,6 +87,19 @@ impl App {
             follow: true,
             ..App::default()
         }
+    }
+
+    pub fn from_transcript(session: SessionInfo, messages: Vec<TranscriptMessage>) -> App {
+        let mut app = App::new(session);
+        app.entries = messages
+            .into_iter()
+            .map(|message| match message.role.as_str() {
+                "user" => Entry::User(message.content),
+                "assistant" => Entry::Assistant(message.content),
+                _ => Entry::Note(format!("{}: {}", message.role, message.content)),
+            })
+            .collect();
+        app
     }
 
     pub fn header(&self) -> String {
@@ -70,11 +120,19 @@ impl App {
             s.push_str(" · ");
             s.push_str(&short);
         }
+        if self.usage.total() > 0 {
+            s.push_str(" · ");
+            s.push_str(&self.usage.chip());
+        }
         s
     }
 
     pub fn footer(&self) -> String {
-        let hints = "enter send · esc cancel · q quit";
+        let hints = if let Some(permission) = &self.pending_perm {
+            return format!("y allow · n deny · a always · {}", permission.name);
+        } else {
+            "enter send · esc cancel · q quit"
+        };
         if self.status.is_empty() {
             hints.to_string()
         } else {
@@ -110,13 +168,9 @@ impl App {
         match n.method.as_str() {
             "event" => self.on_event(&n.params),
             "perm.ask" => {
-                let name = n
-                    .params
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("tool");
-                // Phase 1 owns the y/n/a strip; for now say so plainly.
-                self.status = format!("{name} needs permission (not wired yet — esc to cancel)");
+                if let Some(permission) = n.permission_request() {
+                    self.pending_perm = Some(permission);
+                }
             }
             _ => {}
         }
@@ -124,6 +178,10 @@ impl App {
 
     fn on_event(&mut self, params: &Value) {
         let kind = params.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        if kind.contains("delegate") && kind.contains("usage") {
+            self.usage.peer_tokens += token_count(params, "input_tokens");
+            self.usage.peer_tokens += token_count(params, "output_tokens");
+        }
         match kind {
             "run.start" => {
                 self.busy = true;
@@ -153,6 +211,10 @@ impl App {
         self.busy = false;
         match result {
             Ok(v) => {
+                self.usage.input_tokens +=
+                    token_count(v.get("usage").unwrap_or(&Value::Null), "input_tokens");
+                self.usage.output_tokens +=
+                    token_count(v.get("usage").unwrap_or(&Value::Null), "output_tokens");
                 let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
                 let body = if !text.is_empty() {
                     text.to_string()
@@ -178,6 +240,29 @@ impl App {
             self.scroll = u16::MAX;
         }
     }
+
+    pub fn permission_decision(
+        &mut self,
+        decision: &str,
+        client: &mut Client,
+    ) -> Result<(), Error> {
+        if let Some(permission) = self.pending_perm.take() {
+            client.perm_decide(&permission.id, decision, Duration::from_secs(20))?;
+        }
+        Ok(())
+    }
+
+    pub fn refuses_exclusive_slash(&self, name: &str) -> bool {
+        self.busy
+            && self
+                .slash_commands
+                .iter()
+                .any(|command| command.exclusive && command.name.trim_start_matches('/') == name)
+    }
+}
+
+fn token_count(value: &Value, field: &str) -> u64 {
+    value.get(field).and_then(Value::as_u64).unwrap_or(0)
 }
 
 /// Paint header / transcript / input / footer.
@@ -205,7 +290,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
         app.scroll
     };
     frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: false }).scroll((scroll, 0)),
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
         areas[1],
     );
 
@@ -223,6 +310,7 @@ pub fn run<B: Backend>(
     app: &mut App,
 ) -> Result<(), Error> {
     let mut turn: Option<Receiver<Result<Value, Error>>> = None;
+    let mut slash_rx: Option<Receiver<Result<Value, Error>>> = None;
 
     while !app.quit {
         terminal.draw(|f| draw(f, app)).map_err(Error::Io)?;
@@ -253,11 +341,40 @@ pub fn run<B: Backend>(
                 }
             }
         }
+        if let Some(rx) = slash_rx.as_ref() {
+            match rx.try_recv() {
+                Ok(result) => {
+                    match result {
+                        Ok(value) => {
+                            let title = value
+                                .get("title")
+                                .and_then(Value::as_str)
+                                .unwrap_or("slash");
+                            let body = value.get("body").and_then(Value::as_str).unwrap_or("");
+                            let error = value.get("error").and_then(Value::as_str);
+                            app.entries.push(Entry::Note(if let Some(error) = error {
+                                format!("{title}: {error}")
+                            } else {
+                                format!("{title}: {body}")
+                            }));
+                        }
+                        Err(error) => app.entries.push(Entry::Note(format!("error: {error}"))),
+                    }
+                    slash_rx = None;
+                }
+                Err(TryRecvError::Disconnected) => {
+                    app.entries
+                        .push(Entry::Note("slash connection closed".into()));
+                    slash_rx = None;
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
 
         if event::poll(Duration::from_millis(50)).map_err(Error::Io)? {
             if let Event::Key(key) = event::read().map_err(Error::Io)? {
                 if key.kind == KeyEventKind::Press {
-                    handle_key(key, client, app, &mut turn)?;
+                    handle_key(key, client, app, &mut turn, &mut slash_rx)?;
                 }
             }
         }
@@ -270,8 +387,17 @@ fn handle_key(
     client: &mut Client,
     app: &mut App,
     turn: &mut Option<Receiver<Result<Value, Error>>>,
+    slash_rx: &mut Option<Receiver<Result<Value, Error>>>,
 ) -> Result<(), Error> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    if app.pending_perm.is_some() {
+        match key.code {
+            KeyCode::Char('y') => return app.permission_decision("allow", client),
+            KeyCode::Char('n') => return app.permission_decision("deny", client),
+            KeyCode::Char('a') => return app.permission_decision("always", client),
+            _ => return Ok(()),
+        }
+    }
     match key.code {
         KeyCode::Char('c') if ctrl => {
             if app.busy || turn.is_some() {
@@ -288,7 +414,24 @@ fn handle_key(
         }
         KeyCode::Enter => {
             let text = app.input.trim().to_string();
-            if !text.is_empty() && turn.is_none() {
+            if text.starts_with("/steer") {
+                let steer_text = text.strip_prefix("/steer").unwrap_or("").trim();
+                if app.busy || turn.is_some() {
+                    if steer_text.is_empty() {
+                        app.status = "steer text must not be empty".into();
+                    } else {
+                        client.steer(steer_text, Duration::from_secs(20))?;
+                        app.status = "steered".into();
+                    }
+                    app.input.clear();
+                }
+            } else if text.starts_with('/') {
+                handle_slash(&text, client, app, slash_rx)?;
+                app.input.clear();
+            } else if app.busy || turn.is_some() {
+                app.status = "turn in flight (esc cancel · /steer)".into();
+                app.input.clear();
+            } else if !text.is_empty() {
                 app.entries.push(Entry::User(text.clone()));
                 app.input.clear();
                 app.live.clear();
@@ -302,15 +445,79 @@ fn handle_key(
         KeyCode::Backspace => {
             app.input.pop();
         }
+        KeyCode::Char('u') if ctrl => {
+            app.follow = false;
+            app.scroll = app.scroll.saturating_sub(5);
+        }
+        KeyCode::Char('d') if ctrl => {
+            app.scroll = app.scroll.saturating_add(5);
+            if app.scroll as usize >= app.transcript_lines().len() {
+                app.follow = true;
+                app.scroll = u16::MAX;
+            }
+        }
         KeyCode::Up => {
             app.follow = false;
             app.scroll = app.scroll.saturating_sub(1);
         }
         KeyCode::Down => {
+            app.follow = false;
             app.scroll = app.scroll.saturating_add(1);
         }
         KeyCode::Char(c) => app.input.push(c),
         _ => {}
+    }
+    Ok(())
+}
+
+fn handle_slash(
+    text: &str,
+    client: &mut Client,
+    app: &mut App,
+    slash_rx: &mut Option<Receiver<Result<Value, Error>>>,
+) -> Result<(), Error> {
+    let mut words = text[1..].split_whitespace();
+    let Some(name) = words.next() else {
+        return Ok(());
+    };
+    let args: Vec<String> = words.map(ToString::to_string).collect();
+    match name {
+        "help" => {
+            app.slash_commands = client.slash_list(Duration::from_secs(20))?;
+            let body = app
+                .slash_commands
+                .iter()
+                .map(|command| format!("/{} — {}", command.name, command.summary))
+                .collect::<Vec<_>>()
+                .join(" · ");
+            app.entries.push(Entry::Note(body));
+        }
+        "sessions" => {
+            let sessions = client.sessions(Duration::from_secs(20))?;
+            let body = sessions
+                .iter()
+                .map(|session| {
+                    format!("{} · {} · {}", session.id, session.updated, session.preview)
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            app.entries.push(Entry::Note(if body.is_empty() {
+                "no sessions".into()
+            } else {
+                body
+            }));
+        }
+        "status" => {
+            let status = client.status(Duration::from_secs(20))?;
+            app.entries.push(Entry::Note(format!("status: {status}")));
+        }
+        _ => {
+            if app.refuses_exclusive_slash(name) {
+                app.status = format!("/{name} is unavailable while busy");
+            } else {
+                *slash_rx = Some(client.slash(name, &args, false)?);
+            }
+        }
     }
     Ok(())
 }
@@ -395,5 +602,66 @@ mod tests {
                 Entry::Note("error: mow rpc connection closed".into()),
             ]
         );
+    }
+
+    #[test]
+    fn transcript_seed_maps_roles() {
+        let app = App::from_transcript(
+            SessionInfo::default(),
+            vec![
+                TranscriptMessage {
+                    role: "user".into(),
+                    content: "hi".into(),
+                },
+                TranscriptMessage {
+                    role: "assistant".into(),
+                    content: "hello".into(),
+                },
+                TranscriptMessage {
+                    role: "tool".into(),
+                    content: "grep".into(),
+                },
+            ],
+        );
+        assert_eq!(
+            app.entries,
+            vec![
+                Entry::User("hi".into()),
+                Entry::Assistant("hello".into()),
+                Entry::Note("tool: grep".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn permission_strip_and_exclusive_slash() {
+        let mut app = App::new(SessionInfo::default());
+        app.slash_commands.push(SlashCommand {
+            name: "review".into(),
+            summary: "review changes".into(),
+            exclusive: true,
+            aliases: vec![],
+        });
+        app.busy = true;
+        assert!(app.refuses_exclusive_slash("review"));
+        app.on_notification(&Notification {
+            method: "perm.ask".into(),
+            params: serde_json::json!({
+                "id": "perm-1", "name": "write", "args": {}, "tool_call_id": "call-1"
+            }),
+        });
+        assert_eq!(app.footer(), "y allow · n deny · a always · write");
+    }
+
+    #[test]
+    fn token_chip_includes_peer_usage() {
+        let mut app = App::new(SessionInfo::default());
+        app.usage = Usage {
+            input_tokens: 10_000,
+            output_tokens: 2_300,
+            peer_tokens: 1_200,
+        };
+        assert_eq!(app.usage.chip(), "12.3k tok (⇄ 1.2k)");
+        assert!(app.header().contains("12.3k tok"));
     }
 }

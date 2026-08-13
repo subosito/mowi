@@ -23,7 +23,10 @@ pub enum Error {
     Spawn(String),
     Io(io::Error),
     /// JSON-RPC error envelope from the server.
-    Rpc { code: i64, message: String },
+    Rpc {
+        code: i64,
+        message: String,
+    },
     /// Handshake / shape problem.
     Protocol(String),
     /// Child exited or the reader thread stopped.
@@ -57,6 +60,59 @@ impl From<io::Error> for Error {
 pub struct Notification {
     pub method: String,
     pub params: Value,
+}
+
+/// A resumable session returned by `sessions`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionSummary {
+    pub id: String,
+    pub updated: String,
+    pub preview: String,
+}
+
+/// One stored transcript message.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranscriptMessage {
+    pub role: String,
+    pub content: String,
+}
+
+/// A slash command advertised by `slash.list`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SlashCommand {
+    pub name: String,
+    pub summary: String,
+    pub exclusive: bool,
+    pub aliases: Vec<String>,
+}
+
+/// A permission request notification.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PermissionRequest {
+    pub id: String,
+    pub name: String,
+    pub args: Value,
+    pub tool_call_id: String,
+}
+
+impl Notification {
+    /// Decode a `perm.ask` notification, if this notification is one.
+    pub fn permission_request(&self) -> Option<PermissionRequest> {
+        if self.method != "perm.ask" {
+            return None;
+        }
+        Some(PermissionRequest {
+            id: self.params.get("id")?.as_str()?.to_string(),
+            name: self.params.get("name")?.as_str()?.to_string(),
+            args: self.params.get("args").cloned().unwrap_or(Value::Null),
+            tool_call_id: self
+                .params
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        })
+    }
 }
 
 /// One decoded stdout line.
@@ -147,12 +203,7 @@ pub struct SessionInfo {
 
 impl SessionInfo {
     pub fn from_value(v: &Value) -> Self {
-        let s = |k: &str| {
-            v.get(k)
-                .and_then(|x| x.as_str())
-                .unwrap_or("")
-                .to_string()
-        };
+        let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
         SessionInfo {
             session_id: s("session_id"),
             workspace: s("workspace"),
@@ -281,7 +332,11 @@ impl Client {
         self.pending.lock().unwrap().insert(id, tx);
         let mut line = serde_json::to_string(&req).map_err(|e| Error::Protocol(e.to_string()))?;
         line.push('\n');
-        if let Err(e) = self.stdin.write_all(line.as_bytes()).and_then(|_| self.stdin.flush()) {
+        if let Err(e) = self
+            .stdin
+            .write_all(line.as_bytes())
+            .and_then(|_| self.stdin.flush())
+        {
             self.pending.lock().unwrap().remove(&id);
             return Err(Error::Io(e));
         }
@@ -317,6 +372,127 @@ impl Client {
         self.call("ping", None, timeout)
     }
 
+    /// Return the resumable sessions known to the host.
+    pub fn sessions(&mut self, timeout: Duration) -> Result<Vec<SessionSummary>, Error> {
+        let value = self.call("sessions", None, timeout)?;
+        let rows = value
+            .get("sessions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| Error::Protocol("sessions result has no sessions array".into()))?;
+        rows.iter()
+            .map(|row| {
+                Ok(SessionSummary {
+                    id: string_field(row, "id")?,
+                    updated: string_field(row, "updated")?,
+                    preview: string_field(row, "preview")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Return the stored transcript.
+    pub fn transcript(&mut self, timeout: Duration) -> Result<Vec<TranscriptMessage>, Error> {
+        let value = self.call("transcript", None, timeout)?;
+        let rows = value
+            .get("messages")
+            .and_then(Value::as_array)
+            .ok_or_else(|| Error::Protocol("transcript result has no messages array".into()))?;
+        rows.iter()
+            .map(|row| {
+                Ok(TranscriptMessage {
+                    role: string_field(row, "role")?,
+                    content: string_field(row, "content")?,
+                })
+            })
+            .collect()
+    }
+
+    /// Redirect the active turn.
+    pub fn steer(&mut self, text: &str, timeout: Duration) -> Result<Value, Error> {
+        if text.trim().is_empty() {
+            return Err(Error::Protocol("steer text must not be empty".into()));
+        }
+        self.call("steer", Some(json!({ "text": text })), timeout)
+    }
+
+    /// List slash commands registered by the host.
+    pub fn slash_list(&mut self, timeout: Duration) -> Result<Vec<SlashCommand>, Error> {
+        let value = self.call("slash.list", None, timeout)?;
+        let rows = value
+            .get("commands")
+            .and_then(Value::as_array)
+            .ok_or_else(|| Error::Protocol("slash.list result has no commands array".into()))?;
+        rows.iter()
+            .map(|row| {
+                let aliases = row
+                    .get("aliases")
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(ToString::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Ok(SlashCommand {
+                    name: string_field(row, "name")?,
+                    summary: string_field(row, "summary")?,
+                    exclusive: row
+                        .get("exclusive")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    aliases,
+                })
+            })
+            .collect()
+    }
+
+    /// Run a host slash command.
+    pub fn slash(
+        &mut self,
+        name: &str,
+        args: &[String],
+        color: bool,
+    ) -> Result<Receiver<Result<Value, Error>>, Error> {
+        self.send(
+            "slash",
+            Some(json!({ "name": name, "args": args, "color": color })),
+        )
+    }
+
+    /// Set the host permission mode.
+    pub fn perm_set(&mut self, mode: &str, timeout: Duration) -> Result<Value, Error> {
+        if !matches!(mode, "ask" | "auto") {
+            return Err(Error::Protocol(format!("invalid permission mode: {mode}")));
+        }
+        self.call("perm.set", Some(json!({ "mode": mode })), timeout)
+    }
+
+    /// Resolve a pending permission request.
+    pub fn perm_decide(
+        &mut self,
+        id: &str,
+        decision: &str,
+        timeout: Duration,
+    ) -> Result<Value, Error> {
+        if !matches!(decision, "allow" | "deny" | "always") {
+            return Err(Error::Protocol(format!(
+                "invalid permission decision: {decision}"
+            )));
+        }
+        self.call(
+            "perm.decide",
+            Some(json!({ "id": id, "decision": decision })),
+            timeout,
+        )
+    }
+
+    /// Return the current status object.
+    pub fn status(&mut self, timeout: Duration) -> Result<Value, Error> {
+        self.call("status", None, timeout)
+    }
+
     /// Start a turn. The result arrives later (the channel stays open while
     /// `event` notifications stream).
     pub fn prompt(&mut self, text: &str) -> Result<Receiver<Result<Value, Error>>, Error> {
@@ -333,6 +509,14 @@ impl Client {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+fn string_field(value: &Value, field: &str) -> Result<String, Error> {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .ok_or_else(|| Error::Protocol(format!("missing string field {field:?}")))
 }
 
 impl Drop for Client {
@@ -376,7 +560,8 @@ mod tests {
 
     #[test]
     fn parses_notification() {
-        let line = r#"{"jsonrpc":"2.0","method":"event","params":{"type":"loop.token","delta":"hi"}}"#;
+        let line =
+            r#"{"jsonrpc":"2.0","method":"event","params":{"type":"loop.token","delta":"hi"}}"#;
         match parse_message(line).unwrap() {
             Message::Notify(n) => {
                 assert_eq!(n.method, "event");
@@ -409,7 +594,8 @@ mod tests {
 
     #[test]
     fn delegate_chunks_are_not_host_tokens() {
-        let peer = serde_json::json!({"type":"harness.delegate.chunk","agent":"peer-agent","delta":"x"});
+        let peer =
+            serde_json::json!({"type":"harness.delegate.chunk","agent":"peer-agent","delta":"x"});
         assert_eq!(token_delta(&peer), None);
 
         let tool = serde_json::json!({"type":"tool.start","name":"grep"});
@@ -423,5 +609,36 @@ mod tests {
         }));
         assert_eq!(s.short_id(), "01234567");
         assert_eq!(s.model, "gpt-5-mini");
+    }
+
+    #[test]
+    fn parses_permission_notification() {
+        let notification = Notification {
+            method: "perm.ask".into(),
+            params: serde_json::json!({
+                "id": "perm-1",
+                "name": "write",
+                "args": {"path": "notes.txt"},
+                "tool_call_id": "call-1"
+            }),
+        };
+        let permission = notification.permission_request().unwrap();
+        assert_eq!(permission.id, "perm-1");
+        assert_eq!(permission.name, "write");
+        assert_eq!(permission.args["path"], "notes.txt");
+        assert_eq!(permission.tool_call_id, "call-1");
+    }
+
+    #[test]
+    fn parses_sessions_and_transcript_shapes() {
+        let sessions = serde_json::json!({
+            "sessions": [{"id":"s1","updated":"today","preview":"hello"}]
+        });
+        assert_eq!(sessions["sessions"][0]["id"], "s1");
+
+        let transcript = serde_json::json!({
+            "messages": [{"role":"user","content":"hi"},{"role":"assistant","content":"hello"}]
+        });
+        assert_eq!(transcript["messages"][1]["role"], "assistant");
     }
 }
