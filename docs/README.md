@@ -20,6 +20,7 @@ at the **same product surface** over a wire, not a Charm port.
 | [architecture.md](architecture.md) | Process split, what mow owns vs the UI |
 | [protocol.md](protocol.md) | `mow rpc` v3 methods, events, perm.ask |
 | [baseline.md](baseline.md) | Feature inventory of Go mowi (the bar) |
+| [ui-review.md](ui-review.md) | Snapshot tool + the layout rules to review against |
 | [roadmap.md](roadmap.md) | Phases from hello-RPC to parity |
 
 ## Run (once the crate exists)

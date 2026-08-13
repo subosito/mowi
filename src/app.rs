@@ -37,6 +37,8 @@ use crate::theme::{SPINNER, SPINNER_STATIC, TYPING, Theme, Tone};
 
 /// Display columns allowed for a collapsed peer preview.
 const PEER_PREVIEW: usize = 48;
+/// Display columns allowed for the argument half of a tool row label.
+const TOOL_ARG_COLS: usize = 56;
 /// Cells in the header context meter.
 const CTX_CELLS: usize = 5;
 /// Below this context percentage the footer stays quiet — the header gauge is
@@ -704,12 +706,9 @@ impl App {
                     Some(_) => ("✓", self.theme.badge(Tone::Ok).patch(self.theme.base())),
                     None => (self.spinner_frame(), self.theme.spinner()),
                 };
-                // Split "cmd rest" so the verb reads and the argument recedes.
-                let clean = sanitize_preview(name);
-                let (verb, rest) = match clean.split_once(' ') {
-                    Some((verb, rest)) => (verb.to_string(), rest.to_string()),
-                    None => (clean, String::new()),
-                };
+                // Label as `verb · argument`, never a raw shell blob: a
+                // chained command must not become four lines of transcript.
+                let (verb, rest) = tool_label(name);
                 let mut spans = vec![
                     Span::styled(format!("{glyph} "), glyph_style),
                     Span::styled(verb, self.theme.tool()),
@@ -848,11 +847,47 @@ impl App {
         (lines, base.min(u16::MAX as usize) as u16)
     }
 
+    /// Height an entry will occupy once painted, in transcript rows.
+    ///
+    /// This must never *under*-report. `visible_transcript_lines` slices the
+    /// document with these numbers, and the scrollbar derives its extent from
+    /// them; if an entry paints taller than it claims, the window slides and
+    /// content the operator was reading — typically their own prompt — is
+    /// pushed off the top of the pane.
+    ///
+    /// So the count is by wrapped rows, not logical lines. A tool row whose
+    /// name is a whole shell blob (`bash echo ---; cat …; ls -la`) is the case
+    /// that made this matter: it reported 1 row and painted four.
     fn estimated_entry_lines(&self, entry: &Entry) -> usize {
+        let width = self.last_view_w.max(8) as usize;
+        // Rows a block of text needs once hard-wrapped into `inner` columns.
+        let wrapped = |text: &str, inner: usize| -> usize {
+            let inner = inner.max(1);
+            text.split('\n')
+                .map(|line| {
+                    let cols = line.width();
+                    if cols == 0 { 1 } else { cols.div_ceil(inner) }
+                })
+                .sum::<usize>()
+                .max(1)
+        };
         (match entry {
-            Entry::Assistant(text) => text.lines().count().max(1),
-            Entry::User(text) => text.lines().count().max(1) + 2,
-            _ => 1,
+            // The user band reserves the accent rail plus its gutters, and
+            // pads with a blank row above and below.
+            Entry::User(text) => wrapped(text, width.saturating_sub(3)) + 2,
+            Entry::Assistant(text) => wrapped(text, width),
+            Entry::Note(text) => wrapped(text, width),
+            Entry::Tool { name, duration_ms } => {
+                // Estimate against the *label*, not the raw name: the label is
+                // what gets painted, and it is bounded by TOOL_ARG_COLS.
+                let (verb, rest) = tool_label(name);
+                let suffix = match duration_ms {
+                    Some(_) => 8,
+                    None => 10,
+                };
+                let cols = verb.width() + rest.width() + suffix + 3;
+                cols.div_ceil(width.max(1))
+            }
         }) + 1
     }
 
@@ -930,7 +965,7 @@ impl App {
         if self.animate {
             SPINNER[(self.tick as usize / 2) % SPINNER.len()]
         } else {
-            "●"
+            SPINNER_STATIC
         }
     }
 
@@ -1504,6 +1539,10 @@ fn decision_line(theme: Theme, width: u16, tool: Option<&str>) -> Line<'static> 
     ];
 
     // Widest-first label plans; the first that fits wins.
+    //   0: full words + the tool name
+    //   1: full words alone
+    //   2: short words
+    //   3: bare keycaps
     for plan in 0..4 {
         let mut spans: Vec<Span<'static>> = Vec::new();
         for (index, (key, tone, long, short)) in keys.iter().enumerate() {
@@ -1512,12 +1551,12 @@ fn decision_line(theme: Theme, width: u16, tool: Option<&str>) -> Line<'static> 
             }
             spans.push(Span::styled(format!(" {key} "), theme.badge_solid(*tone)));
             match plan {
-                0 => spans.push(Span::styled(format!(" {long}"), theme.note())),
-                1 => spans.push(Span::styled(format!(" {short}"), theme.note())),
+                0 | 1 => spans.push(Span::styled(format!(" {long}"), theme.note())),
+                2 => spans.push(Span::styled(format!(" {short}"), theme.note())),
                 _ => {}
             }
         }
-        // The tool name is context, not a control: it goes first.
+        // The tool name is context, not a control: it is the first thing cut.
         if plan == 0
             && let Some(name) = tool
         {
@@ -1529,6 +1568,51 @@ fn decision_line(theme: Theme, width: u16, tool: Option<&str>) -> Line<'static> 
         }
     }
     Line::from(Vec::new())
+}
+
+/// A tool row label: `verb · argument`, never a raw shell blob.
+///
+/// The Go design notes are explicit about this (`label.go`): build the label
+/// from the verb and a meaningful argument, and never mid-string-truncate a
+/// shell blob into noise. A chained command like
+/// `bash echo ---; cat AGENTS.md; ls -la; git log` is four lines of unreadable
+/// transcript that pushes the operator's own prompt off screen.
+///
+/// So a multi-command blob is reduced to its first command plus a count of
+/// what follows. The full text is still in the engine's log; the transcript
+/// is a place to see *that* something ran, not to re-read the script.
+fn tool_label(name: &str) -> (String, String) {
+    let clean = sanitize_preview(name);
+    let clean = clean.trim();
+    let (verb, rest) = match clean.split_once(char::is_whitespace) {
+        Some((verb, rest)) => (verb.to_string(), rest.trim().to_string()),
+        None => (clean.to_string(), String::new()),
+    };
+    if rest.is_empty() {
+        return (verb, String::new());
+    }
+
+    // Count the separate commands in a shell chain. Quoting is not parsed —
+    // this is a display heuristic, and over-counting only costs a suffix.
+    let extra = rest
+        .split(&[';', '\n'][..])
+        .filter(|part| !part.trim().is_empty())
+        .count()
+        .saturating_sub(1);
+
+    let head = rest
+        .split(&[';', '\n'][..])
+        .map(str::trim)
+        .find(|part| !part.is_empty())
+        .unwrap_or("");
+    let head = clip_display(head, TOOL_ARG_COLS);
+
+    let rest = if extra > 0 {
+        format!("{head} (+{extra} more)")
+    } else {
+        head
+    };
+    (verb, rest)
 }
 
 fn entry_text(entry: &Entry) -> String {
@@ -1943,7 +2027,12 @@ fn input_cursor_pos(app: &App, inner: Rect) -> Position {
     let gutter = if row.first { glyph_w } else { 2 };
     // Columns, not chars: measure the text actually left of the caret.
     let into = app.cursor.saturating_sub(row.start);
-    let col: usize = row.text.chars().take(into).map(|c| c.width().unwrap_or(0)).sum();
+    let col: usize = row
+        .text
+        .chars()
+        .take(into)
+        .map(|c| c.width().unwrap_or(0))
+        .sum();
 
     let y = inner
         .y
@@ -2919,6 +3008,85 @@ mod tests {
     }
 
     #[test]
+    fn tool_labels_collapse_shell_chains() {
+        // The exact shape that garbled the transcript: a chained shell blob
+        // passed through as the tool name.
+        let (verb, rest) = tool_label(
+            "bash echo ----; cat AGENTS.md 2>/dev/null || cat CLAUDE.md 2>/dev/null; ls -la",
+        );
+        assert_eq!(verb, "bash");
+        assert!(rest.starts_with("echo ----"), "{rest}");
+        assert!(rest.contains("+2 more"), "{rest}");
+        // The whole chain must never be reproduced verbatim.
+        assert!(!rest.contains("CLAUDE.md"), "{rest}");
+        assert!(rest.width() <= TOOL_ARG_COLS + 12, "{rest}");
+
+        // A plain single command keeps its argument intact.
+        let (verb, rest) = tool_label("read src/app.rs");
+        assert_eq!(verb, "read");
+        assert_eq!(rest, "src/app.rs");
+
+        // A bare tool name has no argument half.
+        let (verb, rest) = tool_label("status");
+        assert_eq!(verb, "status");
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn long_tool_names_do_not_eat_the_user_prompt() {
+        // A tool row whose name is a whole shell blob wraps to several lines.
+        // The transcript window math must agree with what is painted, or the
+        // overflow scrolls the user's own prompt off the top of the pane.
+        let mut app = App::new(SessionInfo::default());
+        app.theme = Theme { colored: true };
+        app.entries.push(Entry::User("summarise the repo".into()));
+        app.entries.push(Entry::Tool {
+            name: "bash echo ----; cat AGENTS.md 2>/dev/null || cat CLAUDE.md 2>/dev/null; \
+                   echo ----; ls -la; git log --oneline | head -20"
+                .into(),
+            duration_ms: Some(120),
+        });
+        app.entries
+            .push(Entry::Assistant("Here is the summary.".into()));
+
+        let out = render(&mut app, 60, 20);
+        assert!(
+            out.contains("summarise the repo"),
+            "user prompt lost:\n{out}"
+        );
+        assert!(out.contains("Here is the summary."), "answer lost:\n{out}");
+    }
+
+    #[test]
+    fn estimated_height_matches_painted_height() {
+        // `visible_transcript_lines` slices the document using estimates. If an
+        // estimate is smaller than what `entry_lines` actually paints, the
+        // window slides and earlier entries get scrolled away.
+        let mut app = App::new(SessionInfo::default());
+        app.theme = Theme { colored: true };
+        app.last_view_w = 40;
+        let entries = vec![
+            Entry::User("a short prompt".into()),
+            Entry::User("a prompt that is quite a lot longer than forty columns".into()),
+            Entry::Assistant("one line".into()),
+            Entry::Assistant("a much longer answer that has to wrap several times over".into()),
+            Entry::Tool {
+                name: "bash echo ----; cat AGENTS.md; echo ----; ls -la; git log".into(),
+                duration_ms: Some(90),
+            },
+            Entry::Note("a note that also happens to be rather long indeed".into()),
+        ];
+        for entry in entries {
+            let painted = app.entry_lines(&entry).len();
+            let estimated = app.estimated_entry_lines(&entry) - 1; // minus separator
+            assert!(
+                estimated >= painted,
+                "under-estimated {entry:?}: estimated {estimated}, painted {painted}"
+            );
+        }
+    }
+
+    #[test]
     fn caret_tracks_wrapped_and_wide_text() {
         let mut app = App::new(SessionInfo::default());
         app.theme = Theme { colored: true };
@@ -2962,6 +3130,32 @@ mod tests {
     }
 
     #[test]
+    fn scrim_dims_the_document_without_colour() {
+        // With NO_COLOR there is no ground to recede with, so the scrim has to
+        // fall back to the DIM attribute — otherwise modals float on top of
+        // undimmed text and the layering is invisible.
+        let mut app = App::new(SessionInfo::default());
+        app.theme = Theme { colored: false };
+        app.entries.push(Entry::User("hello there".into()));
+        app.overlay = Overlay::help();
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        // Row 2 is inside the document region, above the overlay body.
+        let dimmed = (0..80u16).any(|x| buf[(x, 2)].modifier.contains(Modifier::DIM));
+        assert!(dimmed, "document was not dimmed behind the modal");
+
+        // No colour leaked in while doing it.
+        for y in 0..24u16 {
+            for x in 0..80u16 {
+                assert_eq!(buf[(x, y)].fg, Color::Reset, "fg leaked at {x},{y}");
+                assert_eq!(buf[(x, y)].bg, Color::Reset, "bg leaked at {x},{y}");
+            }
+        }
+    }
+
+    #[test]
     fn deny_survives_every_supported_width() {
         // A consent surface that clips the reject key is a safety bug. At no
         // width the client claims to support may "allow" be reachable while
@@ -2991,9 +3185,11 @@ mod tests {
             tool_call_id: "call-1".into(),
         });
         // MIN_WIDTH is the narrowest frame the client will paint at all.
+        // Assert on the decision labels, not bare letters: "command" contains
+        // an "n" and would make a broken row look like a passing test.
         let out = render(&mut app, MIN_WIDTH, 20);
-        for key in ["y", "a", "n"] {
-            assert!(out.contains(key), "{out}");
+        for label in ["allow", "always", "deny"] {
+            assert!(out.contains(label), "missing {label} at MIN_WIDTH:\n{out}");
         }
     }
 

@@ -113,6 +113,21 @@ pub fn scene(name: &str) -> App {
                     .into(),
             ));
         }
+        // Regression scene: a chained shell command arriving as a tool name.
+        // Raw, this wrapped to four rows and pushed the user prompt off pane.
+        "shellblob" => {
+            app.entries
+                .push(Entry::User("what is in this repo?".into()));
+            app.entries.push(Entry::Tool {
+                name: "bash ls -la; echo ----; cat AGENTS.md 2>/dev/null || \
+                       cat CLAUDE.md 2>/dev/null; git log --oneline | head -20"
+                    .into(),
+                duration_ms: Some(340),
+            });
+            app.entries.push(Entry::Assistant(
+                "It is the Ratatui client for the mow harness.".into(),
+            ));
+        }
         "narrow" => {
             app.entries.push(Entry::User("status?".into()));
             app.entries
