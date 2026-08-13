@@ -99,6 +99,26 @@ pub struct EffortInfo {
     pub current: bool,
 }
 
+/// `context` result — drives the context gauge.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ContextUsage {
+    pub tokens: u64,
+    pub context_window: Option<u64>,
+    pub remaining: Option<u64>,
+    pub percent: Option<f64>,
+}
+
+/// `compact` result.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CompactReport {
+    pub layer: String,
+    pub chars_saved: i64,
+    pub messages_before: i64,
+    pub messages_after: i64,
+    pub over_budget: bool,
+    pub tokens: u64,
+}
+
 /// `effort.list` result.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct EffortList {
@@ -553,6 +573,109 @@ impl Client {
             .filter(|effort| !effort.is_empty())
             .unwrap_or(id)
             .to_string())
+    }
+
+    /// Context-window usage for the gauge. Control method: answered while busy.
+    pub fn context(&mut self, timeout: Duration) -> Result<ContextUsage, Error> {
+        let value = self.call("context", None, timeout)?;
+        Ok(ContextUsage {
+            tokens: value.get("tokens").and_then(Value::as_u64).unwrap_or(0),
+            context_window: value.get("context_window").and_then(Value::as_u64),
+            remaining: value.get("remaining").and_then(Value::as_u64),
+            percent: value.get("percent").and_then(Value::as_f64),
+        })
+    }
+
+    /// Compact the engine transcript. `max_chars <= 0` lets the engine choose.
+    pub fn compact(&mut self, max_chars: i64, timeout: Duration) -> Result<CompactReport, Error> {
+        let params = if max_chars > 0 {
+            Some(json!({ "max_chars": max_chars }))
+        } else {
+            None
+        };
+        let value = self.call("compact", params, timeout)?;
+        Ok(CompactReport {
+            layer: value
+                .get("layer")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            chars_saved: value
+                .get("chars_saved")
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+            messages_before: value
+                .get("messages_before")
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+            messages_after: value
+                .get("messages_after")
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+            over_budget: value
+                .get("over_budget")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            tokens: value.get("tokens").and_then(Value::as_u64).unwrap_or(0),
+        })
+    }
+
+    /// Drop the last exchange; returns the user text so the UI can refill the
+    /// input box for an edit-and-resend.
+    pub fn rewind(&mut self, timeout: Duration) -> Result<Option<String>, Error> {
+        let value = self.call("rewind", None, timeout)?;
+        if !value.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+            return Ok(None);
+        }
+        Ok(Some(
+            value
+                .get("last_user")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+        ))
+    }
+
+    /// Skills available in this workspace.
+    pub fn skill_list(&mut self, timeout: Duration) -> Result<Vec<String>, Error> {
+        let value = self.call("skill.list", None, timeout)?;
+        Ok(value
+            .get("skills")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default())
+    }
+
+    /// Activate skills by name; returns `(activated, unknown)`.
+    pub fn skill_activate(
+        &mut self,
+        names: &[String],
+        timeout: Duration,
+    ) -> Result<(Vec<String>, Vec<String>), Error> {
+        if names.is_empty() {
+            return Err(Error::Protocol(
+                "skill.activate needs at least one name".into(),
+            ));
+        }
+        let value = self.call("skill.activate", Some(json!({ "names": names })), timeout)?;
+        let pick = |key: &str| -> Vec<String> {
+            value
+                .get(key)
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        Ok((pick("activated"), pick("unknown")))
     }
 
     /// Start a turn. The result arrives later (the channel stays open while

@@ -27,8 +27,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::render::{Segment, diff_title, markdown_lines, split_markdown_and_diffs};
 use crate::rpc::{
-    Client, EffortList, Error, ModelList, Notification, PermissionRequest, SessionInfo,
-    SessionSummary, SlashCommand, TranscriptMessage, token_delta,
+    Client, ContextUsage, EffortList, Error, ModelList, Notification, PermissionRequest,
+    SessionInfo, SessionSummary, SlashCommand, TranscriptMessage, token_delta,
 };
 use crate::slash::{
     SlashRoute, canonical_slash, slash_completions, slash_route, unknown_slash_message,
@@ -37,6 +37,19 @@ use crate::theme::{SPINNER, TYPING, Theme, Tone};
 
 /// Display columns allowed for a collapsed peer preview.
 const PEER_PREVIEW: usize = 48;
+
+/// Compact token count for status text: 950 -> "950", 12_300 -> "12.3k".
+fn human_tokens(n: u64) -> String {
+    if n < 1000 {
+        return n.to_string();
+    }
+    let k = n as f64 / 1000.0;
+    if k < 100.0 {
+        format!("{k:.1}k")
+    } else {
+        format!("{k:.0}k")
+    }
+}
 
 /// One painted transcript block.
 #[derive(Debug, Clone, PartialEq)]
@@ -225,6 +238,8 @@ pub struct App {
     pub animate: bool,
     /// Reasoning effort from `effort.list` / `effort.set`.
     pub effort: String,
+    /// Latest `context` result, for the gauge and /context.
+    pub ctx: Option<ContextUsage>,
     /// Character index into `input`.
     pub cursor: usize,
     /// Ratatui frame counter, used for the busy spinner.
@@ -266,6 +281,7 @@ impl Default for App {
             peer_focus: None,
             animate: std::env::var_os("MOW_NO_ANIM").is_none(),
             effort: String::new(),
+            ctx: None,
             cursor: 0,
             tick: 0,
             scrollbar_state: ScrollbarState::default(),
@@ -354,6 +370,27 @@ impl App {
         self.status = format!("effort: {effort}");
         self.entries.push(Entry::Note(format!("effort: {effort}")));
         self.overlay = Overlay::None;
+    }
+
+    /// Store a `context` result for the gauge.
+    pub fn apply_context(&mut self, usage: &ContextUsage) {
+        self.ctx = Some(usage.clone());
+    }
+
+    /// One-line context summary, e.g. "context: 12.3k / 200k (6%)".
+    pub fn context_summary(&self) -> String {
+        let Some(ctx) = &self.ctx else {
+            return "context: unknown".into();
+        };
+        match (ctx.context_window, ctx.percent) {
+            (Some(window), Some(pct)) => format!(
+                "context: {} / {} ({:.0}%)",
+                human_tokens(ctx.tokens),
+                human_tokens(window),
+                pct
+            ),
+            _ => format!("context: {} tokens", human_tokens(ctx.tokens)),
+        }
     }
 
     /// Capability chip: what the Engine was allowed to do at spawn.
@@ -459,6 +496,18 @@ impl App {
         if !short.is_empty() {
             push_sep(&mut spans);
             spans.push(Span::styled(short, self.theme.note()));
+        }
+        // Context pressure: warn once the window is mostly consumed.
+        if let Some(ctx) = &self.ctx
+            && let Some(pct) = ctx.percent
+        {
+            push_sep(&mut spans);
+            let style = if pct >= 85.0 {
+                self.theme.warn()
+            } else {
+                self.theme.note()
+            };
+            spans.push(Span::styled(format!("ctx {pct:.0}%"), style));
         }
         push_sep(&mut spans);
         if self.busy {
@@ -2033,6 +2082,11 @@ pub fn run<B: Backend>(
                 Ok(res) => {
                     app.finish_turn(res);
                     turn = None;
+                    // Usage only moves at turn end; refresh the gauge here
+                    // rather than polling. A failure is not fatal to the UI.
+                    if let Ok(usage) = client.context(Duration::from_secs(5)) {
+                        app.apply_context(&usage);
+                    }
                     if let Some(next) = app.next_queued_prompt() {
                         turn = Some(start_prompt(client, app, &next)?);
                     }
@@ -2369,6 +2423,64 @@ fn handle_slash(
             app.apply_status(&status);
             app.entries.push(Entry::Note(format!("status: {status}")));
         }
+        "context" => {
+            let usage = client.context(Duration::from_secs(20))?;
+            app.apply_context(&usage);
+            app.entries.push(Entry::Note(app.context_summary()));
+        }
+        "compact" => {
+            let max_chars = args
+                .first()
+                .and_then(|a| a.trim().parse::<i64>().ok())
+                .unwrap_or(0);
+            let rep = client.compact(max_chars, Duration::from_secs(120))?;
+            let saved = if rep.over_budget {
+                " (still over budget)"
+            } else {
+                ""
+            };
+            app.entries.push(Entry::Note(format!(
+                "compacted [{}]: {} -> {} messages, {} chars saved{saved}",
+                rep.layer, rep.messages_before, rep.messages_after, rep.chars_saved
+            )));
+            // Engine history changed under us; repaint from the new truth.
+            let messages = client.transcript(Duration::from_secs(20))?;
+            app.load_transcript(messages);
+            app.status = format!("compacted · {} tokens", rep.tokens);
+        }
+        "rewind" | "undo" => match client.rewind(Duration::from_secs(20))? {
+            Some(last_user) => {
+                let messages = client.transcript(Duration::from_secs(20))?;
+                app.load_transcript(messages);
+                app.set_input(last_user);
+                app.status = "rewound — edit and send again".into();
+            }
+            None => app.status = "nothing to rewind".into(),
+        },
+        "skills" => {
+            if args.is_empty() {
+                let skills = client.skill_list(Duration::from_secs(20))?;
+                if skills.is_empty() {
+                    app.status = "no skills in this workspace".into();
+                } else {
+                    app.entries
+                        .push(Entry::Note(format!("skills: {}", skills.join(", "))));
+                }
+            } else {
+                let (activated, unknown) = client.skill_activate(&args, Duration::from_secs(20))?;
+                let mut msg = String::new();
+                if !activated.is_empty() {
+                    msg.push_str(&format!("activated: {}", activated.join(", ")));
+                }
+                if !unknown.is_empty() {
+                    if !msg.is_empty() {
+                        msg.push_str(" · ");
+                    }
+                    msg.push_str(&format!("unknown: {}", unknown.join(", ")));
+                }
+                app.entries.push(Entry::Note(msg));
+            }
+        }
         "steer" => {
             app.status = "steer is /steer <text> while a turn is running".into();
         }
@@ -2398,6 +2510,33 @@ fn start_prompt(
 mod tests {
     use super::*;
     use crate::rpc::ModelInfo;
+
+    fn usage(tokens: u64, window: Option<u64>, pct: Option<f64>) -> ContextUsage {
+        ContextUsage {
+            tokens,
+            context_window: window,
+            remaining: window.map(|w| w.saturating_sub(tokens)),
+            percent: pct,
+        }
+    }
+
+    #[test]
+    fn context_summary_renders_window_when_known() {
+        let mut app = App::new(SessionInfo::default());
+        assert_eq!(app.context_summary(), "context: unknown");
+        app.apply_context(&usage(12_300, Some(200_000), Some(6.15)));
+        assert_eq!(app.context_summary(), "context: 12.3k / 200k (6%)");
+        app.apply_context(&usage(950, None, None));
+        assert_eq!(app.context_summary(), "context: 950 tokens");
+    }
+
+    #[test]
+    fn footer_shows_context_percent_when_known() {
+        let mut app = App::new(SessionInfo::default());
+        assert!(!app.footer().contains("ctx "));
+        app.apply_context(&usage(100_000, Some(200_000), Some(50.0)));
+        assert!(app.footer().contains("ctx 50%"), "footer: {}", app.footer());
+    }
     use ratatui::{Terminal, backend::TestBackend, style::Color};
 
     fn render(app: &mut App, w: u16, h: u16) -> String {

@@ -46,6 +46,11 @@ const DISPATCH: &[(&str, Builtin)] = &[
     ("retry", Builtin::Local),
     ("regen", Builtin::Local),
     ("status", Builtin::Local),
+    ("compact", Builtin::Local),
+    ("context", Builtin::Local),
+    ("rewind", Builtin::Local),
+    ("undo", Builtin::Local),
+    ("skills", Builtin::Local),
     ("steer", Builtin::Local),
 ];
 
