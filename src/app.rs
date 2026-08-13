@@ -175,6 +175,7 @@ impl App {
     }
 
     /// Transcript as wrapped-source lines (live answer last).
+    #[allow(dead_code)]
     pub fn transcript_lines(&self) -> Vec<Line<'_>> {
         let mut out: Vec<Line<'_>> = Vec::new();
         for e in &self.entries {
@@ -212,25 +213,49 @@ impl App {
 
     /// Materialize only a bounded transcript window for painting large sessions.
     fn visible_transcript_lines(&self) -> (Vec<Line<'_>>, u16) {
-        const OVERSCAN_ENTRIES: usize = 256;
-        let total = self.entries.len();
-        let start = if self.follow {
-            total.saturating_sub(OVERSCAN_ENTRIES)
+        const OVERSCAN_LINES: usize = 16;
+        let total_lines = self.estimated_total_lines();
+        let viewport = self.last_view_h.max(1) as usize;
+        let target = if self.follow {
+            total_lines.saturating_sub(viewport + OVERSCAN_LINES)
         } else {
-            ((self.scroll as usize) / 2)
-                .saturating_sub(OVERSCAN_ENTRIES / 4)
-                .min(total)
+            (self.scroll as usize).saturating_sub(OVERSCAN_LINES)
         };
-        let end = (start + OVERSCAN_ENTRIES).min(total);
+        let window_end = target + viewport + (OVERSCAN_LINES * 2);
         let mut lines = Vec::new();
-        for entry in &self.entries[start..end] {
-            lines.extend(self.entry_lines(entry));
-            lines.push(Line::raw(""));
+        let mut base = 0usize;
+        let mut cursor = 0usize;
+        for entry in &self.entries {
+            let entry_height = self.estimated_entry_lines(entry);
+            let entry_end = cursor + entry_height;
+            if entry_end > target && cursor < window_end {
+                if lines.is_empty() {
+                    base = cursor;
+                }
+                lines.extend(self.entry_lines(entry));
+                lines.push(Line::raw(""));
+            }
+            cursor = entry_end;
         }
-        if end == total && !self.live.is_empty() {
+        if !self.live.is_empty() && cursor >= target {
             lines.extend(markdown_lines(self.live.as_str(), self.theme));
         }
-        (lines, (start.saturating_mul(2)) as u16)
+        (lines, base.min(u16::MAX as usize) as u16)
+    }
+
+    fn estimated_entry_lines(&self, entry: &Entry) -> usize {
+        (match entry {
+            Entry::Assistant(text) => text.lines().count().max(1),
+            _ => 1,
+        }) + 1
+    }
+
+    fn estimated_total_lines(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|entry| self.estimated_entry_lines(entry))
+            .sum::<usize>()
+            + usize::from(!self.live.is_empty())
     }
 
     pub fn activity(&self) -> String {
@@ -412,7 +437,7 @@ fn token_count(value: &Value, field: &str) -> u64 {
 /// Paint header / transcript / input / footer.
 
 fn max_scroll(app: &App) -> u16 {
-    let n = app.transcript_lines().len() as u16;
+    let n = app.estimated_total_lines().min(u16::MAX as usize) as u16;
     let h = app.last_view_h.max(1);
     n.saturating_sub(h)
 }
@@ -753,6 +778,15 @@ mod tests {
         assert!(out.contains("> hi"), "{out}");
         assert!(out.contains("hello"), "{out}");
         assert!(out.contains("enter send"), "{out}");
+    }
+
+    #[test]
+    fn busy_activity_row_does_not_shrink_transcript_height() {
+        let mut app = App::new(SessionInfo::default());
+        app.busy = true;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(app.last_view_h > 10, "height was {}", app.last_view_h);
     }
 
     #[test]
