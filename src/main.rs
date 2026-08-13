@@ -143,12 +143,21 @@ fn tui(cli: &Cli) -> Result<(), rpc::Error> {
     let (mut client, session, _version) = connect(cli)?;
     let mode = if cli.auto { "auto" } else { "ask" };
     client.perm_set(mode, HANDSHAKE_TIMEOUT)?;
-    let mut app = if cli.session.is_some() || cli.continue_session {
+    let resuming = cli.session.is_some() || cli.continue_session;
+    let mut app = if resuming {
         let messages = client.transcript(HANDSHAKE_TIMEOUT)?;
         App::from_transcript(session, messages)
     } else {
         App::new(session)
     };
+    app.ask_mode = !cli.auto;
+    app.allow_write = cli.allow_write;
+    app.allow_shell = cli.allow_shell;
+    if let Ok(status) = client.status(HANDSHAKE_TIMEOUT) {
+        app.apply_status(&status);
+    }
+    // Splash only for a fresh session (no transcript seed).
+    app.welcome = app.entries.is_empty();
     app.slash_commands = client.slash_list(HANDSHAKE_TIMEOUT)?;
 
     enable_raw_mode().map_err(rpc::Error::Io)?;

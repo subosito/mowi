@@ -74,4 +74,42 @@ impl Theme {
             Style::default()
         }
     }
+
+    /// Quiet chrome: block borders, rules, hints.
+    pub fn chrome(self) -> Style {
+        if self.colored {
+            Style::default().fg(Color::Rgb(88, 91, 112))
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        }
+    }
+
+    /// Safety chips (capabilities, ask/auto) — always legible.
+    pub fn chip(self) -> Style {
+        if self.colored {
+            Style::default().fg(Color::Rgb(249, 226, 175))
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        }
+    }
+
+    /// Something needs a decision or the frame cannot be drawn.
+    pub fn warn(self) -> Style {
+        if self.colored {
+            Style::default()
+                .fg(Color::Rgb(243, 139, 168))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        }
+    }
+
+    /// Accent used for overlay titles and the welcome splash.
+    pub fn accent(self) -> Style {
+        if self.colored {
+            Style::default().fg(Color::Rgb(203, 166, 247))
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        }
+    }
 }

@@ -43,6 +43,39 @@ parity. Do not block v0 on diffs or `/model`.
 - Remappable keys / `extensions.tui` if we choose to read mow config
 - PTY cell smoke (optional)
 
+## Phase 4 — product chrome & key parity ✓
+
+Ratatui widgets carry the chrome; the transcript stays the product.
+
+- **Header chips** built as spans: workspace / model / short session / token
+  (`⇄` peer) are vanity and drop left-to-right on a narrow terminal; the
+  capability chip (`read-only` / `write` / `shell` / `write+shell`) and the
+  `ask` ↔ `auto` chip never drop. `status` seeds them at handshake.
+- **Min size 40×10** — below that a centered `Clear` + bordered warning Block
+  instead of a broken frame.
+- **Welcome splash** for a fresh session (no transcript seed); any key
+  dismisses it.
+- **Activity band** only while busy: a top-rule Block titled with spinner +
+  verb + elapsed. `MOW_NO_ANIM=1` pins a static `●` and the clock still ticks.
+- **Transcript** gets `Paragraph` + a `Scrollbar` bound to the scroll state,
+  and diffs render as a review card with a `─ <file>` title parsed from `+++`.
+- **Input** is a multi-line Paragraph that grows 1–6 rows; `ctrl+j` inserts a
+  newline, arrow-up on empty input loads the last prompt, `ctrl+l` clears the
+  painted transcript (Engine history is untouched).
+- **Overlays** (`Clear` + centered Block): help (`List` of local keys plus
+  `slash.list` rows), `/sessions` (id / updated / preview + `mowi --session
+  <id>` hint), peer buffer, and permissions (tool name + command string or
+  pretty-printed args, `y`/`n`/`a`). The permission overlay ignores keys for
+  ~200 ms after paint so a stray keystroke cannot approve a power tool.
+- **Peers** collapse to `→ agent · …`; `ctrl+p` expands the last agent's buffer
+  in an overlay. Peer chunks still never weld onto the host answer.
+- **shift+tab** flips ask/auto locally and pushes `perm.set`.
+- Theme gained `chrome` / `chip` / `warn` / `accent` roles; `NO_COLOR` keeps
+  the glyphs distinct.
+
+Still deliberately out: `/model` catalog (not on the wire), a remappable
+keymap file, PTY cell smoke.
+
 ## Non-goals
 
 - In-app Engine

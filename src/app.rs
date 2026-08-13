@@ -20,16 +20,19 @@ use crossterm::{
 use ratatui::{
     Frame, Terminal,
     backend::Backend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Alignment, Constraint, Direction, Flex, Layout, Rect},
     text::{Line, Span},
-    widgets::{Paragraph, Wrap},
+    widgets::{
+        Block, BorderType, Borders, Clear, List, ListItem, Padding, Paragraph, Scrollbar,
+        ScrollbarOrientation, ScrollbarState, Wrap,
+    },
 };
 use serde_json::Value;
 
-use crate::render::{is_unified_diff, markdown_lines};
+use crate::render::{diff_file, is_unified_diff, markdown_lines};
 use crate::rpc::{
-    Client, Error, Notification, PermissionRequest, SessionInfo, SlashCommand, TranscriptMessage,
-    token_delta,
+    Client, Error, Notification, PermissionRequest, SessionInfo, SessionSummary, SlashCommand,
+    TranscriptMessage, token_delta,
 };
 use crate::theme::Theme;
 
@@ -76,6 +79,21 @@ fn format_tokens(tokens: u64) -> String {
     }
 }
 
+/// Which modal overlay (if any) is painted over the document.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Overlay {
+    None,
+    Help,
+    Sessions(Vec<SessionSummary>),
+    Peer,
+}
+
+impl Overlay {
+    pub fn is_open(&self) -> bool {
+        !matches!(self, Overlay::None)
+    }
+}
+
 /// UI state. `draw` is pure over this struct so `TestBackend` can assert on it.
 #[derive(Debug)]
 pub struct App {
@@ -103,6 +121,18 @@ pub struct App {
     pub search_hits: Vec<usize>,
     pub search_cursor: usize,
     pub last_copy: String,
+    /// Ask mode (`perm.set`): true = ask before power tools.
+    pub ask_mode: bool,
+    pub allow_write: bool,
+    pub allow_shell: bool,
+    /// Splash for a fresh session; any key dismisses it.
+    pub welcome: bool,
+    pub overlay: Overlay,
+    /// Instant the permission overlay was painted; keys are ignored briefly.
+    pub perm_shown: Option<Instant>,
+    /// Agent whose buffer `ctrl+p` expands.
+    pub peer_focus: Option<String>,
+    pub animate: bool,
 }
 
 impl Default for App {
@@ -130,6 +160,14 @@ impl Default for App {
             search_hits: Vec::new(),
             search_cursor: 0,
             last_copy: String::new(),
+            ask_mode: true,
+            allow_write: false,
+            allow_shell: false,
+            welcome: false,
+            overlay: Overlay::None,
+            perm_shown: None,
+            peer_focus: None,
+            animate: std::env::var_os("MOW_NO_ANIM").is_none(),
         }
     }
 }
@@ -156,39 +194,88 @@ impl App {
         app
     }
 
-    pub fn header(&self) -> String {
-        let mut parts: Vec<&str> = Vec::new();
+    /// Adopt capability / ask-mode chips from a `status` result.
+    pub fn apply_status(&mut self, status: &Value) {
+        if let Some(v) = status.get("allow_write").and_then(Value::as_bool) {
+            self.allow_write = v;
+        }
+        if let Some(v) = status.get("allow_shell").and_then(Value::as_bool) {
+            self.allow_shell = v;
+        }
+        match status.get("ask_mode") {
+            Some(Value::Bool(v)) => self.ask_mode = *v,
+            Some(Value::String(mode)) => self.ask_mode = mode == "ask",
+            _ => {}
+        }
+    }
+
+    /// Capability chip: what the Engine was allowed to do at spawn.
+    pub fn capability_chip(&self) -> String {
+        match (self.allow_write, self.allow_shell) {
+            (true, true) => "write+shell".into(),
+            (true, false) => "write".into(),
+            (false, true) => "shell".into(),
+            (false, false) => "read-only".into(),
+        }
+    }
+
+    pub fn mode_chip(&self) -> &'static str {
+        if self.ask_mode { "ask" } else { "auto" }
+    }
+
+    /// Vanity chips, widest-first. These drop on a narrow terminal.
+    fn vanity_chips(&self) -> Vec<String> {
+        let mut chips = Vec::new();
         if !self.session.workspace.is_empty() {
-            parts.push(self.session.workspace.as_str());
+            chips.push(self.session.workspace.clone());
         }
         if !self.session.model.is_empty() {
-            parts.push(self.session.model.as_str());
+            chips.push(self.session.model.clone());
         }
         let short = self.session.short_id();
-        let mut s = if parts.is_empty() {
-            "mowi".to_string()
-        } else {
-            format!("mowi · {}", parts.join(" · "))
-        };
         if !short.is_empty() {
-            s.push_str(" · ");
-            s.push_str(&short);
+            chips.push(short);
         }
-        if self.usage.total() > 0 {
-            s.push_str(" · ");
-            s.push_str(&self.usage.chip());
+        if self.usage.total() > 0 || self.usage.peer_tokens > 0 {
+            chips.push(self.usage.chip());
         }
         if self.select_mode {
-            s.push_str(" · select");
+            chips.push("select".into());
         }
-        s
+        chips
+    }
+
+    /// Header as spans. Safety chips (capability, ask/auto) never drop; vanity
+    /// chips fall off left-to-right until the row fits `width`.
+    pub fn header_line(&self, width: u16) -> Line<'static> {
+        let safety = format!("{} · {}", self.capability_chip(), self.mode_chip());
+        let mut vanity = self.vanity_chips();
+        let width = width as usize;
+        loop {
+            let left = if vanity.is_empty() {
+                "mowi".to_string()
+            } else {
+                format!("mowi · {}", vanity.join(" · "))
+            };
+            if left.chars().count() + safety.chars().count() + 2 <= width || vanity.is_empty() {
+                let pad = width
+                    .saturating_sub(left.chars().count() + safety.chars().count())
+                    .max(1);
+                return Line::from(vec![
+                    Span::styled(left, self.theme.header()),
+                    Span::raw(" ".repeat(pad)),
+                    Span::styled(safety, self.theme.chip()),
+                ]);
+            }
+            vanity.remove(0);
+        }
     }
 
     pub fn footer(&self) -> String {
         let hints = if let Some(permission) = &self.pending_perm {
             return format!("y allow · n deny · a always · {}", permission.name);
         } else {
-            "enter send · esc cancel · q quit · ctrl+s select"
+            "enter send · esc cancel · ? help · ctrl+s select"
         };
         if self.status.is_empty() {
             hints.to_string()
@@ -219,7 +306,7 @@ impl App {
             ])],
             Entry::Assistant(t) => {
                 if is_unified_diff(t) {
-                    crate::render::diff_lines(t, self.theme)
+                    self.diff_card(t)
                 } else {
                     markdown_lines(t, self.theme)
                 }
@@ -232,6 +319,15 @@ impl App {
                 vec![Line::styled(format!("⚙ {name}{suffix}"), self.theme.note())]
             }
         }
+    }
+
+    /// A diff entry framed as a review card: thin rule + file title.
+    fn diff_card(&self, text: &str) -> Vec<Line<'static>> {
+        let title = diff_file(text).unwrap_or_else(|| "diff".to_string());
+        let mut out = vec![Line::styled(format!("─ {title} "), self.theme.chrome())];
+        out.extend(crate::render::diff_lines(text, self.theme));
+        out.push(Line::styled("─".repeat(8), self.theme.chrome()));
+        out
     }
 
     /// Materialize only a bounded transcript window for painting large sessions.
@@ -263,6 +359,7 @@ impl App {
         if !self.live.is_empty() && cursor >= target {
             lines.extend(markdown_lines(self.live.as_str(), self.theme));
         }
+        lines.extend(self.peer_lines());
         (lines, base.min(u16::MAX as usize) as u16)
     }
 
@@ -289,7 +386,82 @@ impl App {
             .activity_started
             .map(|start| start.elapsed().as_secs_f32())
             .unwrap_or(0.0);
-        format!("● {:.1}s · {}", elapsed, self.status_or_default())
+        format!(
+            "{} {:.1}s · {}",
+            self.spinner(elapsed),
+            elapsed,
+            self.status_or_default()
+        )
+    }
+
+    /// Spinner frame. `MOW_NO_ANIM=1` pins a static `●`; elapsed still ticks.
+    fn spinner(&self, elapsed: f32) -> &'static str {
+        const FRAMES: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+        if !self.animate {
+            return "●";
+        }
+        FRAMES[((elapsed * 8.0) as usize) % FRAMES.len()]
+    }
+
+    /// Collapsed peer rows: one line per agent. `ctrl+p` opens the full
+    /// buffer in an overlay — peer text never welds onto the host answer.
+    fn peer_lines(&self) -> Vec<Line<'static>> {
+        let mut agents: Vec<&String> = self.peers.keys().collect();
+        agents.sort();
+        agents
+            .into_iter()
+            .map(|agent| {
+                let preview = self.peers[agent]
+                    .lines()
+                    .next_back()
+                    .unwrap_or("")
+                    .chars()
+                    .take(48)
+                    .collect::<String>();
+                let preview = if preview.is_empty() {
+                    "working".to_string()
+                } else {
+                    preview
+                };
+                Line::styled(format!("→ {agent} · {preview} (ctrl+p)"), self.theme.note())
+            })
+            .collect()
+    }
+
+    /// Toggle the expanded peer buffer (`ctrl+p`).
+    pub fn toggle_peer_expand(&mut self) -> bool {
+        if self.peer_focus.take().is_some() {
+            return true;
+        }
+        let mut agents: Vec<&String> = self.peers.keys().collect();
+        agents.sort();
+        match agents.last() {
+            Some(agent) => {
+                self.peer_focus = Some((*agent).clone());
+                true
+            }
+            None => {
+                self.status = "no peer output".into();
+                false
+            }
+        }
+    }
+
+    /// Drop painted entries. Engine history is untouched (`ctrl+l`).
+    pub fn clear_transcript(&mut self) {
+        self.entries.clear();
+        self.live.clear();
+        self.search_hits.clear();
+        self.search_term.clear();
+        self.scroll = 0;
+        self.follow = true;
+        self.status = "transcript cleared (engine history kept)".into();
+    }
+
+    /// Flip ask/auto locally; the caller pushes `perm.set`.
+    pub fn toggle_ask_mode(&mut self) -> &'static str {
+        self.ask_mode = !self.ask_mode;
+        self.mode_chip()
     }
 
     fn status_or_default(&self) -> &str {
@@ -307,6 +479,7 @@ impl App {
             "perm.ask" => {
                 if let Some(permission) = n.permission_request() {
                     self.pending_perm = Some(permission);
+                    self.perm_shown = Some(Instant::now());
                 }
             }
             _ => {}
@@ -399,6 +572,7 @@ impl App {
     }
 
     fn finish_peers(&mut self) {
+        self.peer_focus = None;
         for (agent, _) in self.peers.drain() {
             self.entries.push(Entry::Note(format!("→ {agent} · done")));
         }
@@ -545,9 +719,60 @@ impl App {
         client: &mut Client,
     ) -> Result<(), Error> {
         if let Some(permission) = self.pending_perm.take() {
+            self.perm_shown = None;
+            self.status = format!("{} {}", permission.name, decision);
             client.perm_decide(&permission.id, decision, Duration::from_secs(20))?;
         }
         Ok(())
+    }
+
+    /// True while the freshly painted permission overlay swallows keys, so a
+    /// stray keystroke cannot approve a power tool (Go mowi behavior).
+    pub fn perm_guard_active(&self) -> bool {
+        const GUARD: Duration = Duration::from_millis(200);
+        self.perm_shown
+            .map(|shown| shown.elapsed() < GUARD)
+            .unwrap_or(false)
+    }
+
+    /// Local key table plus `slash.list` rows, for the help overlay.
+    pub fn help_rows(&self) -> Vec<(String, String)> {
+        let mut rows: Vec<(String, String)> = [
+            ("enter", "send (queue while busy)"),
+            ("ctrl+j", "newline"),
+            ("↑ (empty input)", "edit last prompt"),
+            ("ctrl+u / ctrl+d", "scroll transcript"),
+            ("ctrl+l", "clear transcript (engine history kept)"),
+            ("shift+tab", "ask ↔ auto"),
+            ("ctrl+p", "expand peer output"),
+            ("ctrl+s", "select mode (native copy)"),
+            ("ctrl+/ or ?", "this help"),
+            ("esc", "dismiss overlay, else cancel turn"),
+            ("ctrl+c", "quit"),
+        ]
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+        for command in &self.slash_commands {
+            rows.push((
+                format!("/{}", command.name.trim_start_matches('/')),
+                command.summary.clone(),
+            ));
+        }
+        rows
+    }
+
+    /// Close whichever overlay is open. Returns true if something closed.
+    pub fn dismiss_overlay(&mut self) -> bool {
+        if self.welcome {
+            self.welcome = false;
+            return true;
+        }
+        if self.overlay.is_open() {
+            self.overlay = Overlay::None;
+            return true;
+        }
+        false
     }
 
     pub fn refuses_exclusive_slash(&self, name: &str) -> bool {
@@ -569,8 +794,6 @@ fn entry_text(entry: &Entry) -> String {
         Entry::Tool { name, .. } => name.clone(),
     }
 }
-
-/// Paint header / transcript / input / footer.
 
 fn max_scroll(app: &App) -> u16 {
     let n = app.estimated_total_lines().min(u16::MAX as usize) as u16;
@@ -599,69 +822,339 @@ fn scroll_down(app: &mut App, n: u16) {
     }
 }
 
+/// Centered popup rect using constraint layout (no ad-hoc arithmetic).
+fn centered(area: Rect, width: Constraint, height: Constraint) -> Rect {
+    let [row] = Layout::vertical([height]).flex(Flex::Center).areas(area);
+    let [cell] = Layout::horizontal([width]).flex(Flex::Center).areas(row);
+    cell
+}
+
+/// Height of the input textarea: grows 1..6 lines with the typed text.
+fn input_height(app: &App) -> u16 {
+    (app.input.lines().count().max(1) as u16).clamp(1, 6)
+}
+
+fn overlay_block(app: &App, title: &str) -> Block<'static> {
+    Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(app.theme.chrome())
+        .padding(Padding::horizontal(1))
+        .title(Span::styled(format!(" {title} "), app.theme.accent()))
+}
+
+const MIN_WIDTH: u16 = 40;
+const MIN_HEIGHT: u16 = 10;
+
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
+    let area = frame.area();
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        draw_too_small(frame, app, area);
+        return;
+    }
+
+    let input_h = input_height(app) + 1; // + top rule
     let constraints = if app.busy {
         vec![
             Constraint::Length(1),
             Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(input_h),
             Constraint::Length(1),
         ]
     } else {
         vec![
             Constraint::Length(1),
-            Constraint::Min(1),
-            Constraint::Length(1),
+            Constraint::Fill(1),
+            Constraint::Length(input_h),
             Constraint::Length(1),
         ]
     };
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints(constraints)
-        .split(frame.area());
+        .split(area);
 
-    frame.render_widget(
-        Paragraph::new(app.header()).style(app.theme.header()),
-        areas[0],
-    );
+    frame.render_widget(Paragraph::new(app.header_line(area.width)), areas[0]);
 
     let transcript_area = if app.busy {
         frame.render_widget(
-            Paragraph::new(app.activity()).style(app.theme.note()),
+            Block::new()
+                .borders(Borders::TOP)
+                .border_style(app.theme.chrome())
+                .title(Span::styled(
+                    format!(" {} ", app.activity()),
+                    app.theme.note(),
+                )),
             areas[1],
         );
         areas[2]
     } else {
         areas[1]
     };
-    app.last_view_h = transcript_area.height.max(1);
-    let (lines, base_scroll) = app.visible_transcript_lines();
-    let height = app.last_view_h as usize;
-    let scroll = if app.follow {
-        lines.len().saturating_sub(height) as u16
-    } else {
-        app.scroll
-            .saturating_sub(base_scroll)
-            .min(lines.len().saturating_sub(height) as u16)
-    };
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
-        transcript_area,
-    );
+    draw_transcript(frame, app, transcript_area);
 
     let input_area = if app.busy { areas[3] } else { areas[2] };
     let footer_area = if app.busy { areas[4] } else { areas[3] };
+    let input_block = Block::new()
+        .borders(Borders::TOP)
+        .border_style(app.theme.chrome());
+    let input_inner = input_block.inner(input_area);
+    frame.render_widget(input_block, input_area);
     frame.render_widget(
-        Paragraph::new(format!("› {}", app.input)).style(app.theme.user()),
-        input_area,
+        Paragraph::new(prompt_text(app))
+            .style(app.theme.user())
+            .wrap(Wrap { trim: false }),
+        input_inner,
     );
     frame.render_widget(
         Paragraph::new(app.footer()).style(app.theme.note()),
         footer_area,
     );
+
+    if app.welcome {
+        draw_welcome(frame, app, area);
+        return;
+    }
+    if app.pending_perm.is_some() {
+        draw_permission(frame, app, area);
+        return;
+    }
+    match &app.overlay {
+        Overlay::Help => draw_help(frame, app, area),
+        Overlay::Sessions(sessions) => draw_sessions(frame, app, sessions, area),
+        Overlay::Peer => draw_peer(frame, app, area),
+        Overlay::None => {}
+    }
+}
+
+/// Input text with the prompt glyph on the first line.
+fn prompt_text(app: &App) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (index, line) in app.input.split('\n').enumerate() {
+        let glyph = if index == 0 { "› " } else { "  " };
+        lines.push(Line::from(format!("{glyph}{line}")));
+    }
+    if lines.is_empty() {
+        lines.push(Line::from("› ".to_string()));
+    }
+    lines
+}
+
+fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let block = Block::new().padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    app.last_view_h = inner.height.max(1);
+
+    let (lines, base_scroll) = app.visible_transcript_lines();
+    let height = app.last_view_h as usize;
+    let overflow = lines.len().saturating_sub(height);
+    let scroll = if app.follow {
+        overflow as u16
+    } else {
+        app.scroll.saturating_sub(base_scroll).min(overflow as u16)
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        inner,
+    );
+    if overflow > 0 {
+        let mut state = ScrollbarState::new(overflow).position(scroll as usize);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .style(app.theme.chrome())
+                .begin_symbol(None)
+                .end_symbol(None),
+            area,
+            &mut state,
+        );
+    }
+}
+
+fn draw_too_small(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    frame.render_widget(Clear, area);
+    let block = Block::bordered()
+        .border_type(BorderType::Rounded)
+        .border_style(app.theme.warn())
+        .title(Span::styled(" mowi ", app.theme.warn()));
+    let spot = centered(
+        area,
+        Constraint::Length(area.width.min(34)),
+        Constraint::Length(area.height.min(5)),
+    );
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled("terminal too small", app.theme.warn()),
+            Line::styled(
+                format!(
+                    "need {MIN_WIDTH}x{MIN_HEIGHT}, have {}x{}",
+                    area.width, area.height
+                ),
+                app.theme.note(),
+            ),
+        ])
+        .alignment(Alignment::Center)
+        .wrap(Wrap { trim: true })
+        .block(block),
+        spot,
+    );
+}
+
+fn draw_welcome(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let spot = centered(
+        area,
+        Constraint::Length(area.width.saturating_sub(4).min(60)),
+        Constraint::Length(area.height.saturating_sub(2).min(9)),
+    );
+    frame.render_widget(Clear, spot);
+    let workspace = if app.session.workspace.is_empty() {
+        "workspace".to_string()
+    } else {
+        app.session.workspace.clone()
+    };
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::styled("◇ mowi", app.theme.accent()),
+            Line::raw(""),
+            Line::styled(
+                format!("{workspace} · {}", app.session.model),
+                app.theme.note(),
+            ),
+            Line::styled(
+                format!("{} · {}", app.capability_chip(), app.mode_chip()),
+                app.theme.chip(),
+            ),
+            Line::raw(""),
+            Line::styled(
+                "ask anything · ? for help · any key to start",
+                app.theme.note(),
+            ),
+        ])
+        .wrap(Wrap { trim: true })
+        .block(overlay_block(app, "welcome")),
+        spot,
+    );
+}
+
+fn draw_help(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let spot = centered(
+        area,
+        Constraint::Length(area.width.saturating_sub(4).min(64)),
+        Constraint::Length(area.height.saturating_sub(2)),
+    );
+    frame.render_widget(Clear, spot);
+    let items: Vec<ListItem<'static>> = app
+        .help_rows()
+        .into_iter()
+        .map(|(key, what)| {
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{key:<18}"), app.theme.chip()),
+                Span::styled(what, app.theme.note()),
+            ]))
+        })
+        .collect();
+    frame.render_widget(
+        List::new(items).block(overlay_block(app, "help · esc to close")),
+        spot,
+    );
+}
+
+fn draw_sessions(frame: &mut Frame<'_>, app: &App, sessions: &[SessionSummary], area: Rect) {
+    let spot = centered(
+        area,
+        Constraint::Length(area.width.saturating_sub(4).min(72)),
+        Constraint::Length(area.height.saturating_sub(2)),
+    );
+    frame.render_widget(Clear, spot);
+    let mut items: Vec<ListItem<'static>> = sessions
+        .iter()
+        .map(|session| {
+            ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled(session.id.clone(), app.theme.chip()),
+                    Span::styled(format!("  {}", session.updated), app.theme.note()),
+                ]),
+                Line::styled(format!("  {}", session.preview), app.theme.context()),
+            ])
+        })
+        .collect();
+    if items.is_empty() {
+        items.push(ListItem::new(Line::styled(
+            "no stored sessions",
+            app.theme.note(),
+        )));
+    }
+    items.push(ListItem::new(Line::styled(
+        "resume with: mowi --session <id>",
+        app.theme.accent(),
+    )));
+    frame.render_widget(
+        List::new(items).block(overlay_block(app, "sessions · esc to close")),
+        spot,
+    );
+}
+
+fn draw_peer(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let spot = centered(
+        area,
+        Constraint::Length(area.width.saturating_sub(4).min(72)),
+        Constraint::Length(area.height.saturating_sub(2)),
+    );
+    frame.render_widget(Clear, spot);
+    let agent = app.peer_focus.clone().unwrap_or_else(|| "peer".to_string());
+    let body = app.peers.get(&agent).cloned().unwrap_or_default();
+    frame.render_widget(
+        Paragraph::new(body)
+            .style(app.theme.context())
+            .wrap(Wrap { trim: false })
+            .block(overlay_block(app, &format!("⇄ {agent} · esc to close"))),
+        spot,
+    );
+}
+
+fn draw_permission(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let Some(permission) = &app.pending_perm else {
+        return;
+    };
+    let spot = centered(
+        area,
+        Constraint::Length(area.width.saturating_sub(4).min(70)),
+        Constraint::Length(area.height.saturating_sub(2).min(14)),
+    );
+    frame.render_widget(Clear, spot);
+    let mut lines = vec![Line::styled(
+        format!("▲ {} wants to run", permission.name),
+        app.theme.warn(),
+    )];
+    for line in permission_preview(permission).lines() {
+        lines.push(Line::styled(line.to_string(), app.theme.context()));
+    }
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "y allow · n deny · a always (this session) · esc cancel",
+        app.theme.chip(),
+    ));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(overlay_block(app, "permission")),
+        spot,
+    );
+}
+
+/// Command string when the tool has one, else pretty-printed args JSON.
+fn permission_preview(permission: &PermissionRequest) -> String {
+    for field in ["command", "cmd", "path", "file_path"] {
+        if let Some(text) = permission.args.get(field).and_then(Value::as_str) {
+            return format!("{field}: {text}");
+        }
+    }
+    match &permission.args {
+        Value::Null => String::new(),
+        args => serde_json::to_string_pretty(args).unwrap_or_else(|_| args.to_string()),
+    }
 }
 
 /// Terminal loop: keys in, RPC messages out, one repaint per tick.
@@ -773,14 +1266,38 @@ fn handle_key(
     slash_rx: &mut Option<Receiver<Result<Value, Error>>>,
 ) -> Result<(), Error> {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+    // The permission overlay owns the keyboard, with a short guard window so a
+    // stray keystroke in flight cannot approve a power tool.
     if app.pending_perm.is_some() {
+        if app.perm_guard_active() {
+            return Ok(());
+        }
         match key.code {
             KeyCode::Char('y') => return app.permission_decision("allow", client),
-            KeyCode::Char('n') => return app.permission_decision("deny", client),
+            KeyCode::Char('n') | KeyCode::Esc => return app.permission_decision("deny", client),
             KeyCode::Char('a') => return app.permission_decision("always", client),
             _ => return Ok(()),
         }
     }
+
+    // The welcome splash dismisses on any key and swallows it.
+    if app.welcome {
+        app.welcome = false;
+        return Ok(());
+    }
+
+    // Overlays: esc (or the toggle key) closes; everything else is inert.
+    if app.overlay.is_open() {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => app.overlay = Overlay::None,
+            KeyCode::Char('?') => app.overlay = Overlay::None,
+            KeyCode::Char('c') if ctrl => app.quit = true,
+            _ => {}
+        }
+        return Ok(());
+    }
+
     match key.code {
         KeyCode::Char('s') if ctrl => {
             app.toggle_select_mode();
@@ -791,9 +1308,29 @@ fn handle_key(
             }
             app.quit = true;
         }
+        KeyCode::Char('j') if ctrl => app.input.push('\n'),
+        KeyCode::Char('l') if ctrl => app.clear_transcript(),
+        KeyCode::Char('p') if ctrl => {
+            if app.toggle_peer_expand() {
+                app.overlay = if app.peer_focus.is_some() {
+                    Overlay::Peer
+                } else {
+                    Overlay::None
+                };
+            }
+        }
+        KeyCode::BackTab => {
+            let mode = app.toggle_ask_mode();
+            client.perm_set(mode, Duration::from_secs(20))?;
+            app.status = format!("mode: {mode}");
+        }
+        // ctrl+/ arrives as Char('/') with CONTROL on most terminals.
+        KeyCode::Char('/') if ctrl => app.overlay = Overlay::Help,
+        KeyCode::Char('?') if app.input.is_empty() => app.overlay = Overlay::Help,
         KeyCode::Char('q') if app.input.is_empty() && !app.busy => app.quit = true,
         KeyCode::Esc => {
-            if app.busy || turn.is_some() {
+            if app.dismiss_overlay() {
+            } else if app.busy || turn.is_some() {
                 client.cancel()?;
                 app.status = "cancelling".into();
             }
@@ -836,6 +1373,9 @@ fn handle_key(
             scroll_down(app, 5);
         }
         KeyCode::Up => {
+            if app.input.is_empty() && app.edit_last_prompt() {
+                return Ok(());
+            }
             leave_follow(app, 1);
         }
         KeyCode::Down => {
@@ -884,31 +1424,15 @@ fn handle_slash(
         }
         "help" => {
             app.slash_commands = client.slash_list(Duration::from_secs(20))?;
-            let body = app
-                .slash_commands
-                .iter()
-                .map(|command| format!("/{} — {}", command.name, command.summary))
-                .collect::<Vec<_>>()
-                .join(" · ");
-            app.entries.push(Entry::Note(body));
+            app.overlay = Overlay::Help;
         }
         "sessions" => {
             let sessions = client.sessions(Duration::from_secs(20))?;
-            let body = sessions
-                .iter()
-                .map(|session| {
-                    format!("{} · {} · {}", session.id, session.updated, session.preview)
-                })
-                .collect::<Vec<_>>()
-                .join(" | ");
-            app.entries.push(Entry::Note(if body.is_empty() {
-                "no sessions".into()
-            } else {
-                body
-            }));
+            app.overlay = Overlay::Sessions(sessions);
         }
         "status" => {
             let status = client.status(Duration::from_secs(20))?;
+            app.apply_status(&status);
             app.entries.push(Entry::Note(format!("status: {status}")));
         }
         _ => {
@@ -967,13 +1491,188 @@ mod tests {
         app.entries.push(Entry::User("hi".into()));
         app.live.push_str("hello");
 
-        let out = render(&mut app, 48, 6);
+        let out = render(&mut app, 80, 14);
         assert!(out.contains("mowi"), "{out}");
         assert!(out.contains("gpt-5-mini"), "{out}");
         assert!(out.contains("abcdef01"), "{out}");
         assert!(out.contains("> hi"), "{out}");
         assert!(out.contains("hello"), "{out}");
         assert!(out.contains("enter send"), "{out}");
+        // Safety chips are always painted.
+        assert!(out.contains("read-only"), "{out}");
+        assert!(out.contains("ask"), "{out}");
+    }
+
+    #[test]
+    fn narrow_header_drops_vanity_but_keeps_safety_chips() {
+        let mut app = App::new(SessionInfo {
+            session_id: "abcdef0123456789".into(),
+            workspace: "/very/long/workspace/path".into(),
+            model: "claude-sonnet-4".into(),
+            wire: "anthropic-messages".into(),
+        });
+        app.allow_write = true;
+        app.allow_shell = true;
+        let wide: String = app
+            .header_line(120)
+            .spans
+            .iter()
+            .map(|span| span.content.to_string())
+            .collect();
+        assert!(wide.contains("/very/long/workspace/path"), "{wide}");
+
+        let narrow: String = app
+            .header_line(42)
+            .spans
+            .iter()
+            .map(|span| span.content.to_string())
+            .collect();
+        assert!(!narrow.contains("/very/long/workspace/path"), "{narrow}");
+        assert!(narrow.contains("write+shell"), "{narrow}");
+        assert!(narrow.contains("ask"), "{narrow}");
+    }
+
+    #[test]
+    fn tiny_terminal_paints_a_warning_not_a_broken_frame() {
+        let mut app = App::new(SessionInfo::default());
+        app.entries.push(Entry::User("hi".into()));
+        let out = render(&mut app, 30, 8);
+        assert!(out.contains("too small"), "{out}");
+        assert!(!out.contains("> hi"), "{out}");
+    }
+
+    #[test]
+    fn welcome_splash_paints_and_any_key_dismisses_it() {
+        let mut app = App::new(SessionInfo::default());
+        app.welcome = true;
+        let out = render(&mut app, 60, 16);
+        assert!(out.contains("welcome"), "{out}");
+
+        // handle_key needs a Client; the splash branch is the state machine.
+        assert!(app.dismiss_overlay());
+        assert!(!app.welcome);
+        let out = render(&mut app, 60, 16);
+        assert!(!out.contains("welcome"), "{out}");
+    }
+
+    #[test]
+    fn help_overlay_lists_local_keys_and_slash_commands() {
+        let mut app = App::new(SessionInfo::default());
+        app.slash_commands.push(SlashCommand {
+            name: "review".into(),
+            summary: "review changes".into(),
+            exclusive: true,
+            aliases: vec![],
+        });
+        app.overlay = Overlay::Help;
+        let out = render(&mut app, 70, 20);
+        assert!(out.contains("help"), "{out}");
+        assert!(out.contains("ctrl+j"), "{out}");
+        assert!(out.contains("/review"), "{out}");
+
+        assert!(app.dismiss_overlay());
+        assert_eq!(app.overlay, Overlay::None);
+        let out = render(&mut app, 70, 20);
+        assert!(!out.contains("ctrl+j"), "{out}");
+    }
+
+    #[test]
+    fn sessions_overlay_lists_rows_and_resume_hint() {
+        let mut app = App::new(SessionInfo::default());
+        app.overlay = Overlay::Sessions(vec![SessionSummary {
+            id: "s-42".into(),
+            updated: "today".into(),
+            preview: "port the header".into(),
+        }]);
+        let out = render(&mut app, 72, 16);
+        assert!(out.contains("s-42"), "{out}");
+        assert!(out.contains("port the header"), "{out}");
+        assert!(out.contains("mowi --session <id>"), "{out}");
+    }
+
+    #[test]
+    fn permission_overlay_shows_args_and_guards_early_keys() {
+        let mut app = App::new(SessionInfo::default());
+        app.on_notification(&Notification {
+            method: "perm.ask".into(),
+            params: serde_json::json!({
+                "id": "perm-1",
+                "name": "bash",
+                "args": {"command": "rm -rf build"},
+                "tool_call_id": "call-1"
+            }),
+        });
+        assert!(app.perm_guard_active(), "guard should swallow stray keys");
+        let out = render(&mut app, 70, 16);
+        assert!(out.contains("permission"), "{out}");
+        assert!(out.contains("rm -rf build"), "{out}");
+        assert!(out.contains("y allow"), "{out}");
+    }
+
+    #[test]
+    fn ctrl_j_grows_the_input_area() {
+        let mut app = App::new(SessionInfo::default());
+        assert_eq!(input_height(&app), 1);
+        app.input.push_str("one");
+        app.input.push('\n');
+        app.input.push_str("two");
+        assert_eq!(input_height(&app), 2);
+        let out = render(&mut app, 60, 16);
+        assert!(out.contains("› one"), "{out}");
+        assert!(out.contains("  two"), "{out}");
+    }
+
+    #[test]
+    fn ask_mode_flips_and_clear_keeps_engine_history() {
+        let mut app = App::new(SessionInfo::default());
+        assert_eq!(app.mode_chip(), "ask");
+        assert_eq!(app.toggle_ask_mode(), "auto");
+        assert!(!app.ask_mode);
+        assert_eq!(app.toggle_ask_mode(), "ask");
+
+        app.entries.push(Entry::User("hi".into()));
+        app.live.push_str("partial");
+        app.clear_transcript();
+        assert!(app.entries.is_empty());
+        assert!(app.live.is_empty());
+        assert!(app.status.contains("engine history"), "{}", app.status);
+    }
+
+    #[test]
+    fn peer_output_collapses_and_expands() {
+        let mut app = App::new(SessionInfo::default());
+        app.on_notification(&Notification {
+            method: "event".into(),
+            params: serde_json::json!({
+                "type": "harness.delegate.chunk", "agent": "peer-agent", "delta": "scanning\n"
+            }),
+        });
+        let out = render(&mut app, 70, 16);
+        assert!(out.contains("→ peer-agent"), "{out}");
+
+        assert!(app.toggle_peer_expand());
+        assert_eq!(app.peer_focus.as_deref(), Some("peer-agent"));
+        assert!(app.toggle_peer_expand());
+        assert!(app.peer_focus.is_none());
+    }
+
+    #[test]
+    fn status_result_updates_capability_chips() {
+        let mut app = App::new(SessionInfo::default());
+        app.apply_status(&serde_json::json!({
+            "allow_write": true, "allow_shell": false, "ask_mode": "auto"
+        }));
+        assert_eq!(app.capability_chip(), "write");
+        assert_eq!(app.mode_chip(), "auto");
+    }
+
+    #[test]
+    fn static_spinner_when_animation_is_off() {
+        let mut app = App::new(SessionInfo::default());
+        app.animate = false;
+        app.busy = true;
+        app.activity_started = Some(Instant::now());
+        assert!(app.activity().starts_with('●'), "{}", app.activity());
     }
 
     #[test]
@@ -1139,7 +1838,12 @@ mod tests {
             peer_tokens: 1_200,
         };
         assert_eq!(app.usage.chip(), "12.3k tok (⇄ 1.2k)");
-        assert!(app.header().contains("12.3k tok"));
+        assert!(
+            app.header_line(80)
+                .spans
+                .iter()
+                .any(|span| span.content.contains("12.3k tok"))
+        );
     }
 
     #[test]

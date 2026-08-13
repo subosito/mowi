@@ -69,6 +69,20 @@ pub fn markdown_lines(text: &str, theme: Theme) -> Vec<Line<'static>> {
     lines
 }
 
+/// File path of a unified diff, from the `+++ b/path` header when present.
+pub fn diff_file(text: &str) -> Option<String> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("+++ "))
+        .map(|path| {
+            path.split('\t')
+                .next()
+                .unwrap_or(path)
+                .trim_start_matches("b/")
+                .to_string()
+        })
+        .filter(|path| !path.is_empty() && path != "/dev/null")
+}
+
 pub fn diff_lines(text: &str, theme: Theme) -> Vec<Line<'static>> {
     text.lines()
         .map(|line| {
@@ -102,5 +116,12 @@ mod tests {
     #[test]
     fn markdown_list_is_not_a_diff() {
         assert!(!is_unified_diff("- item\n- item2"));
+    }
+
+    #[test]
+    fn diff_title_comes_from_the_plus_header() {
+        let diff = "--- a/src/app.rs\n+++ b/src/app.rs\n@@ -1 +1 @@\n-old\n+new";
+        assert_eq!(super::diff_file(diff).as_deref(), Some("src/app.rs"));
+        assert_eq!(super::diff_file("@@ -1 +1 @@\n+new"), None);
     }
 }

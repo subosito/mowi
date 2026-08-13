@@ -19,17 +19,19 @@ operator experience**, not a subset that forgets permissions or resume.
 | Key | Action |
 |---|---|
 | Enter | send (queue if busy) |
-| ctrl+j | newline |
+| ctrl+j | newline (input grows 1–6 rows) |
 | ctrl+u / ctrl+d | scroll transcript (wheel too) |
-| Esc | cancel turn / dismiss overlay / deny? (cancel first) |
+| Esc | dismiss overlay, else cancel turn, else ignore |
 | ctrl+l | clear transcript (UI-local; Engine history remains) |
 | shift+tab | ask ↔ auto (`perm.set`) |
+| ctrl+p | expand the last peer buffer in an overlay |
 | ctrl+s | select mode — release mouse for native copy |
-| ctrl+/ or `?` on empty | help |
+| ctrl+/ or `?` on empty | help overlay (local keys + `slash.list`) |
 | ctrl+c | quit (cancel first if busy) |
 | Arrow-up on empty | edit last prompt |
+| any key | dismiss the welcome splash |
 
-All bindings remappable later (`extensions.tui.keys` in Go). v1 can hard-code
+All bindings remappable later (`extensions.tui.keys` in Go). v1 hard-codes
 defaults.
 
 ## Commands (typed)
@@ -40,7 +42,7 @@ Host-side (this crate, or slash if registered):
 |---|---|
 | `/steer <text>` | RPC `steer` while busy |
 | `/status` | RPC `status` + last usage; show peer share |
-| `/sessions` | RPC `sessions` (list + how to resume; no in-app switch) |
+| `/sessions` | RPC `sessions` — overlay list + `mowi --session <id>` hint |
 | `/search` | UI-local find in painted transcript |
 | `/copy` `/retry` `/edit` | UI-local / re-`prompt` |
 | `/model` `/effort` | later; Engine/CLI today |
@@ -59,9 +61,10 @@ Power tools (`write`, `edit`, `bash`) when ask mode:
 y allow · n deny · a always (this session)
 ```
 
-Preview: command string or diff from `perm.ask` args. Esc cancels the
-prompt (does not auto-allow). Short ignore window after paint so a stray
-key cannot approve.
+Shown as a modal overlay (`Clear` + centered Block), not just a footer
+strip: tool name plus the command string when the args carry one, else
+pretty-printed args JSON. Esc denies the prompt (never auto-allows). Keys
+are ignored for ~200 ms after paint so a stray key cannot approve.
 
 Default Go mowi is ask when capabilities are on. This crate should
 `perm.set ask` unless `--auto`.
@@ -73,7 +76,7 @@ Trust: `mow trust` / `mowi trust` out of band. No marker in the workspace.
 `acp_delegate` is Engine-only. UI:
 
 - activity: “delegating · <agent>”
-- live peer text: collapsed one-liner; expand later (`ctrl+p` in Go)
+- live peer text: collapsed one-liner; `ctrl+p` expands the buffer overlay
 - never weld peer chunks onto the host answer
 - `harness.delegate.usage` → header `⇄` chip
 
@@ -86,7 +89,8 @@ del `#f38ba8` on ~`#4d3240`. Syntax highlight **context only**. Word-diff:
 shared tokens stay full accent; changed tokens invert. Gutter unbanded,
 tinted numbers. See mow `packs/mowi/styles.go` / `diff_*.go`.
 
-v1 can show a raw unified diff; parity needs this recipe.
+Diff entries render as a review card: a thin `─ <file>` rule parsed from the
+`+++` header around the add/del lines. Full word-diff is still open.
 
 ## Resume / scroll
 

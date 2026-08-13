@@ -13,8 +13,8 @@ mowi never:
 
 mowi does:
 
-- paint a document (header, transcript, activity, input, perm strip)
-- send `prompt` / `cancel` / `steer` / `slash` / `perm.decide`
+- paint a document (header, transcript, activity, input, overlays)
+- send `prompt` / `cancel` / `steer` / `slash` / `perm.set` / `perm.decide`
 - render `event` and `perm.ask` notifications
 
 ## Processes
@@ -79,7 +79,9 @@ Slash commands exist only if the **mow binary** blank-imported the pack.
 Same baseline ([baseline.md](baseline.md)), deliberately better in:
 
 - **Process isolation** — UI is not the Engine. Spawn-kill still cancels.
-- **Layout** — Ratatui widgets/constraints instead of hand-rolled lipgloss.
+- **Layout** — Ratatui widgets/constraints instead of hand-rolled lipgloss:
+  constraint layout for the frame, `Scrollbar` on the transcript, `Clear` +
+  centered Block for help / sessions / peer / permission overlays.
 - **Testing** — ratatui `TestBackend` + protocol fixtures (no PTY required
   for logic). Optional cell smoke later.
 - **Theme** — mocha default and flashdiff-style diffs as a palette module,
