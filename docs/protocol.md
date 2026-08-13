@@ -6,7 +6,7 @@ Responses and notifications always include it.
 Spawn:
 
 ```bash
-mow rpc [--session ID] [--continue] [--allow-write] [--allow-shell] …
+mow rpc [--session ID] [--continue] [--model ID] [--allow-write] [--allow-shell] …
 ```
 
 Child stdin = requests. Child stdout = responses + notifications.
@@ -37,6 +37,8 @@ Stderr is Engine logs — do not parse it.
 | `slash.list` | yes | — | `{commands:[{name, summary, exclusive, aliases}]}` |
 | `perm.set` | yes | `{mode:"ask"\|"auto"}` | `{ok, ask_mode}` |
 | `perm.decide` | yes | `{id, decision}` | `{ok}` |
+| `model.list` | yes | — | `{models:[{id,current,wire?}], current}` |
+| `model.set` | yes | `{id}` | `{ok, model}` |
 | `version` | yes | — | `{name, version, rpc, package}` |
 | `ping` | yes | — | `"pong"` |
 

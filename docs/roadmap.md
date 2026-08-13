@@ -1,7 +1,7 @@
 # Roadmap
 
 Ship a **running** UI against `mow rpc` v3, then climb toward Go mowi
-parity. Do not block v0 on diffs or `/model`.
+parity. Do not block v0 on diffs.
 
 ## Phase 0 — crate + spawn ✓
 
@@ -38,7 +38,7 @@ parity. Do not block v0 on diffs or `/model`.
 ## Phase 3 — polish ✓
 
 - Queued prompts while busy
-- Select-mode mouse
+- Native terminal selection (no mouse capture)
 - `/search`, `/copy`, `/retry`, `/edit`
 - Remappable keys / `extensions.tui` if we choose to read mow config
 - PTY cell smoke (optional)
@@ -73,8 +73,7 @@ Ratatui widgets carry the chrome; the transcript stays the product.
 - Theme gained `chrome` / `chip` / `warn` / `accent` roles; `NO_COLOR` keeps
   the glyphs distinct.
 
-Still deliberately out: `/model` catalog (not on the wire), a remappable
-keymap file, PTY cell smoke.
+Still deliberately out: a remappable keymap file, PTY cell smoke.
 
 ## Phase 5 — production chrome & flashdiff bands ✓
 

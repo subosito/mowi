@@ -77,6 +77,21 @@ pub struct TranscriptMessage {
     pub content: String,
 }
 
+/// One model from `model.list`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ModelInfo {
+    pub id: String,
+    pub current: bool,
+    pub wire: String,
+}
+
+/// `model.list` result.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ModelList {
+    pub models: Vec<ModelInfo>,
+    pub current: String,
+}
+
 /// A slash command advertised by `slash.list`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SlashCommand {
@@ -477,6 +492,27 @@ impl Client {
         self.call("status", None, timeout)
     }
 
+    /// List models the host can switch to. Control method: answered while busy.
+    pub fn model_list(&mut self, timeout: Duration) -> Result<ModelList, Error> {
+        let value = self.call("model.list", None, timeout)?;
+        decode_model_list(&value)
+    }
+
+    /// Switch the session model. Control method: answered while busy.
+    pub fn model_set(&mut self, id: &str, timeout: Duration) -> Result<String, Error> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(Error::Protocol("model id must not be empty".into()));
+        }
+        let value = self.call("model.set", Some(json!({ "id": id })), timeout)?;
+        Ok(value
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|model| !model.is_empty())
+            .unwrap_or(id)
+            .to_string())
+    }
+
     /// Start a turn. The result arrives later (the channel stays open while
     /// `event` notifications stream).
     pub fn prompt(&mut self, text: &str) -> Result<Receiver<Result<Value, Error>>, Error> {
@@ -501,6 +537,40 @@ fn string_field(value: &Value, field: &str) -> Result<String, Error> {
         .and_then(Value::as_str)
         .map(ToString::to_string)
         .ok_or_else(|| Error::Protocol(format!("missing string field {field:?}")))
+}
+
+pub fn decode_model_list(value: &Value) -> Result<ModelList, Error> {
+    let rows = value
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::Protocol("model.list result has no models array".into()))?;
+    let models: Vec<ModelInfo> = rows
+        .iter()
+        .map(|row| {
+            Ok::<_, Error>(ModelInfo {
+                id: string_field(row, "id")?,
+                current: row.get("current").and_then(Value::as_bool).unwrap_or(false),
+                wire: row
+                    .get("wire")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            })
+        })
+        .collect::<Result<Vec<ModelInfo>, Error>>()?;
+    let current = value
+        .get("current")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            models
+                .iter()
+                .find(|model| model.current)
+                .map(|model| model.id.clone())
+        })
+        .unwrap_or_default();
+    Ok(ModelList { models, current })
 }
 
 fn decode_sessions(value: &Value) -> Result<Vec<SessionSummary>, Error> {
@@ -661,5 +731,23 @@ mod tests {
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].role, "user");
         assert_eq!(turns[1].content, "hello");
+    }
+
+    #[test]
+    fn parses_model_list_shape() {
+        let list = decode_model_list(&serde_json::json!({
+            "models": [
+                {"id": "gpt-5-mini", "current": true, "wire": "openai-responses"},
+                {"id": "claude-sonnet-4", "current": false}
+            ],
+            "current": "gpt-5-mini"
+        }))
+        .unwrap();
+        assert_eq!(list.current, "gpt-5-mini");
+        assert_eq!(list.models.len(), 2);
+        assert!(list.models[0].current);
+        assert_eq!(list.models[0].wire, "openai-responses");
+        assert_eq!(list.models[1].id, "claude-sonnet-4");
+        assert!(list.models[1].wire.is_empty());
     }
 }

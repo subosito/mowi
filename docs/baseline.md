@@ -20,20 +20,20 @@ operator experience**, not a subset that forgets permissions or resume.
 |---|---|
 | Enter | send (queue if busy) |
 | ctrl+j | newline (input grows 1–6 rows) |
-| ctrl+u / ctrl+d | scroll transcript (wheel too) |
+| ctrl+u / ctrl+d | scroll transcript |
 | Esc | dismiss overlay, else cancel turn, else ignore |
 | ctrl+l | clear transcript (UI-local; Engine history remains) |
 | shift+tab | ask ↔ auto (`perm.set`) |
 | ctrl+p | expand the last peer buffer in an overlay |
-| ctrl+s | select mode — release mouse for native copy |
 | ctrl+/ or `?` on empty | help overlay (local keys + `slash.list`) |
 | ctrl+c | quit (cancel first if busy) |
-| `q` on empty input | quit when idle |
 | Arrow-up on empty | edit last prompt |
 | any key | dismiss the welcome splash |
 
 All bindings remappable later (`extensions.tui.keys` in Go). v1 hard-codes
-defaults.
+defaults. Quit is `/quit` / `/exit` / `/q` or ctrl+c — a lone `q` on empty
+input does not quit. The terminal keeps native select/copy; mowi does not
+capture the mouse.
 
 ## Commands (typed)
 
@@ -47,11 +47,12 @@ Host-side (this crate, or slash if registered):
 | `/search` | UI-local find in painted transcript |
 | `/copy` `/retry` `/edit` | UI-local / re-`prompt` |
 | `/quit` `/exit` `/q` | UI-local quit (cancels an in-flight turn first) |
-| `/model` `/effort` | later; Engine/CLI today |
+| `/model` | UI-local: `model.list` overlay, or `/model gpt-5-mini` → `model.set` |
 | `/review` `/sec` `/goal` … | RPC `slash` — only if `slash.list` has them |
 
-Local commands are routed by name before the RPC fallback, so `/quit` and
-friends can never be sent to the host as an unknown slash command.
+Local commands are routed by name before the RPC fallback, so `/quit`,
+`/model`, and friends can never be sent to the host as an unknown slash
+command.
 
 Exclusive slash: refuse while `status.busy`.
 
@@ -114,7 +115,7 @@ ctrl+u is **scroll**, not kill-to-start-of-line.
 - Default theme name: catppuccin-mocha (chroma-compatible idea)
 - `NO_COLOR=1` — glyphs still distinct (◇ ⚙ ✕ ▲)
 - `MOW_NO_ANIM=1` — still spinner; elapsed still ticks
-- `MOW_MOUSE=0` / select mode — native selection
+- Native terminal selection/copy (no mouse capture; scroll with ctrl+u/d)
 - Not screen-reader complete; keyboard-complete is required
 
 ## Config (Go: `extensions.tui`)

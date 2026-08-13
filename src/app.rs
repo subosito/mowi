@@ -5,18 +5,11 @@
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::io::Write;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 use std::time::Instant;
 
-use crossterm::{
-    event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-        KeyModifiers, MouseEventKind,
-    },
-    execute,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::{
     Frame, Terminal,
     backend::Backend,
@@ -32,8 +25,8 @@ use serde_json::Value;
 
 use crate::render::{Segment, diff_title, markdown_lines, split_markdown_and_diffs};
 use crate::rpc::{
-    Client, Error, Notification, PermissionRequest, SessionInfo, SessionSummary, SlashCommand,
-    TranscriptMessage, token_delta,
+    Client, Error, ModelList, Notification, PermissionRequest, SessionInfo, SessionSummary,
+    SlashCommand, TranscriptMessage, token_delta,
 };
 use crate::theme::Theme;
 
@@ -86,6 +79,7 @@ pub enum Overlay {
     None,
     Help,
     Sessions(Vec<SessionSummary>),
+    Models(ModelList),
     Peer,
 }
 
@@ -119,7 +113,6 @@ pub struct App {
     pub activity_started: Option<Instant>,
     pub peers: HashMap<String, String>,
     pub queue: VecDeque<String>,
-    pub select_mode: bool,
     pub search_term: String,
     pub search_hits: Vec<usize>,
     pub search_cursor: usize,
@@ -159,7 +152,6 @@ impl Default for App {
             activity_started: None,
             peers: HashMap::new(),
             queue: VecDeque::new(),
-            select_mode: false,
             search_term: String::new(),
             search_hits: Vec::new(),
             search_cursor: 0,
@@ -213,6 +205,24 @@ impl App {
         }
     }
 
+    /// Show the model catalog overlay and keep the header chip in sync.
+    pub fn apply_model_list(&mut self, list: ModelList) {
+        if !list.current.is_empty() {
+            self.session.model = list.current.clone();
+        }
+        self.overlay = Overlay::Models(list);
+    }
+
+    /// Apply a `model.set` result to the header chip.
+    pub fn apply_model_set(&mut self, model: &str) {
+        if model.is_empty() {
+            return;
+        }
+        self.session.model = model.to_string();
+        self.status = format!("model: {model}");
+        self.entries.push(Entry::Note(format!("model: {model}")));
+    }
+
     /// Capability chip: what the Engine was allowed to do at spawn.
     pub fn capability_chip(&self) -> String {
         match (self.allow_write, self.allow_shell) {
@@ -248,9 +258,6 @@ impl App {
         if self.usage.total() > 0 || self.usage.peer_tokens > 0 {
             chips.push(self.usage.chip());
         }
-        if self.select_mode {
-            chips.push("select".into());
-        }
         chips
     }
 
@@ -284,7 +291,7 @@ impl App {
         let hints = if let Some(permission) = &self.pending_perm {
             return format!("y allow · n deny · a always · {}", permission.name);
         } else {
-            "enter send · esc cancel · ? help · ctrl+s select"
+            "enter send · esc cancel · ? help · /quit"
         };
         if self.status.is_empty() {
             hints.to_string()
@@ -788,10 +795,6 @@ impl App {
         Some((self.search_cursor + 1, self.search_hits.len()))
     }
 
-    pub fn toggle_select_mode(&mut self) {
-        self.select_mode = !self.select_mode;
-    }
-
     pub fn permission_decision(
         &mut self,
         decision: &str,
@@ -824,10 +827,11 @@ impl App {
             ("ctrl+l", "clear transcript (engine history kept)"),
             ("shift+tab", "ask ↔ auto"),
             ("ctrl+p", "expand peer output"),
-            ("ctrl+s", "select mode (native copy)"),
             ("ctrl+/ or ?", "this help"),
             ("esc", "dismiss overlay, else cancel turn"),
-            ("ctrl+c", "quit"),
+            ("ctrl+c", "quit (cancel first if busy)"),
+            ("/model", "list models, or /model <id> to set"),
+            ("/quit", "quit"),
         ]
         .iter()
         .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
@@ -1064,6 +1068,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     match &app.overlay {
         Overlay::Help => draw_help(frame, app, area),
         Overlay::Sessions(sessions) => draw_sessions(frame, app, sessions, area),
+        Overlay::Models(list) => draw_models(frame, app, list, area),
         Overlay::Peer => draw_peer(frame, app, area),
         Overlay::None => {}
     }
@@ -1270,6 +1275,48 @@ fn draw_sessions(frame: &mut Frame<'_>, app: &App, sessions: &[SessionSummary], 
     );
 }
 
+fn draw_models(frame: &mut Frame<'_>, app: &App, list: &ModelList, area: Rect) {
+    let spot = centered(
+        area,
+        Constraint::Length(area.width.saturating_sub(4).min(64)),
+        Constraint::Length(area.height.saturating_sub(2)),
+    );
+    frame.render_widget(Clear, spot);
+    let mut items: Vec<ListItem<'static>> = Vec::new();
+    let current = if list.current.is_empty() {
+        "current: (none)".to_string()
+    } else {
+        format!("current: {}", list.current)
+    };
+    items.push(ListItem::new(Line::styled(current, app.theme.accent())));
+    if list.models.is_empty() {
+        items.push(ListItem::new(Line::styled("no models", app.theme.note())));
+    }
+    for model in &list.models {
+        let mark = if model.current || model.id == list.current {
+            "●"
+        } else {
+            "·"
+        };
+        let mut label = format!("{mark} {}", model.id);
+        if !model.wire.is_empty() {
+            label.push_str(&format!("  {}", model.wire));
+        }
+        items.push(ListItem::new(Line::from(vec![Span::styled(
+            label,
+            app.theme.chip(),
+        )])));
+    }
+    items.push(ListItem::new(Line::styled(
+        "set with: /model gpt-5-mini",
+        app.theme.note(),
+    )));
+    frame.render_widget(
+        List::new(items).block(overlay_block(app, "models · /model <id> · esc to close")),
+        spot,
+    );
+}
+
 fn draw_peer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let spot = centered(
         area,
@@ -1341,7 +1388,7 @@ fn permission_preview(permission: &PermissionRequest) -> String {
 }
 
 /// Terminal loop: keys in, RPC messages out, one repaint per tick.
-pub fn run<B: Backend + Write>(
+pub fn run<B: Backend>(
     terminal: &mut Terminal<B>,
     client: &mut Client,
     app: &mut App,
@@ -1417,23 +1464,8 @@ pub fn run<B: Backend + Write>(
         if event::poll(Duration::from_millis(50)).map_err(Error::Io)? {
             match event::read().map_err(Error::Io)? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    let select_before = app.select_mode;
                     handle_key(key, client, app, &mut turn, &mut slash_rx)?;
-                    if select_before != app.select_mode {
-                        if app.select_mode {
-                            execute!(terminal.backend_mut(), DisableMouseCapture)
-                                .map_err(Error::Io)?;
-                        } else {
-                            execute!(terminal.backend_mut(), EnableMouseCapture)
-                                .map_err(Error::Io)?;
-                        }
-                    }
                 }
-                Event::Mouse(mouse) if !app.select_mode => match mouse.kind {
-                    MouseEventKind::ScrollUp => leave_follow(app, 3),
-                    MouseEventKind::ScrollDown => scroll_down(app, 3),
-                    _ => {}
-                },
                 _ => {}
             }
         }
@@ -1482,9 +1514,6 @@ fn handle_key(
     }
 
     match key.code {
-        KeyCode::Char('s') if ctrl => {
-            app.toggle_select_mode();
-        }
         KeyCode::Char('c') if ctrl => {
             if app.busy || turn.is_some() {
                 let _ = client.cancel();
@@ -1510,7 +1539,6 @@ fn handle_key(
         // ctrl+/ arrives as Char('/') with CONTROL on most terminals.
         KeyCode::Char('/') if ctrl => app.overlay = Overlay::Help,
         KeyCode::Char('?') if app.input.is_empty() => app.overlay = Overlay::Help,
-        KeyCode::Char('q') if app.input.is_empty() && !app.busy => app.quit = true,
         KeyCode::Esc => {
             if app.dismiss_overlay() {
             } else if app.busy || turn.is_some() {
@@ -1588,9 +1616,8 @@ pub enum SlashRoute {
 pub fn slash_route(name: &str) -> SlashRoute {
     match name {
         "quit" | "exit" | "q" => SlashRoute::Quit,
-        "search" | "copy" | "edit" | "retry" | "help" | "sessions" | "status" | "steer" => {
-            SlashRoute::Local
-        }
+        "search" | "copy" | "edit" | "retry" | "help" | "sessions" | "status" | "steer"
+        | "model" => SlashRoute::Local,
         _ => SlashRoute::Rpc,
     }
 }
@@ -1646,6 +1673,15 @@ fn handle_slash(
             let sessions = client.sessions(Duration::from_secs(20))?;
             app.overlay = Overlay::Sessions(sessions);
         }
+        "model" => {
+            if args.is_empty() {
+                let list = client.model_list(Duration::from_secs(20))?;
+                app.apply_model_list(list);
+            } else {
+                let model = client.model_set(&args.join(" "), Duration::from_secs(20))?;
+                app.apply_model_set(&model);
+            }
+        }
         "status" => {
             let status = client.status(Duration::from_secs(20))?;
             app.apply_status(&status);
@@ -1684,6 +1720,7 @@ fn start_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rpc::ModelInfo;
     use ratatui::{Terminal, backend::TestBackend, style::Color};
 
     fn render(app: &mut App, w: u16, h: u16) -> String {
@@ -1843,10 +1880,13 @@ mod tests {
             aliases: vec![],
         });
         app.overlay = Overlay::Help;
-        let out = render(&mut app, 70, 20);
+        let out = render(&mut app, 70, 24);
         assert!(out.contains("help"), "{out}");
         assert!(out.contains("ctrl+j"), "{out}");
         assert!(out.contains("/review"), "{out}");
+        assert!(out.contains("/model"), "{out}");
+        assert!(out.contains("/quit"), "{out}");
+        assert!(!out.contains("ctrl+s"), "{out}");
 
         assert!(app.dismiss_overlay());
         assert_eq!(app.overlay, Overlay::None);
@@ -1866,6 +1906,51 @@ mod tests {
         assert!(out.contains("s-42"), "{out}");
         assert!(out.contains("port the header"), "{out}");
         assert!(out.contains("mowi --session <id>"), "{out}");
+    }
+
+    #[test]
+    fn models_overlay_lists_ids_and_current() {
+        let mut app = App::new(SessionInfo {
+            model: "claude-sonnet-4".into(),
+            ..Default::default()
+        });
+        app.apply_model_list(ModelList {
+            current: "gpt-5-mini".into(),
+            models: vec![
+                ModelInfo {
+                    id: "gpt-5-mini".into(),
+                    current: true,
+                    wire: "openai-responses".into(),
+                },
+                ModelInfo {
+                    id: "claude-sonnet-4".into(),
+                    current: false,
+                    wire: String::new(),
+                },
+            ],
+        });
+        assert_eq!(app.session.model, "gpt-5-mini");
+        let out = render(&mut app, 72, 16);
+        assert!(out.contains("gpt-5-mini"), "{out}");
+        assert!(out.contains("current"), "{out}");
+        assert!(out.contains("claude-sonnet-4"), "{out}");
+        assert!(out.contains("/model"), "{out}");
+    }
+
+    #[test]
+    fn model_set_updates_session_model() {
+        let mut app = App::new(SessionInfo {
+            model: "claude-sonnet-4".into(),
+            ..Default::default()
+        });
+        app.apply_model_set("gpt-5-mini");
+        assert_eq!(app.session.model, "gpt-5-mini");
+        assert!(app.status.contains("gpt-5-mini"), "{}", app.status);
+        assert!(
+            app.entries
+                .iter()
+                .any(|entry| matches!(entry, Entry::Note(note) if note.contains("gpt-5-mini")))
+        );
     }
 
     #[test]
@@ -1964,7 +2049,7 @@ mod tests {
         }
         // Everything the UI answers itself stays off the wire too.
         for name in [
-            "help", "search", "copy", "retry", "edit", "steer", "sessions", "status",
+            "help", "search", "copy", "retry", "edit", "steer", "sessions", "status", "model",
         ] {
             assert_eq!(slash_route(name), SlashRoute::Local, "/{name}");
         }
@@ -2262,12 +2347,12 @@ mod tests {
     }
 
     #[test]
-    fn select_mode_and_copy_state_are_local() {
+    fn copy_state_is_local() {
         let mut app = App::new(SessionInfo::default());
         app.entries.push(Entry::Assistant("answer".into()));
-        app.toggle_select_mode();
-        assert!(app.select_mode);
         assert!(app.copy_last_assistant());
         assert_eq!(app.last_copy, "answer");
+        assert!(!app.footer().contains("ctrl+s"), "{}", app.footer());
+        assert!(app.footer().contains("/quit"), "{}", app.footer());
     }
 }
