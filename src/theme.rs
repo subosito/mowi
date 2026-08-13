@@ -13,10 +13,64 @@ impl Theme {
         }
     }
 
+    fn rgb(self, r: u8, g: u8, b: u8) -> Option<Color> {
+        self.colored.then_some(Color::Rgb(r, g, b))
+    }
+
+    /// Document ground (`#1e1e2e`). Empty cells pick this up so the frame is
+    /// not terminal-black.
+    pub fn base(self) -> Style {
+        match self.rgb(0x1e, 0x1e, 0x2e) {
+            Some(bg) => Style::default().bg(bg).fg(Color::Rgb(0xcd, 0xd6, 0xf4)),
+            None => Style::default(),
+        }
+    }
+
+    /// Header / sunk chrome (`#181825`).
+    pub fn mantle(self) -> Style {
+        match self.rgb(0x18, 0x18, 0x25) {
+            Some(bg) => Style::default().bg(bg),
+            None => Style::default(),
+        }
+    }
+
+    /// Raised chrome: user bands, input (`#313244`).
+    pub fn surface(self) -> Style {
+        match self.rgb(0x31, 0x32, 0x44) {
+            Some(bg) => Style::default().bg(bg),
+            None => Style::default(),
+        }
+    }
+
+    /// Overlay fill (`#45475a`).
+    pub fn overlay(self) -> Style {
+        match self.rgb(0x45, 0x47, 0x5a) {
+            Some(bg) => Style::default().bg(bg),
+            None => Style::default(),
+        }
+    }
+
+    pub fn header_bg(self) -> Style {
+        self.mantle()
+    }
+
+    pub fn user_bg(self) -> Style {
+        self.surface()
+    }
+
+    pub fn text(self) -> Style {
+        if self.colored {
+            Style::default().fg(Color::Rgb(0xcd, 0xd6, 0xf4))
+        } else {
+            Style::default()
+        }
+    }
+
     pub fn header(self) -> Style {
         if self.colored {
             Style::default()
                 .fg(Color::Rgb(203, 166, 247))
+                .bg(Color::Rgb(0x18, 0x18, 0x25))
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
@@ -25,18 +79,16 @@ impl Theme {
 
     pub fn user(self) -> Style {
         if self.colored {
-            Style::default().fg(Color::Rgb(137, 180, 250))
+            Style::default()
+                .fg(Color::Rgb(137, 180, 250))
+                .patch(self.user_bg())
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         }
     }
 
     pub fn assistant(self) -> Style {
-        if self.colored {
-            Style::default().fg(Color::Rgb(205, 214, 244))
-        } else {
-            Style::default()
-        }
+        self.text()
     }
 
     pub fn note(self) -> Style {

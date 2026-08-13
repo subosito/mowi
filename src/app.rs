@@ -29,7 +29,7 @@ use ratatui::{
 };
 use serde_json::Value;
 
-use crate::render::{diff_file, is_unified_diff, markdown_lines};
+use crate::render::{Segment, diff_file, markdown_lines, split_markdown_and_diffs};
 use crate::rpc::{
     Client, Error, Notification, PermissionRequest, SessionInfo, SessionSummary, SlashCommand,
     TranscriptMessage, token_delta,
@@ -271,8 +271,8 @@ impl App {
                     .max(1);
                 return Line::from(vec![
                     Span::styled(left, self.theme.header()),
-                    Span::raw(" ".repeat(pad)),
-                    Span::styled(safety, self.theme.chip()),
+                    Span::styled(" ".repeat(pad), self.theme.header_bg()),
+                    Span::styled(safety, self.theme.chip().patch(self.theme.header_bg())),
                 ]);
             }
             vanity.remove(0);
@@ -301,24 +301,15 @@ impl App {
             out.push(Line::raw(""));
         }
         if !self.live.is_empty() {
-            out.extend(markdown_lines(self.live.as_str(), self.theme));
+            out.extend(self.assistant_lines(self.live.as_str()));
         }
         out
     }
 
     fn entry_lines<'a>(&self, entry: &'a Entry) -> Vec<Line<'a>> {
         match entry {
-            Entry::User(t) => vec![Line::from(vec![
-                Span::styled("> ", self.theme.user()),
-                Span::styled(t.as_str(), self.theme.user()),
-            ])],
-            Entry::Assistant(t) => {
-                if is_unified_diff(t) {
-                    self.diff_card(t)
-                } else {
-                    markdown_lines(t, self.theme)
-                }
-            }
+            Entry::User(t) => self.user_lines(t),
+            Entry::Assistant(t) => self.assistant_lines(t),
             Entry::Note(t) => vec![Line::styled(t.as_str(), self.theme.note())],
             Entry::Tool { name, duration_ms } => {
                 let suffix = duration_ms
@@ -327,6 +318,59 @@ impl App {
                 vec![Line::styled(format!("⚙ {name}{suffix}"), self.theme.note())]
             }
         }
+    }
+
+    /// User prompt as a full-width filled band, not a lone unpadded span.
+    fn user_lines(&self, text: &str) -> Vec<Line<'static>> {
+        let width = self.last_view_w.max(8) as usize;
+        let glyph = self.prompt_glyph();
+        let indent = " ".repeat(glyph.chars().count());
+        let mut out = Vec::new();
+        for (index, raw) in text.split('\n').enumerate() {
+            let prefix = if index == 0 { glyph } else { indent.as_str() };
+            let inner = width.saturating_sub(prefix.chars().count()).max(1);
+            for (wrap_i, chunk) in wrap_cols(raw, inner).into_iter().enumerate() {
+                let lead = if wrap_i == 0 { prefix } else { indent.as_str() };
+                let mut spans = vec![
+                    Span::styled(lead.to_string(), self.theme.user()),
+                    Span::styled(chunk.clone(), self.theme.user()),
+                ];
+                let painted = lead.chars().count() + chunk.chars().count();
+                let pad = width.saturating_sub(painted);
+                if pad > 0 {
+                    spans.push(Span::styled(" ".repeat(pad), self.theme.user()));
+                }
+                out.push(Line::from(spans));
+            }
+        }
+        if out.is_empty() {
+            out.push(Line::from(Span::styled(
+                format!(
+                    "{glyph}{}",
+                    " ".repeat(width.saturating_sub(glyph.chars().count()))
+                ),
+                self.theme.user(),
+            )));
+        }
+        out
+    }
+
+    /// Markdown by default; only fenced or bare unified-diff bodies become cards.
+    fn assistant_lines(&self, text: &str) -> Vec<Line<'static>> {
+        let mut out = Vec::new();
+        for segment in split_markdown_and_diffs(text) {
+            if !out.is_empty() {
+                out.push(Line::raw(""));
+            }
+            match segment {
+                Segment::Md(md) => out.extend(markdown_lines(&md, self.theme)),
+                Segment::Diff(diff) => out.extend(self.diff_card(&diff)),
+            }
+        }
+        if out.is_empty() {
+            out.push(Line::raw(""));
+        }
+        out
     }
 
     /// A diff entry as a review card: a titled rule, the washed hunk, a close
@@ -376,7 +420,7 @@ impl App {
             cursor = entry_end;
         }
         if !self.live.is_empty() && cursor >= target {
-            lines.extend(markdown_lines(self.live.as_str(), self.theme));
+            lines.extend(self.assistant_lines(self.live.as_str()));
         }
         lines.extend(self.peer_lines());
         (lines, base.min(u16::MAX as usize) as u16)
@@ -857,8 +901,26 @@ fn overlay_block(app: &App, title: &str) -> Block<'static> {
     Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(app.theme.chrome())
+        .style(app.theme.overlay())
         .padding(Padding::horizontal(1))
         .title(Span::styled(format!(" {title} "), app.theme.accent()))
+}
+
+/// Hard-wrap `text` to `width` columns (character cells, ASCII-sized).
+fn wrap_cols(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
+    }
+    let mut rows = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if current.chars().count() >= width {
+            rows.push(std::mem::take(&mut current));
+        }
+        current.push(ch);
+    }
+    rows.push(current);
+    rows
 }
 
 const MIN_WIDTH: u16 = 40;
@@ -871,36 +933,39 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         return;
     }
 
-    // header · hairline · [activity] · transcript · input · footer
-    let mut rows = vec![Constraint::Length(1), Constraint::Length(1)];
+    frame.render_widget(Block::new().style(app.theme.base()), area);
+
+    // header (with bottom hairline) · [activity] · transcript · input · footer
+    let mut rows = vec![Constraint::Length(2)];
     if app.busy {
         rows.push(Constraint::Length(1));
     }
     rows.push(Constraint::Fill(1));
-    rows.push(Constraint::Length(input_height(app) + 1));
+    rows.push(Constraint::Length(input_height(app) + 2));
     rows.push(Constraint::Length(1));
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints(rows)
         .split(area);
-    let rest = &areas[2..];
+    let rest = &areas[1..];
     let (activity, transcript_area, input_area, footer_area) = if app.busy {
         (Some(rest[0]), rest[1], rest[2], rest[3])
     } else {
         (None, rest[0], rest[1], rest[2])
     };
 
-    // Header bar: chips on one row, closed by a hairline rule.
+    // Full-width mantle bar; the bottom border is the hairline under the chips.
     frame.render_widget(
         Paragraph::new(app.header_line(area.width.saturating_sub(2)))
-            .block(Block::new().padding(Padding::horizontal(1))),
+            .style(app.theme.header())
+            .block(
+                Block::new()
+                    .style(app.theme.header_bg())
+                    .borders(Borders::BOTTOM)
+                    .border_style(app.theme.chrome())
+                    .padding(Padding::horizontal(1)),
+            ),
         areas[0],
-    );
-    frame.render_widget(
-        Block::new()
-            .borders(Borders::TOP)
-            .border_style(app.theme.chrome()),
-        areas[1],
     );
 
     // The activity band exists only while a turn runs.
@@ -914,14 +979,17 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 
     draw_transcript(frame, app, transcript_area);
 
-    let input_block = Block::new()
-        .borders(Borders::TOP)
+    let input_block = Block::bordered()
+        .border_type(BorderType::Rounded)
         .border_style(app.theme.chrome())
+        .style(app.theme.surface())
         .padding(Padding::horizontal(1));
     let input_inner = input_block.inner(input_area);
     frame.render_widget(input_block, input_area);
     frame.render_widget(
-        Paragraph::new(prompt_text(app)).wrap(Wrap { trim: false }),
+        Paragraph::new(prompt_text(app))
+            .style(app.theme.surface())
+            .wrap(Wrap { trim: false }),
         input_inner,
     );
 
@@ -973,7 +1041,9 @@ fn prompt_text(app: &App) -> Vec<Line<'static>> {
 fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     // Right padding of 2 leaves the last column free for the scrollbar, so a
     // full-width diff band never runs under the thumb.
-    let block = Block::new().padding(Padding::new(1, 2, 0, 0));
+    let block = Block::new()
+        .style(app.theme.base())
+        .padding(Padding::new(1, 2, 0, 0));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     app.last_view_h = inner.height.max(1);
@@ -1166,6 +1236,7 @@ fn draw_permission(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(app.theme.warn())
+        .style(app.theme.surface())
         .padding(Padding::horizontal(1))
         .title(Span::styled(
             format!(" {} ", permission.name),
@@ -1540,7 +1611,7 @@ fn start_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::{Terminal, backend::TestBackend};
+    use ratatui::{Terminal, backend::TestBackend, style::Color};
 
     fn render(app: &mut App, w: u16, h: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
@@ -1564,6 +1635,7 @@ mod tests {
             model: "gpt-5-mini".into(),
             wire: "openai-responses".into(),
         });
+        app.theme = Theme { colored: true };
         app.entries.push(Entry::User("hi".into()));
         app.live.push_str("hello");
 
@@ -1571,12 +1643,52 @@ mod tests {
         assert!(out.contains("mowi"), "{out}");
         assert!(out.contains("gpt-5-mini"), "{out}");
         assert!(out.contains("abcdef01"), "{out}");
-        assert!(out.contains("> hi"), "{out}");
+        assert!(out.contains("❯ hi"), "{out}");
         assert!(out.contains("hello"), "{out}");
         assert!(out.contains("enter send"), "{out}");
         // Safety chips are always painted.
         assert!(out.contains("read-only"), "{out}");
         assert!(out.contains("ask"), "{out}");
+    }
+
+    #[test]
+    fn header_row_fills_header_bg() {
+        let mut app = App::new(SessionInfo {
+            session_id: "abcdef0123456789".into(),
+            workspace: "/w".into(),
+            model: "gpt-5-mini".into(),
+            wire: "openai-responses".into(),
+        });
+        app.theme = Theme { colored: true };
+        let mut terminal = Terminal::new(TestBackend::new(80, 14)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let mantle = Color::Rgb(0x18, 0x18, 0x25);
+        assert_eq!(buf[(0, 0)].bg, mantle, "left edge of header");
+        assert_eq!(buf[(79, 0)].bg, mantle, "right edge of header");
+    }
+
+    #[test]
+    fn user_entry_is_a_filled_band() {
+        let mut app = App::new(SessionInfo::default());
+        app.theme = Theme { colored: true };
+        app.entries.push(Entry::User("hi".into()));
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let user_bg = Color::Rgb(0x31, 0x32, 0x44);
+        let mut found = false;
+        for y in 0..16 {
+            let row: String = (0..60).map(|x| buf[(x, y)].symbol().to_string()).collect();
+            if let Some(x) = row.find("hi") {
+                found = true;
+                assert_eq!(buf[(x as u16, y)].bg, user_bg, "text cell {x},{y}");
+                // The band continues past the letters, not a lone unpadded span.
+                assert_eq!(buf[(x as u16 + 4, y)].bg, user_bg, "pad cell after text");
+                break;
+            }
+        }
+        assert!(found, "user text not painted");
     }
 
     #[test]
@@ -1691,6 +1803,7 @@ mod tests {
     #[test]
     fn ctrl_j_grows_the_input_area() {
         let mut app = App::new(SessionInfo::default());
+        app.theme = Theme { colored: true };
         assert_eq!(input_height(&app), 1);
         app.input.push_str("one");
         app.input.push('\n');
@@ -1769,6 +1882,28 @@ mod tests {
         for name in ["review", "sec", "goal"] {
             assert_eq!(slash_route(name), SlashRoute::Rpc, "/{name}");
         }
+    }
+
+    #[test]
+    fn fenced_diff_in_prose_is_not_one_card() {
+        let mut app = App::new(SessionInfo::default());
+        app.theme = Theme { colored: true };
+        app.entries.push(Entry::Assistant(
+            "Edited `cfg.go`:\n\n```diff\n--- a/cfg.go\n+++ b/cfg.go\n@@ -1 +1 @@\n-old\n+new\n```\n\nThe client now waits a minute.".into(),
+        ));
+        let out = render(&mut app, 80, 24);
+        assert!(out.contains("Edited"), "{out}");
+        assert!(out.contains("─ cfg.go"), "{out}");
+        assert!(out.contains("waits a minute"), "{out}");
+        // Fence markers are consumed by the splitter, not painted as chrome.
+        assert!(!out.contains("```diff"), "{out}");
+        let prose = out.find("Edited").expect("prose");
+        let card = out.find("─ cfg.go").expect("card");
+        let after = out.find("waits a minute").expect("trailing prose");
+        assert!(prose < card, "prose should precede the card\n{out}");
+        assert!(card < after, "trailing prose should follow the card\n{out}");
+        // The whole message is not a generic wrapping card.
+        assert!(!out.contains("─ diff "), "{out}");
     }
 
     #[test]
@@ -1876,7 +2011,7 @@ mod tests {
                 .iter()
                 .any(|line| line.spans.len() > 1)
         );
-        assert!(is_unified_diff("@@ -1 +1 @@\n+foo\n-bar"));
+        assert!(crate::render::is_unified_diff("@@ -1 +1 @@\n+foo\n-bar"));
         app.theme = Theme { colored: false };
         let _ = app.transcript_lines();
     }
