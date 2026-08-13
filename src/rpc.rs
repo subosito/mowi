@@ -231,8 +231,8 @@ pub fn token_delta(params: &Value) -> Option<&str> {
     if kind.contains("delegate") {
         return None;
     }
-    // Only host answer tokens. Reasoning / tool deltas must not weld into the live answer.
-    if !kind.contains("token") {
+    // Host answer stream only. Reasoning / tool deltas must not weld into live text.
+    if kind != "loop.token" {
         return None;
     }
     params
