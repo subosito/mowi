@@ -227,6 +227,9 @@ pub enum Overlay {
         state: ListState,
     },
     Peer,
+    PeerPicker {
+        state: ListState,
+    },
 }
 
 impl Overlay {
@@ -276,6 +279,16 @@ impl Overlay {
             state: select_list(items.len(), 0),
             items,
         }
+    }
+
+    pub(crate) fn peer_picker(len: usize, selected: usize) -> Self {
+        Overlay::PeerPicker {
+            state: select_list(len, selected),
+        }
+    }
+
+    fn is_peer_ui(&self) -> bool {
+        matches!(self, Overlay::Peer | Overlay::PeerPicker { .. })
     }
 }
 
@@ -421,6 +434,11 @@ pub struct App {
     pub theme: Theme,
     pub activity_started: Option<Instant>,
     pub peers: HashMap<String, String>,
+    /// Most recently active peer first. Picker and collapsed rows follow this,
+    /// not alphabetical order.
+    pub peer_order: Vec<String>,
+    /// Latest `harness.delegate.progress` phase per agent, when the engine sent one.
+    pub peer_state: HashMap<String, String>,
     pub queue: VecDeque<String>,
     pub search_term: String,
     pub search_hits: Vec<usize>,
@@ -498,6 +516,8 @@ impl Default for App {
             theme: Theme::detect(),
             activity_started: None,
             peers: HashMap::new(),
+            peer_order: Vec::new(),
+            peer_state: HashMap::new(),
             queue: VecDeque::new(),
             search_term: String::new(),
             search_hits: Vec::new(),
@@ -1769,13 +1789,12 @@ impl App {
     /// moves, carriage returns and tabs. Painting those raw is what garbles
     /// the frame, so every preview goes through `sanitize_preview` first.
     fn peer_lines(&self) -> Vec<Line<'static>> {
-        let mut agents: Vec<&String> = self.peers.keys().collect();
-        agents.sort();
         let frame = self.spinner_frame();
-        agents
+        self.peer_agents()
             .into_iter()
             .map(|agent| {
-                let preview = last_visible_line(&self.peers[agent]);
+                let preview =
+                    last_visible_line(self.peers.get(&agent).map(String::as_str).unwrap_or(""));
                 let preview = if preview.is_empty() {
                     "working".to_string()
                 } else {
@@ -1784,13 +1803,127 @@ impl App {
                 Line::from(vec![
                     Span::styled(format!("{frame} "), self.theme.spinner()),
                     Span::styled("⇄ ", self.theme.peer()),
-                    Span::styled(agent.clone(), self.theme.peer()),
+                    Span::styled(agent, self.theme.peer()),
                     Span::styled(" · ", self.theme.chrome()),
                     Span::styled(preview, self.theme.note()),
                     Span::styled("  (ctrl+p)", self.theme.timing()),
                 ])
             })
             .collect()
+    }
+
+    /// Live peers, most recently active first. Keys missing from `peer_order`
+    /// (tests that insert directly) trail in a stable leftover order.
+    fn peer_agents(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .peer_order
+            .iter()
+            .filter(|agent| self.peers.contains_key(*agent))
+            .cloned()
+            .collect();
+        let mut extra: Vec<String> = self
+            .peers
+            .keys()
+            .filter(|agent| !out.iter().any(|known| known == *agent))
+            .cloned()
+            .collect();
+        extra.sort();
+        out.extend(extra);
+        out
+    }
+
+    fn touch_peer(&mut self, agent: &str) {
+        self.peer_order.retain(|existing| existing != agent);
+        self.peer_order.insert(0, agent.to_string());
+    }
+
+    fn open_peer_viewer(&mut self, agent: &str) {
+        self.peer_focus = Some(agent.to_string());
+        self.peer_scroll = 0;
+        self.overlay = Overlay::Peer;
+    }
+
+    fn open_peer_picker(&mut self, focus: Option<&str>) {
+        let agents = self.peer_agents();
+        let idx = focus
+            .and_then(|name| agents.iter().position(|agent| agent == name))
+            .unwrap_or(0);
+        self.peer_focus = None;
+        self.peer_scroll = 0;
+        self.overlay = Overlay::peer_picker(agents.len(), idx);
+    }
+
+    fn close_peer_ui(&mut self) {
+        self.peer_focus = None;
+        self.peer_scroll = 0;
+        if self.overlay.is_peer_ui() {
+            self.overlay = Overlay::None;
+        }
+    }
+
+    fn cycle_peer(&mut self, delta: i32) {
+        if !matches!(self.overlay, Overlay::Peer) {
+            return;
+        }
+        let agents = self.peer_agents();
+        if agents.len() < 2 {
+            return;
+        }
+        let current = self.peer_focus.as_deref().unwrap_or("");
+        let idx = agents
+            .iter()
+            .position(|agent| agent == current)
+            .unwrap_or(0);
+        let next = (idx as i32 + delta).rem_euclid(agents.len() as i32) as usize;
+        self.open_peer_viewer(&agents[next]);
+    }
+
+    fn confirm_peer_picker(&mut self) -> bool {
+        if !matches!(self.overlay, Overlay::PeerPicker { .. }) {
+            return false;
+        }
+        let Some(agent) = self.overlay_selection() else {
+            return false;
+        };
+        self.open_peer_viewer(&agent);
+        true
+    }
+
+    fn peer_picker_label(&self, agent: &str) -> String {
+        let name = sanitize_preview(agent);
+        let preview = last_visible_line(self.peers.get(agent).map(String::as_str).unwrap_or(""));
+        let preview = if preview.is_empty() {
+            "working".to_string()
+        } else {
+            preview
+        };
+        match self
+            .peer_state
+            .get(agent)
+            .map(String::as_str)
+            .filter(|s| !s.is_empty())
+        {
+            Some(state) => format!("{name} · {state} · {preview}"),
+            None => format!("{name} · {preview}"),
+        }
+    }
+
+    fn peer_picker_line(&self, agent: &str) -> Line<'static> {
+        let name = sanitize_preview(agent);
+        let preview = last_visible_line(self.peers.get(agent).map(String::as_str).unwrap_or(""));
+        let preview = if preview.is_empty() {
+            "working".to_string()
+        } else {
+            preview
+        };
+        let mut spans = vec![Span::styled(name, self.theme.peer())];
+        if let Some(state) = self.peer_state.get(agent).filter(|s| !s.is_empty()) {
+            spans.push(Span::styled(" · ", self.theme.chrome()));
+            spans.push(Span::styled(state.clone(), self.theme.timing()));
+        }
+        spans.push(Span::styled(" · ", self.theme.chrome()));
+        spans.push(Span::styled(preview, self.theme.note()));
+        Line::from(spans)
     }
 
     /// Current spinner glyph, frozen to a stable frame when animation is off.
@@ -1807,22 +1940,28 @@ impl App {
         }
     }
 
-    /// Toggle the expanded peer buffer (`ctrl+p`).
+    /// Toggle the peer picker / viewer (`ctrl+p`).
+    ///
+    /// One peer opens the viewer; several open a picker focused on the most
+    /// recently active agent. Pressed again from either surface, it closes.
     pub fn toggle_peer_expand(&mut self) -> bool {
-        if self.peer_focus.take().is_some() {
+        if self.overlay.is_peer_ui() {
+            self.close_peer_ui();
             return true;
         }
-        let mut agents: Vec<&String> = self.peers.keys().collect();
-        agents.sort();
-        match agents.last() {
-            Some(agent) => {
-                self.peer_focus = Some((*agent).clone());
-                self.peer_scroll = 0;
-                true
-            }
-            None => {
+        let agents = self.peer_agents();
+        match agents.as_slice() {
+            [] => {
                 self.status = "no peer output".into();
                 false
+            }
+            [agent] => {
+                self.open_peer_viewer(agent);
+                true
+            }
+            _ => {
+                self.open_peer_picker(None);
+                true
             }
         }
     }
@@ -1932,6 +2071,7 @@ impl App {
                 .entry(agent.clone())
                 .or_default()
                 .push_str(params.get("delta").and_then(Value::as_str).unwrap_or(""));
+            self.touch_peer(&agent);
             self.status = format!("⇄ {} · receiving", sanitize_preview(&agent));
         } else if kind.contains("delegate") && kind.contains("progress") {
             let agent = params
@@ -1942,6 +2082,10 @@ impl App {
                 .get("phase")
                 .and_then(Value::as_str)
                 .unwrap_or("working");
+            self.peers.entry(agent.to_string()).or_default();
+            self.peer_state
+                .insert(agent.to_string(), sanitize_preview(phase));
+            self.touch_peer(agent);
             self.status = format!(
                 "⇄ {} · {}",
                 sanitize_preview(agent),
@@ -2062,13 +2206,23 @@ impl App {
     }
 
     fn finish_peers(&mut self) {
-        self.peer_focus = None;
-        for (agent, _) in self.peers.drain() {
-            self.entries.push(Entry::Note(format!(
-                "⇄ {} · done",
-                sanitize_preview(&agent)
-            )));
+        if self.overlay.is_peer_ui() {
+            self.overlay = Overlay::None;
         }
+        self.peer_focus = None;
+        self.peer_scroll = 0;
+        let agents = self.peer_agents();
+        self.peer_order.clear();
+        self.peer_state.clear();
+        for agent in agents {
+            if self.peers.remove(&agent).is_some() {
+                self.entries.push(Entry::Note(format!(
+                    "⇄ {} · done",
+                    sanitize_preview(&agent)
+                )));
+            }
+        }
+        self.peers.clear();
     }
 
     /// Finish the turn: commit live text (or the final `prompt` result).
@@ -2368,7 +2522,7 @@ impl App {
             ("pgup / pgdn", "scroll transcript"),
             ("ctrl+l", "clear transcript (engine history kept)"),
             ("shift+tab", "ask ↔ auto"),
-            ("ctrl+p", "expand peer output"),
+            ("ctrl+p", "peer picker / viewer"),
             ("home / end", "cursor to start / end"),
             ("delete", "delete forward"),
             ("ctrl+/ or ?", "this help"),
@@ -2399,12 +2553,14 @@ impl App {
 
     fn overlay_move(&mut self, delta: i32) {
         let help_len = self.help_rows().len();
+        let peer_len = self.peer_agents().len();
         match &mut self.overlay {
             Overlay::Help(state) => step_table(state, help_len, delta),
             Overlay::Sessions { items, state } => step_list(state, items.len(), delta),
             Overlay::Models { list, state } => step_list(state, list.models.len(), delta),
             Overlay::Efforts { list, state } => step_list(state, list.efforts.len(), delta),
             Overlay::Completions { items, state } => step_list(state, items.len(), delta),
+            Overlay::PeerPicker { state } => step_list(state, peer_len, delta),
             Overlay::Peer => {
                 if delta < 0 {
                     self.peer_scroll = self.peer_scroll.saturating_add(delta.unsigned_abs() as u16);
@@ -2429,6 +2585,7 @@ impl App {
                 list.efforts.get(state.selected()?).map(|e| e.id.clone())
             }
             Overlay::Completions { items, state } => items.get(state.selected()?).cloned(),
+            Overlay::PeerPicker { state } => self.peer_agents().get(state.selected()?).cloned(),
             _ => None,
         }
     }
@@ -2473,13 +2630,26 @@ impl App {
     }
 
     /// Close whichever overlay is open. Returns true if something closed.
+    ///
+    /// The peer viewer is special: with several peers, Esc returns to the
+    /// picker focused on the agent that was open. One peer, or the picker
+    /// itself, just closes.
     pub fn dismiss_overlay(&mut self) -> bool {
         if self.welcome {
             self.welcome = false;
             return true;
         }
+        if matches!(self.overlay, Overlay::Peer) && self.peer_agents().len() > 1 {
+            let focus = self.peer_focus.clone();
+            self.open_peer_picker(focus.as_deref());
+            return true;
+        }
         if self.overlay.is_open() {
-            self.overlay = Overlay::None;
+            if self.overlay.is_peer_ui() {
+                self.close_peer_ui();
+            } else {
+                self.overlay = Overlay::None;
+            }
             return true;
         }
         false
@@ -3458,6 +3628,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         Overlay::Efforts { list, state } => draw_efforts(frame, app, list, state, doc),
         Overlay::Completions { items, state } => draw_completions(frame, app, items, state, doc),
         Overlay::Peer => draw_peer(frame, app, doc),
+        Overlay::PeerPicker { state } => draw_peer_picker(frame, app, state, doc),
         Overlay::None => {}
     }
     app.overlay = overlay;
@@ -4141,16 +4312,70 @@ fn draw_peer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         String::new()
     };
+    let hint = if app.peer_agents().len() > 1 {
+        "↑↓ scroll · ←→/tab peers · esc back"
+    } else {
+        "↑↓ scroll · esc close"
+    };
     frame.render_widget(
         Paragraph::new(visible)
             .style(app.theme.context())
             .block(overlay_block_hint(
                 app,
                 &format!("⇄ {agent}{position}"),
-                "↑↓ scroll · esc close",
+                hint,
             )),
         spot,
     );
+}
+
+fn draw_peer_picker(frame: &mut Frame<'_>, app: &App, state: &mut ListState, area: Rect) {
+    let agents = app.peer_agents();
+    let labels: Vec<String> = agents
+        .iter()
+        .map(|agent| app.peer_picker_label(agent))
+        .collect();
+    let natural = labels
+        .iter()
+        .map(|label| label.width() as u16)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(6);
+    let max_w = area.width.saturating_sub(2).min(72);
+    let width = natural.clamp(32.min(max_w), max_w.max(1));
+    let wanted_h = (agents.len() as u16).saturating_add(2).max(3);
+    let height = wanted_h.min(18).min(area.height.max(1));
+    let spot = centered(area, Constraint::Length(width), Constraint::Length(height));
+    frame.render_widget(Clear, spot);
+    let inner_w = width.saturating_sub(6).max(1) as usize;
+    let items: Vec<ListItem<'static>> = if agents.is_empty() {
+        vec![ListItem::new(Line::styled(
+            "no peer output",
+            app.theme.note(),
+        ))]
+    } else {
+        agents
+            .iter()
+            .map(|agent| {
+                let line = app.peer_picker_line(agent);
+                let clipped = clip_display(&app.peer_picker_label(agent), inner_w);
+                if line.width() as usize > inner_w {
+                    ListItem::new(Line::styled(clipped, app.theme.note()))
+                } else {
+                    ListItem::new(line)
+                }
+            })
+            .collect()
+    };
+    let widget = List::new(items)
+        .highlight_symbol("▸ ")
+        .highlight_style(app.theme.accent().add_modifier(Modifier::BOLD))
+        .block(overlay_block_hint(
+            app,
+            "peers",
+            "↑↓ select · enter open · esc close",
+        ));
+    frame.render_stateful_widget(widget, spot, state);
 }
 
 /// The approval prompt.
@@ -4640,16 +4865,13 @@ fn handle_key(
         app.welcome = false;
     }
 
-    // Overlays: esc closes; arrows/jk move; enter picks.
+    // Overlays: esc dismisses (peer viewer with several peers returns to
+    // the picker); arrows/jk move; enter picks; ctrl+p closes peer UI.
     if app.overlay.is_open() {
-        match key.code {
-            KeyCode::Esc | KeyCode::Char('q') => app.overlay = Overlay::None,
-            KeyCode::Char('?') => app.overlay = Overlay::None,
-            KeyCode::Char('c') if ctrl => app.quit = true,
-            KeyCode::Up | KeyCode::Char('k') => app.overlay_move(-1),
-            KeyCode::Down | KeyCode::Char('j') => app.overlay_move(1),
-            KeyCode::Enter => overlay_activate(client, app, slash_rx)?,
-            _ => {}
+        match handle_overlay_keys(app, key) {
+            OverlayAction::Quit => app.quit = true,
+            OverlayAction::Activate => overlay_activate(client, app, slash_rx)?,
+            OverlayAction::Handled => {}
         }
         return Ok(());
     }
@@ -4712,13 +4934,7 @@ fn handle_view_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('j') if ctrl => app.insert_char('\n'),
         KeyCode::Char('l') if ctrl => app.clear_transcript(),
         KeyCode::Char('p') if ctrl => {
-            if app.toggle_peer_expand() {
-                app.overlay = if app.peer_focus.is_some() {
-                    Overlay::Peer
-                } else {
-                    Overlay::None
-                };
-            }
+            app.toggle_peer_expand();
         }
         // ctrl+/ arrives as Char('/') with CONTROL on most terminals.
         KeyCode::Char('/') if ctrl => app.overlay = Overlay::help(),
@@ -4759,14 +4975,68 @@ fn handle_mouse(app: &mut App, kind: MouseEventKind) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayAction {
+    Handled,
+    Activate,
+    Quit,
+}
+
+fn handle_overlay_keys(app: &mut App, key: KeyEvent) -> OverlayAction {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Char('p') if ctrl => {
+            if app.overlay.is_peer_ui() {
+                app.toggle_peer_expand();
+            }
+            OverlayAction::Handled
+        }
+        KeyCode::Esc | KeyCode::Char('q') => {
+            app.dismiss_overlay();
+            OverlayAction::Handled
+        }
+        KeyCode::Char('?') => {
+            if app.overlay.is_peer_ui() {
+                app.close_peer_ui();
+            } else {
+                app.overlay = Overlay::None;
+            }
+            OverlayAction::Handled
+        }
+        KeyCode::Char('c') if ctrl => OverlayAction::Quit,
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.overlay_move(-1);
+            OverlayAction::Handled
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.overlay_move(1);
+            OverlayAction::Handled
+        }
+        KeyCode::Left | KeyCode::BackTab => {
+            app.cycle_peer(-1);
+            OverlayAction::Handled
+        }
+        KeyCode::Right | KeyCode::Tab => {
+            app.cycle_peer(1);
+            OverlayAction::Handled
+        }
+        KeyCode::Enter => OverlayAction::Activate,
+        _ => OverlayAction::Handled,
+    }
+}
+
 fn overlay_activate(
     client: &mut Client,
     app: &mut App,
     slash_rx: &mut Option<Receiver<Result<Value, Error>>>,
 ) -> Result<(), Error> {
+    if app.confirm_peer_picker() {
+        return Ok(());
+    }
     let selection = app.overlay_selection();
     let picker = match &app.overlay {
-        Overlay::Help(_) | Overlay::Peer => "close",
+        Overlay::Help(_) => "close",
+        Overlay::Peer | Overlay::PeerPicker { .. } => "none",
         Overlay::Sessions { .. } => "session",
         Overlay::Models { .. } => "model",
         Overlay::Efforts { .. } => "effort",
@@ -6698,22 +6968,62 @@ mod tests {
         assert!(app.status.contains("engine history"), "{}", app.status);
     }
 
-    #[test]
-    fn peer_output_collapses_and_expands() {
-        let mut app = App::new(SessionInfo::default());
+    fn peer_chunk(app: &mut App, agent: &str, delta: &str) {
         app.on_notification(&Notification {
             method: "event".into(),
             params: serde_json::json!({
-                "type": "harness.delegate.chunk", "agent": "peer-agent", "delta": "scanning\n"
+                "type": "harness.delegate.chunk",
+                "agent": agent,
+                "delta": delta,
             }),
         });
+    }
+
+    fn peer_progress(app: &mut App, agent: &str, phase: &str) {
+        app.on_notification(&Notification {
+            method: "event".into(),
+            params: serde_json::json!({
+                "type": "harness.delegate.progress",
+                "agent": agent,
+                "phase": phase,
+            }),
+        });
+    }
+
+    fn overlay_key(app: &mut App, code: KeyCode) {
+        handle_overlay_keys(app, KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn overlay_ctrl(app: &mut App, c: char) {
+        handle_overlay_keys(app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    }
+
+    fn overlay_height(out: &str) -> u16 {
+        let lines: Vec<&str> = out.lines().collect();
+        let top = lines
+            .iter()
+            .position(|line| line.contains('╭'))
+            .expect("top");
+        let bot = lines
+            .iter()
+            .rposition(|line| line.contains('╰'))
+            .expect("bot");
+        (bot - top + 1) as u16
+    }
+
+    #[test]
+    fn peer_output_collapses_and_expands() {
+        let mut app = App::new(SessionInfo::default());
+        peer_chunk(&mut app, "peer-agent", "scanning\n");
         let out = render(&mut app, 70, 16);
         assert!(out.contains("⇄ peer-agent"), "{out}");
 
         assert!(app.toggle_peer_expand());
         assert_eq!(app.peer_focus.as_deref(), Some("peer-agent"));
+        assert!(matches!(app.overlay, Overlay::Peer));
         assert!(app.toggle_peer_expand());
         assert!(app.peer_focus.is_none());
+        assert_eq!(app.overlay, Overlay::None);
     }
 
     #[test]
@@ -6724,7 +7034,7 @@ mod tests {
             (1..=30).map(|n| format!("line {n}\n")).collect(),
         );
         assert!(app.toggle_peer_expand());
-        app.overlay = Overlay::Peer;
+        assert!(matches!(app.overlay, Overlay::Peer));
         let tail = render(&mut app, 80, 30);
         assert!(tail.contains("line 30"), "{tail}");
         assert!(!tail.contains("line 1 "), "{tail}");
@@ -6754,6 +7064,140 @@ mod tests {
         );
         let filled_rows = short.lines().filter(|line| line.contains('│')).count();
         assert!(filled_rows <= 5, "peer card stayed too tall:\n{short}");
+    }
+
+    #[test]
+    fn ctrl_p_opens_viewer_for_one_peer_and_picker_for_several() {
+        let mut app = App::new(SessionInfo::default());
+        peer_chunk(&mut app, "alpha", "first finding\n");
+        assert!(app.toggle_peer_expand());
+        assert!(matches!(app.overlay, Overlay::Peer));
+        assert_eq!(app.peer_focus.as_deref(), Some("alpha"));
+
+        app.close_peer_ui();
+        peer_chunk(&mut app, "zebra", "later finding\n");
+        assert_eq!(app.peer_agents(), vec!["zebra", "alpha"]);
+        assert!(app.toggle_peer_expand());
+        assert!(matches!(app.overlay, Overlay::PeerPicker { .. }));
+        assert_eq!(app.overlay_selection().as_deref(), Some("zebra"));
+        assert!(app.peer_focus.is_none());
+    }
+
+    #[test]
+    fn peer_picker_follows_activity_not_alphabetical_order() {
+        let mut app = App::new(SessionInfo::default());
+        peer_chunk(&mut app, "alpha", "older\n");
+        peer_chunk(&mut app, "zebra", "newest\n");
+        assert_eq!(app.peer_agents(), vec!["zebra", "alpha"]);
+        peer_chunk(&mut app, "alpha", "alpha spoke again\n");
+        assert_eq!(app.peer_agents(), vec!["alpha", "zebra"]);
+
+        assert!(app.toggle_peer_expand());
+        assert_eq!(app.overlay_selection().as_deref(), Some("alpha"));
+        let out = render(&mut app, 80, 24);
+        let alpha_at = out.find("alpha").expect("alpha row");
+        let zebra_at = out.find("zebra").expect("zebra row");
+        assert!(
+            alpha_at < zebra_at,
+            "most recently active peer must lead the picker:\n{out}"
+        );
+    }
+
+    #[test]
+    fn peer_picker_rows_show_name_state_and_sanitized_preview() {
+        let mut app = App::new(SessionInfo::default());
+        peer_chunk(&mut app, "claude", "first\n");
+        peer_progress(&mut app, "claude", "thought");
+        peer_chunk(&mut app, "claude", "\u{1b}[32mreading auth.rs\u{1b}[0m\n");
+        peer_chunk(&mut app, "codex", "scanning tests\n");
+        peer_progress(&mut app, "codex", "tool");
+
+        assert!(app.toggle_peer_expand());
+        let out = render(&mut app, 80, 24);
+        assert!(out.contains("codex"), "{out}");
+        assert!(out.contains("tool"), "{out}");
+        assert!(out.contains("scanning tests"), "{out}");
+        assert!(out.contains("claude"), "{out}");
+        assert!(out.contains("thought"), "{out}");
+        assert!(out.contains("reading auth.rs"), "{out}");
+        assert!(!out.contains('\u{1b}'), "ansi leaked into picker:\n{out}");
+        assert!(
+            overlay_height(&out) <= 6,
+            "picker must hug its rows:\n{out}"
+        );
+    }
+
+    #[test]
+    fn peer_picker_keys_select_open_and_close() {
+        let mut app = App::new(SessionInfo::default());
+        peer_chunk(&mut app, "alpha", "older line\n");
+        peer_chunk(&mut app, "zebra", "newest line\n");
+        assert!(app.toggle_peer_expand());
+        assert_eq!(app.overlay_selection().as_deref(), Some("zebra"));
+
+        overlay_key(&mut app, KeyCode::Down);
+        assert_eq!(app.overlay_selection().as_deref(), Some("alpha"));
+        overlay_key(&mut app, KeyCode::Up);
+        assert_eq!(app.overlay_selection().as_deref(), Some("zebra"));
+
+        assert_eq!(
+            handle_overlay_keys(&mut app, KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            OverlayAction::Activate
+        );
+        assert!(app.confirm_peer_picker());
+        assert!(matches!(app.overlay, Overlay::Peer));
+        assert_eq!(app.peer_focus.as_deref(), Some("zebra"));
+        let viewer = render(&mut app, 80, 24);
+        assert!(viewer.contains("newest line"), "{viewer}");
+
+        overlay_key(&mut app, KeyCode::Esc);
+        assert!(matches!(app.overlay, Overlay::PeerPicker { .. }));
+        assert_eq!(app.overlay_selection().as_deref(), Some("zebra"));
+
+        overlay_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn peer_viewer_switches_peers_and_ctrl_p_closes() {
+        let mut app = App::new(SessionInfo::default());
+        peer_chunk(&mut app, "alpha", "alpha-only\n");
+        peer_chunk(&mut app, "zebra", "zebra-only\n");
+        app.open_peer_viewer("zebra");
+        let zebra = render(&mut app, 80, 24);
+        assert!(zebra.contains("zebra-only"), "{zebra}");
+        assert!(zebra.contains("⇄ zebra"), "{zebra}");
+
+        overlay_key(&mut app, KeyCode::Left);
+        assert_eq!(app.peer_focus.as_deref(), Some("alpha"));
+        let alpha = render(&mut app, 80, 24);
+        assert!(alpha.contains("alpha-only"), "{alpha}");
+        overlay_key(&mut app, KeyCode::Right);
+        assert_eq!(app.peer_focus.as_deref(), Some("zebra"));
+
+        overlay_key(&mut app, KeyCode::Tab);
+        assert_eq!(app.peer_focus.as_deref(), Some("alpha"));
+        overlay_key(&mut app, KeyCode::BackTab);
+        assert_eq!(app.peer_focus.as_deref(), Some("zebra"));
+
+        overlay_ctrl(&mut app, 'p');
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(app.peer_focus.is_none());
+
+        assert!(app.toggle_peer_expand());
+        assert!(matches!(app.overlay, Overlay::PeerPicker { .. }));
+        overlay_ctrl(&mut app, 'p');
+        assert_eq!(app.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn single_peer_esc_closes_viewer() {
+        let mut app = App::new(SessionInfo::default());
+        peer_chunk(&mut app, "solo", "only\n");
+        assert!(app.toggle_peer_expand());
+        overlay_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.overlay, Overlay::None);
+        assert!(app.peer_focus.is_none());
     }
 
     #[test]

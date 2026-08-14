@@ -58,6 +58,11 @@ stamps prompts it records locally and leaves resumed history untimed.
 
 `prompt` / `slash` share a worker queue (depth 4). Overflow → error, retry.
 
+The linked `goal` pack registers `/goal` in the same slash registry as
+`/review` and `/sec`; it therefore appears in `slash.list` and is invoked with
+the generic `slash` method. `/goal` is exclusive and uses the live session
+Engine.
+
 Caps: prompt/steer text 512k runes; event deltas 8k; transcript content 32k
 per message; stdin line 1 MiB.
 
@@ -118,6 +123,8 @@ Exact strings live in mow `Event*` consts (`mow.go`). Handle at least:
 | `harness.delegate.chunk` | peer live buffer (`agent`, `delta`) — **not** host answer |
 | `harness.delegate.progress` | peer phase (`thought`, `tool`, `prompt`) |
 | `harness.delegate.usage` | add to peer token chip |
+| `graph.goal.start` / `step` / `done` / `fail` | goal progress/state chip |
+| `graph.goal.partial` / `blocked` | partial result or human decision prompt |
 | compact | refresh ctx% |
 | lsp diagnostics | optional diagnostics line |
 

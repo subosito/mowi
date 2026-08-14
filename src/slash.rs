@@ -201,6 +201,13 @@ mod tests {
     }
 
     #[test]
+    fn goal_routes_to_generic_rpc_when_advertised() {
+        let packs = [pack("goal")];
+        assert_eq!(slash_route("/goal", &packs), SlashRoute::Rpc);
+        assert!(slash_completions("go", &packs).contains(&"goal".to_string()));
+    }
+
+    #[test]
     fn bogus_is_a_local_error() {
         let packs = [pack("review")];
         assert_eq!(slash_route("bogus", &packs), SlashRoute::Unknown);
