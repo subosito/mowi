@@ -65,8 +65,10 @@ const TRANSCRIPT_CACHE_ENTRIES: usize = 48;
 /// Bound work per event-loop turn so a continuously streaming RPC cannot
 /// starve input and painting. Remaining notifications are handled next turn.
 const NOTIFICATION_BATCH: usize = 256;
-/// Likewise, a held key must not keep the input-drain loop alive forever.
-const INPUT_BATCH: usize = 64;
+/// Bound one burst while still clearing typical key-repeat backlogs in a
+/// single turn. Navigation repeats are coalesced, so this does not mean 4096
+/// expensive transcript recalculations.
+const INPUT_BATCH: usize = 4096;
 /// Newest retained LSP batches (one per path).
 const MAX_LSP_PROBLEM_PATHS: usize = 10;
 /// `/lsp` dumps at most this many newest batches.
@@ -333,6 +335,9 @@ struct CachedHeight {
 struct HeightCache {
     width: u16,
     entries: Vec<CachedHeight>,
+    /// Prefix row offset for each entry plus a final total sentinel.
+    row_starts: Vec<usize>,
+    entries_total: usize,
     live_bytes: usize,
     live_height: usize,
     live_last_line_start: usize,
@@ -344,6 +349,8 @@ struct HeightCache {
 impl HeightCache {
     fn clear(&mut self) {
         self.entries.clear();
+        self.row_starts.clear();
+        self.entries_total = 0;
         self.invalidate_live();
     }
 
@@ -1281,23 +1288,23 @@ impl App {
         let window_end = target + viewport + (TRANSCRIPT_OVERSCAN * 2);
         let mut lines = Vec::new();
         let mut base = target;
-        let mut cursor = 0usize;
-        let entry_rows: Vec<usize> = self
-            .height_cache
-            .borrow()
-            .entries
-            .iter()
-            .map(|height| height.rows)
-            .collect();
-        for (index, entry_height) in entry_rows.into_iter().enumerate() {
-            let entry_end = cursor + entry_height;
-            if entry_end > target && cursor < window_end {
-                self.push_entry_window(&mut lines, &mut base, index, cursor, target, window_end);
-            }
-            cursor = entry_end;
-            if cursor >= window_end {
-                break;
-            }
+        // Jump directly to the first overlapping entry. Scrolling used to
+        // scan/clone every height from row zero on each key repeat, which made
+        // resumed sessions feel much slower than the Go viewport.
+        let entry_window: Vec<(usize, usize)> = {
+            let cache = self.height_cache.borrow();
+            let first = cache
+                .row_starts
+                .partition_point(|start| *start <= target)
+                .saturating_sub(1)
+                .min(cache.entries.len());
+            (first..cache.entries.len())
+                .take_while(|index| cache.row_starts[*index] < window_end)
+                .map(|index| (index, cache.row_starts[index]))
+                .collect()
+        };
+        for (index, cursor) in entry_window {
+            self.push_entry_window(&mut lines, &mut base, index, cursor, target, window_end);
         }
         if live_height > 0 && entries_height < window_end && entries_height + live_height > target {
             self.push_live_window(
@@ -1541,8 +1548,10 @@ impl App {
             cache.clear();
             cache.width = self.last_view_w;
         }
+        let mut entries_changed = false;
         if cache.entries.len() > self.entries.len() {
             cache.entries.truncate(self.entries.len());
+            entries_changed = true;
         }
         for (index, entry) in self.entries.iter().enumerate() {
             let (bytes, expanded) = entry_fingerprint(entry);
@@ -1563,10 +1572,22 @@ impl App {
             } else {
                 cache.entries.push(rec);
             }
+            entries_changed = true;
+        }
+        if entries_changed || cache.row_starts.len() != cache.entries.len() + 1 {
+            let rows: Vec<usize> = cache.entries.iter().map(|height| height.rows).collect();
+            cache.row_starts.clear();
+            cache.row_starts.reserve(rows.len() + 1);
+            let mut cursor = 0usize;
+            cache.row_starts.push(cursor);
+            for rows in rows {
+                cursor = cursor.saturating_add(rows);
+                cache.row_starts.push(cursor);
+            }
+            cache.entries_total = cursor;
         }
         let live = self.ensure_live_height(&mut cache);
-        let entries: usize = cache.entries.iter().map(|height| height.rows).sum();
-        (entries + live, live)
+        (cache.entries_total + live, live)
     }
 
     fn ensure_live_height(&self, cache: &mut HeightCache) -> usize {
@@ -4315,20 +4336,35 @@ fn poll_input(
         return Ok(false);
     }
     let mut dirty = false;
-    // Drain the complete input burst before repainting. Key-repeat can
-    // enqueue hundreds of events while an arrow is held; consuming one
-    // per 50 ms tick leaves a minute-long backlog that looks like a
-    // frozen app even after the key is released.
+    let mut scroll_rows = 0i32;
+    // Drain a whole input burst before repainting. Held arrows can enqueue
+    // hundreds of repeats ahead of the next typed character; process those
+    // repeats as one scroll operation so the composer becomes responsive as
+    // soon as the key is released.
     for _ in 0..INPUT_BATCH {
         match event::read().map_err(Error::Io)? {
-            Event::Key(key) if key.kind == KeyEventKind::Press => {
+            Event::Key(key)
+                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                    && app.pending_perm.is_none()
+                    && !app.overlay.is_open()
+                    && matches!(
+                        key.code,
+                        KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
+                    ) =>
+            {
+                scroll_rows += match key.code {
+                    KeyCode::Up => -1,
+                    KeyCode::Down => 1,
+                    KeyCode::PageUp => -5,
+                    KeyCode::PageDown => 5,
+                    _ => 0,
+                };
+                dirty = true;
+            }
+            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
                 handle_key(key, client, app, turn, slash_rx)?;
                 dirty = true;
             }
-            // Repeat events are intentionally consumed here. A single
-            // Press already moves the viewport; dropping repeats keeps
-            // scrolling predictable and prevents redraw starvation.
-            Event::Key(key) if key.kind == KeyEventKind::Repeat => {}
             // Bracketed paste lands at the input cursor, multi-line safe.
             Event::Paste(text) => {
                 // A stray paste must never answer a permission prompt.
@@ -4359,6 +4395,11 @@ fn poll_input(
         if !event::poll(Duration::ZERO).map_err(Error::Io)? {
             break;
         }
+    }
+    if scroll_rows < 0 {
+        leave_follow(app, scroll_rows.unsigned_abs().min(u16::MAX as u32) as u16);
+    } else if scroll_rows > 0 {
+        scroll_down(app, (scroll_rows as u32).min(u16::MAX as u32) as u16);
     }
     Ok(dirty)
 }
@@ -7727,6 +7768,29 @@ mod tests {
         fresh.live = app.live.clone();
         fresh.height_cache.borrow_mut().clear();
         assert_eq!(replaced, fresh.estimated_live_lines());
+    }
+
+    #[test]
+    fn large_entry_index_jumps_to_scrolled_window() {
+        let mut app = App::new(SessionInfo::default());
+        app.last_view_w = 80;
+        app.last_view_h = 24;
+        for i in 0..20_000 {
+            app.entries.push(Entry::Note(format!("row {i}")));
+        }
+        let _ = app.estimated_total_lines();
+        app.follow = false;
+        app.scroll = max_scroll(&app).saturating_sub(10);
+        let started = Instant::now();
+        for _ in 0..30 {
+            let lines = app.visible_transcript_lines().0;
+            assert!(lines.len() <= window_line_bound(24));
+        }
+        assert!(
+            started.elapsed() < Duration::from_millis(40),
+            "indexed scroll window regressed: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
