@@ -33,8 +33,9 @@ devenv shell -- cargo run -- --help
 
 mowi should spawn `mow rpc` by default (same flags as today’s Go `mowi` CLI:
 `--session`, `--continue`, `--model`, `--effort`, `--allow-write`,
-`--allow-shell`, `--ask` / `--auto`). It must not embed Engine and must not
-spawn ACP peers.
+`--allow-shell`, `--ask` / `--auto`, repeatable `--skill NAME` and
+`--extra-root PATH` /
+`PATH:ro` / `PATH:rw`). It must not embed Engine and must not spawn ACP peers.
 
 ## Public samples
 

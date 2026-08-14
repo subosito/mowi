@@ -63,6 +63,10 @@ struct Cli {
     #[arg(long)]
     effort: Option<String>,
 
+    /// Load a named skill unconditionally (repeatable; engine flag).
+    #[arg(long = "skill", action = clap::ArgAction::Append)]
+    skill: Vec<String>,
+
     /// Ask before power tools (engine flag).
     #[arg(long)]
     ask: bool,
@@ -70,6 +74,15 @@ struct Cli {
     /// Run power tools without asking (engine flag).
     #[arg(long)]
     auto: bool,
+
+    /// Extra FS root for path jail (repeatable; PATH, PATH:ro, or explicit PATH:rw)
+    #[arg(
+        long = "extra-root",
+        value_name = "PATH",
+        action = clap::ArgAction::Append,
+        value_parser = parse_extra_root
+    )]
+    extra_root: Vec<String>,
 
     /// Handshake and exit instead of starting the UI.
     #[arg(long)]
@@ -120,14 +133,50 @@ impl Cli {
             out.push("--effort".into());
             out.push(effort.clone());
         }
+        for skill in &self.skill {
+            out.push("--skill".into());
+            out.push(skill.clone());
+        }
         if self.ask {
             out.push("--ask".into());
         }
         if self.auto {
             out.push("--auto".into());
         }
+        for spec in &self.extra_root {
+            out.push("--extra-root".into());
+            out.push(spec.clone());
+        }
         out
     }
+}
+
+/// Parse an extra-root spec the same way mow does (`SplitExtraRootSpec`):
+/// `PATH:ro` is read-only; `PATH` / `PATH:rw` are read-write. The suffix is
+/// case-insensitive. Returns `(path, read_only)`.
+fn split_extra_root_spec(raw: &str) -> (String, bool) {
+    let raw = raw.trim();
+    let lower = raw.to_ascii_lowercase();
+    if lower.ends_with(":ro") {
+        return (raw[..raw.len() - 3].trim().to_string(), true);
+    }
+    if lower.ends_with(":rw") {
+        return (raw[..raw.len() - 3].trim().to_string(), false);
+    }
+    (raw.to_string(), false)
+}
+
+/// Clap parser: reject empty specs so a typo does not silently drop a root.
+fn parse_extra_root(raw: &str) -> Result<String, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err("must be PATH, PATH:ro, or PATH:rw".into());
+    }
+    let (path, _) = split_extra_root_spec(raw);
+    if path.is_empty() {
+        return Err("must be PATH, PATH:ro, or PATH:rw".into());
+    }
+    Ok(raw.to_string())
 }
 
 fn main() -> ExitCode {
@@ -252,6 +301,10 @@ mod tests {
             "gpt-5-mini",
             "--effort",
             "high",
+            "--skill",
+            "review",
+            "--skill",
+            "format",
             "--allow-write",
             "--allow-shell",
             "--ask",
@@ -267,6 +320,10 @@ mod tests {
                 "gpt-5-mini",
                 "--effort",
                 "high",
+                "--skill",
+                "review",
+                "--skill",
+                "format",
                 "--ask"
             ]
         );
@@ -280,10 +337,85 @@ mod tests {
     }
 
     #[test]
+    fn skill_is_repeatable_and_forwards_in_order() {
+        let cli = Cli::parse_from([
+            "mowi",
+            "--skill",
+            "review",
+            "--skill=format",
+            "--skill",
+            "security",
+        ]);
+        assert_eq!(
+            cli.engine_flags(),
+            vec![
+                "--skill", "review", "--skill", "format", "--skill", "security",
+            ]
+        );
+    }
+
+    #[test]
     fn ping_subcommand_parses() {
         let cli = Cli::parse_from(["mowi", "ping"]);
         assert!(matches!(cli.command, Some(Command::Ping)));
         assert!(cli.engine_flags().is_empty());
+    }
+
+    #[test]
+    fn extra_root_repeatable_forwards_rw_ro_specs() {
+        let cli = Cli::parse_from([
+            "mowi",
+            "--extra-root",
+            "/rw/one",
+            "--extra-root",
+            "/ro/one:ro",
+            "--extra-root",
+            "/rw/two:rw",
+        ]);
+        assert_eq!(
+            cli.engine_flags(),
+            vec![
+                "--extra-root",
+                "/rw/one",
+                "--extra-root",
+                "/ro/one:ro",
+                "--extra-root",
+                "/rw/two:rw",
+            ]
+        );
+        assert_eq!(split_extra_root_spec("/rw/one"), ("/rw/one".into(), false));
+        assert_eq!(
+            split_extra_root_spec("/ro/one:ro"),
+            ("/ro/one".into(), true)
+        );
+        assert_eq!(
+            split_extra_root_spec("/rw/two:rw"),
+            ("/rw/two".into(), false)
+        );
+        assert_eq!(split_extra_root_spec(" /tmp:RO "), ("/tmp".into(), true));
+    }
+
+    #[test]
+    fn extra_root_rejects_empty_path() {
+        for spec in [":ro", ":rw", "   ", ":RO"] {
+            let err = Cli::try_parse_from(["mowi", "--extra-root", spec]).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("PATH, PATH:ro, or PATH:rw"),
+                "spec {spec:?}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn extra_root_help_documents_modes() {
+        let mut buf = Vec::new();
+        Cli::command().write_long_help(&mut buf).unwrap();
+        let help = String::from_utf8(buf).unwrap();
+        assert!(help.contains("--extra-root"), "{help}");
+        assert!(help.contains("PATH:ro"), "{help}");
+        assert!(help.contains("PATH:rw"), "{help}");
+        assert!(help.contains("--skill"), "{help}");
     }
 
     #[test]

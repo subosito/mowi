@@ -108,6 +108,17 @@ pub struct ContextUsage {
     pub percent: Option<f64>,
 }
 
+impl ContextUsage {
+    pub fn from_value(value: &Value) -> Self {
+        Self {
+            tokens: value.get("tokens").and_then(Value::as_u64).unwrap_or(0),
+            context_window: value.get("context_window").and_then(Value::as_u64),
+            remaining: value.get("remaining").and_then(Value::as_u64),
+            percent: value.get("percent").and_then(Value::as_f64),
+        }
+    }
+}
+
 /// `compact` result.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CompactReport {
@@ -300,7 +311,8 @@ impl SessionInfo {
 /// Live assistant text carried by an `event` notification, if any.
 ///
 /// Peer chunks (`harness.delegate.*`) are deliberately excluded: they are not
-/// the host answer.
+/// the host answer. Reasoning (`loop.reasoning`) is also excluded: the UI
+/// may arm a thinking indicator, but the body must never paint.
 pub fn token_delta(params: &Value) -> Option<&str> {
     let kind = event_type(params);
     if kind.contains("delegate") {
@@ -316,8 +328,234 @@ pub fn token_delta(params: &Value) -> Option<&str> {
         .filter(|d| !d.is_empty())
 }
 
+/// Reasoning-channel delta. Presence-only for the UI: the text is never painted.
+pub fn reasoning_delta(params: &Value) -> Option<&str> {
+    let kind = event_type(params);
+    if kind != "loop.reasoning" && kind != "reasoning" {
+        return None;
+    }
+    params
+        .get("delta")
+        .and_then(|d| d.as_str())
+        .filter(|d| !d.is_empty())
+}
+
 fn event_type(params: &Value) -> &str {
     params.get("type").and_then(|t| t.as_str()).unwrap_or("")
+}
+
+/// Known CoT wrappers, matched case-insensitively on ASCII tags.
+const THINK_TAG_PAIRS: &[(&str, &str)] = &[
+    ("<think>", "</think>"),
+    ("<thinking>", "</thinking>"),
+    ("<redacted_thinking>", "</redacted_thinking>"),
+    ("<thought>", "</thought>"),
+    ("<reasoning>", "</reasoning>"),
+    ("◁think▷", "◁/think▷"),
+    ("<|thinking|>", "<|/thinking|>"),
+    ("<|begin_of_thought|>", "<|end_of_thought|>"),
+    ("```thinking", "```"),
+    ("```think", "```"),
+    ("```reasoning", "```"),
+];
+
+/// Split answer text into visible prose and hidden thinking.
+///
+/// Complete open/close pairs are stripped. An unclosed open tag (still
+/// streaming) hides the remainder so a partial CoT cannot leak as glued
+/// tokens. `unclosed` is true while a think block is still open.
+pub fn extract_thinking(s: &str) -> (String, String, bool) {
+    if s.is_empty() {
+        return (String::new(), String::new(), false);
+    }
+    let mut vis = String::new();
+    let mut think = String::new();
+    let mut rest = s;
+    let mut unclosed = false;
+    while !rest.is_empty() {
+        let Some((open_idx, open_len, close_tag)) = earliest_think_open(rest) else {
+            vis.push_str(rest);
+            break;
+        };
+        vis.push_str(&rest[..open_idx]);
+        let mut after_open = &rest[open_idx + open_len..];
+        if let Some(stripped) = after_open.strip_prefix("\r\n") {
+            after_open = stripped;
+        } else if let Some(stripped) = after_open.strip_prefix('\n') {
+            after_open = stripped;
+        }
+        match index_close_tag(after_open, close_tag) {
+            None => {
+                think.push_str(after_open);
+                unclosed = true;
+                break;
+            }
+            Some(close_idx) => {
+                think.push_str(&after_open[..close_idx]);
+                rest = &after_open[close_idx + close_tag.len()..];
+                if let Some(stripped) = rest.strip_prefix("\r\n") {
+                    rest = stripped;
+                } else if let Some(stripped) = rest.strip_prefix('\n') {
+                    rest = stripped;
+                }
+                if !vis.is_empty()
+                    && !rest.is_empty()
+                    && !vis
+                        .as_bytes()
+                        .last()
+                        .is_some_and(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+                    && !rest
+                        .as_bytes()
+                        .first()
+                        .is_some_and(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+                {
+                    vis.push(' ');
+                }
+            }
+        }
+    }
+    (vis, think, unclosed)
+}
+
+fn earliest_think_open(s: &str) -> Option<(usize, usize, &'static str)> {
+    let lower = ascii_lower(s);
+    let mut best: Option<(usize, usize, &'static str)> = None;
+    for (open, close) in THINK_TAG_PAIRS {
+        if let Some(i) = lower.find(&ascii_lower(open))
+            && best.is_none_or(|(idx, _, _)| i < idx)
+        {
+            best = Some((i, open.len(), close));
+        }
+    }
+    best
+}
+
+fn index_close_tag(s: &str, close_tag: &str) -> Option<usize> {
+    if close_tag == "```" {
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let Some(rel) = s[i..].find("```") else {
+                return None;
+            };
+            let j = i + rel;
+            let rest = &s[j + 3..];
+            let line = rest.split_once('\n').map(|(l, _)| l).unwrap_or(rest);
+            if line.trim().is_empty() {
+                return Some(j);
+            }
+            let Some(k) = rest.find("```") else {
+                return None;
+            };
+            i = j + 3 + k + 3;
+        }
+        return None;
+    }
+    ascii_lower(s).find(&ascii_lower(close_tag))
+}
+
+/// ASCII-only fold so find indices stay valid on the original UTF-8 string.
+fn ascii_lower(s: &str) -> String {
+    let mut bytes = s.as_bytes().to_vec();
+    for b in &mut bytes {
+        if b.is_ascii_uppercase() {
+            *b += 32;
+        }
+    }
+    String::from_utf8(bytes).expect("ASCII fold keeps UTF-8")
+}
+
+/// Frozen host event type for language-server findings after write/edit.
+pub const EVENT_LSP_DIAGNOSTICS: &str = "harness.lsp.diagnostics";
+/// Host cap on findings that ride along a tool result or LSP event.
+pub const MAX_LSP_DIAGNOSTICS: usize = 10;
+
+/// One language-server finding from `harness.lsp.diagnostics`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspDiagnostic {
+    pub severity: String,
+    pub message: String,
+    pub line: i64,
+    pub column: i64,
+    pub source: String,
+}
+
+/// Newest diagnostics batch for one path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LspProblems {
+    pub path: String,
+    pub count: i64,
+    pub diagnostics: Vec<LspDiagnostic>,
+}
+
+fn lsp_severity_rank(severity: &str) -> i32 {
+    match severity {
+        "error" => 4,
+        "warning" => 3,
+        "information" => 2,
+        _ => 1,
+    }
+}
+
+/// Parse a `harness.lsp.diagnostics` payload. `count <= 0` is a no-op.
+pub fn decode_lsp_diagnostics(params: &Value) -> Option<LspProblems> {
+    let kind = params.get("type").and_then(Value::as_str).unwrap_or("");
+    if !kind.is_empty() && kind != EVENT_LSP_DIAGNOSTICS && !kind.ends_with("lsp.diagnostics") {
+        return None;
+    }
+    let count = params.get("count").and_then(Value::as_i64).unwrap_or(0);
+    if count <= 0 {
+        return None;
+    }
+    let path = params
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let mut diagnostics = Vec::new();
+    if let Some(items) = params.get("diagnostics").and_then(Value::as_array) {
+        for item in items.iter().take(MAX_LSP_DIAGNOSTICS) {
+            diagnostics.push(LspDiagnostic {
+                severity: item
+                    .get("severity")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                message: item
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                line: item.get("line").and_then(Value::as_i64).unwrap_or(0),
+                column: item.get("column").and_then(Value::as_i64).unwrap_or(0),
+                source: item
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            });
+        }
+    }
+    diagnostics.sort_by(|a, b| lsp_severity_rank(&b.severity).cmp(&lsp_severity_rank(&a.severity)));
+    Some(LspProblems {
+        path,
+        count,
+        diagnostics,
+    })
+}
+
+/// `rewind` result: `Some(last_user)` when the host dropped the last exchange.
+pub fn decode_rewind(value: &Value) -> Option<String> {
+    if !value.get("ok").and_then(Value::as_bool).unwrap_or(false) {
+        return None;
+    }
+    Some(
+        value
+            .get("last_user")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+    )
 }
 
 type Pending = Arc<Mutex<HashMap<u64, Sender<Result<Value, Error>>>>>;
@@ -505,11 +743,19 @@ impl Client {
     }
 
     /// Redirect the active turn.
+    #[allow(dead_code)] // synchronous API retained for non-TUI callers
     pub fn steer(&mut self, text: &str, timeout: Duration) -> Result<Value, Error> {
-        if text.trim().is_empty() {
-            return Err(Error::Protocol("steer text must not be empty".into()));
+        let rx = self.request_steer(text)?;
+        match rx.recv_timeout(timeout) {
+            Ok(res) => res,
+            Err(RecvTimeoutError::Timeout) => Err(Error::Timeout),
+            Err(RecvTimeoutError::Disconnected) => Err(Error::Closed),
         }
-        self.call("steer", Some(json!({ "text": text })), timeout)
+    }
+
+    /// Non-blocking `steer` — the 50ms loop polls the reply instead of stalling.
+    pub fn request_steer(&mut self, text: &str) -> Result<Receiver<Result<Value, Error>>, Error> {
+        self.send("steer", Some(steer_params(text)?))
     }
 
     /// List slash commands registered by the host.
@@ -567,6 +813,7 @@ impl Client {
     }
 
     /// Resolve a pending permission request.
+    #[allow(dead_code)] // synchronous API retained for non-TUI callers
     pub fn perm_decide(
         &mut self,
         id: &str,
@@ -591,12 +838,14 @@ impl Client {
     }
 
     /// List models the host can switch to. Control method: answered while busy.
+    #[allow(dead_code)] // synchronous API retained for non-TUI callers
     pub fn model_list(&mut self, timeout: Duration) -> Result<ModelList, Error> {
         let value = self.call("model.list", None, timeout)?;
         decode_model_list(&value)
     }
 
     /// Switch the session model. Control method: answered while busy.
+    #[allow(dead_code)] // synchronous API retained for non-TUI callers
     pub fn model_set(&mut self, id: &str, timeout: Duration) -> Result<String, Error> {
         let id = id.trim();
         if id.is_empty() {
@@ -618,6 +867,7 @@ impl Client {
     }
 
     /// Switch the session effort. Control method: answered while busy.
+    #[allow(dead_code)] // synchronous API retained for non-TUI callers
     pub fn effort_set(&mut self, id: &str, timeout: Duration) -> Result<String, Error> {
         let id = id.trim();
         if id.is_empty() {
@@ -635,23 +885,17 @@ impl Client {
     /// Context-window usage for the gauge. Control method: answered while busy.
     pub fn context(&mut self, timeout: Duration) -> Result<ContextUsage, Error> {
         let value = self.call("context", None, timeout)?;
-        Ok(ContextUsage {
-            tokens: value.get("tokens").and_then(Value::as_u64).unwrap_or(0),
-            context_window: value.get("context_window").and_then(Value::as_u64),
-            remaining: value.get("remaining").and_then(Value::as_u64),
-            percent: value.get("percent").and_then(Value::as_f64),
-        })
+        Ok(ContextUsage::from_value(&value))
     }
 
-    /// Compact the engine transcript. `max_chars <= 0` lets the engine choose.
-    pub fn compact(&mut self, max_chars: i64, timeout: Duration) -> Result<CompactReport, Error> {
-        let params = if max_chars > 0 {
-            Some(json!({ "max_chars": max_chars }))
-        } else {
-            None
-        };
-        let value = self.call("compact", params, timeout)?;
-        Ok(CompactReport {
+    /// Non-blocking `context` — the 50ms loop polls the reply instead of stalling.
+    pub fn request_context(&mut self) -> Result<Receiver<Result<Value, Error>>, Error> {
+        self.send("context", None)
+    }
+
+    /// Decode a compact response received through the non-blocking request path.
+    pub fn decode_compact(value: &Value) -> CompactReport {
+        CompactReport {
             layer: value
                 .get("layer")
                 .and_then(Value::as_str)
@@ -674,23 +918,86 @@ impl Client {
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             tokens: value.get("tokens").and_then(Value::as_u64).unwrap_or(0),
-        })
+        }
+    }
+
+    /// Compact the engine transcript. `max_chars <= 0` lets the engine choose.
+    #[allow(dead_code)] // synchronous API retained for non-TUI callers
+    pub fn compact(&mut self, max_chars: i64, timeout: Duration) -> Result<CompactReport, Error> {
+        let params = if max_chars > 0 {
+            Some(json!({ "max_chars": max_chars }))
+        } else {
+            None
+        };
+        let value = self.call("compact", params, timeout)?;
+        Ok(Self::decode_compact(&value))
     }
 
     /// Drop the last exchange; returns the user text so the UI can refill the
     /// input box for an edit-and-resend.
+    #[allow(dead_code)] // synchronous API retained for non-TUI callers
     pub fn rewind(&mut self, timeout: Duration) -> Result<Option<String>, Error> {
         let value = self.call("rewind", None, timeout)?;
-        if !value.get("ok").and_then(Value::as_bool).unwrap_or(false) {
-            return Ok(None);
+        Ok(decode_rewind(&value))
+    }
+
+    /// Non-blocking `rewind` — the 50ms loop polls the reply instead of stalling.
+    pub fn request_rewind(&mut self) -> Result<Receiver<Result<Value, Error>>, Error> {
+        self.send("rewind", None)
+    }
+
+    /// Non-blocking `transcript` refresh after rewind/compact.
+    pub fn request_transcript(&mut self) -> Result<Receiver<Result<Value, Error>>, Error> {
+        self.send("transcript", None)
+    }
+
+    /// Non-blocking `model.set`.
+    pub fn request_model_set(&mut self, id: &str) -> Result<Receiver<Result<Value, Error>>, Error> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(Error::Protocol("model id must not be empty".into()));
         }
-        Ok(Some(
-            value
-                .get("last_user")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-        ))
+        self.send("model.set", Some(json!({ "id": id })))
+    }
+
+    /// Non-blocking `effort.set`.
+    pub fn request_effort_set(
+        &mut self,
+        id: &str,
+    ) -> Result<Receiver<Result<Value, Error>>, Error> {
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(Error::Protocol("effort id must not be empty".into()));
+        }
+        self.send("effort.set", Some(json!({ "id": id })))
+    }
+
+    /// Non-blocking `perm.set`.
+    pub fn request_perm_set(
+        &mut self,
+        mode: &str,
+    ) -> Result<Receiver<Result<Value, Error>>, Error> {
+        if !matches!(mode, "ask" | "auto") {
+            return Err(Error::Protocol(format!("invalid permission mode: {mode}")));
+        }
+        self.send("perm.set", Some(json!({ "mode": mode })))
+    }
+
+    /// Non-blocking `perm.decide`.
+    pub fn request_perm_decide(
+        &mut self,
+        id: &str,
+        decision: &str,
+    ) -> Result<Receiver<Result<Value, Error>>, Error> {
+        if !matches!(decision, "allow" | "deny" | "always") {
+            return Err(Error::Protocol(format!(
+                "invalid permission decision: {decision}"
+            )));
+        }
+        self.send(
+            "perm.decide",
+            Some(json!({ "id": id, "decision": decision })),
+        )
     }
 
     /// Skills available in this workspace.
@@ -738,7 +1045,20 @@ impl Client {
     /// Start a turn. The result arrives later (the channel stays open while
     /// `event` notifications stream).
     pub fn prompt(&mut self, text: &str) -> Result<Receiver<Result<Value, Error>>, Error> {
-        self.send("prompt", Some(json!({ "text": text })))
+        self.prompt_with(text, false)
+    }
+
+    /// Start a prompt that is answered against current context but is not
+    /// persisted into session history (`/btw`).
+    pub fn prompt_with(
+        &mut self,
+        text: &str,
+        ephemeral: bool,
+    ) -> Result<Receiver<Result<Value, Error>>, Error> {
+        self.send(
+            "prompt",
+            Some(json!({ "text": text, "ephemeral": ephemeral })),
+        )
     }
 
     /// Abort the running turn (control method: answered while busy).
@@ -751,6 +1071,13 @@ impl Client {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+fn steer_params(text: &str) -> Result<Value, Error> {
+    if text.trim().is_empty() {
+        return Err(Error::Protocol("steer text must not be empty".into()));
+    }
+    Ok(json!({ "text": text }))
 }
 
 fn string_field(value: &Value, field: &str) -> Result<String, Error> {
@@ -833,7 +1160,7 @@ pub fn decode_effort_list(value: &Value) -> Result<EffortList, Error> {
     })
 }
 
-fn decode_sessions(value: &Value) -> Result<Vec<SessionSummary>, Error> {
+pub fn decode_sessions(value: &Value) -> Result<Vec<SessionSummary>, Error> {
     let rows = value
         .get("sessions")
         .and_then(Value::as_array)
@@ -849,7 +1176,7 @@ fn decode_sessions(value: &Value) -> Result<Vec<SessionSummary>, Error> {
         .collect()
 }
 
-fn decode_transcript(value: &Value) -> Result<Vec<TranscriptMessage>, Error> {
+pub fn decode_transcript(value: &Value) -> Result<Vec<TranscriptMessage>, Error> {
     let rows = value
         .get("messages")
         .and_then(Value::as_array)
@@ -984,6 +1311,86 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_deltas_are_not_host_tokens() {
+        let reason = serde_json::json!({"type":"loop.reasoning","delta":"secret plan"});
+        assert_eq!(token_delta(&reason), None);
+        assert_eq!(reasoning_delta(&reason), Some("secret plan"));
+        assert_eq!(
+            reasoning_delta(&serde_json::json!({"type":"loop.token","delta":"hi"})),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_thinking_strips_closed_and_hides_unclosed() {
+        let (vis, think, unclosed) = extract_thinking("<think>secret plan</think>## Hello");
+        assert_eq!(vis, "## Hello");
+        assert!(think.contains("secret plan"), "{think}");
+        assert!(!unclosed);
+
+        let (vis, think, unclosed) = extract_thinking("<think>Let me reason without spaces");
+        assert!(vis.is_empty(), "{vis}");
+        assert!(think.contains("Let me reason"), "{think}");
+        assert!(unclosed);
+
+        let (vis, _, unclosed) =
+            extract_thinking("key files.<think>plan the approach</think>Let me go");
+        assert_eq!(vis, "key files. Let me go");
+        assert!(!unclosed);
+        assert!(!vis.contains("plan the approach"), "{vis}");
+
+        let (vis, _, _) = extract_thinking("<THINK>SECRET</THINK>ok");
+        assert_eq!(vis, "ok");
+        assert!(!vis.to_lowercase().contains("secret"));
+    }
+
+    #[test]
+    fn decode_lsp_diagnostics_matches_frozen_shape() {
+        let event = serde_json::json!({
+            "type": "harness.lsp.diagnostics",
+            "tool": "edit",
+            "path": "internal/x.go",
+            "count": 3,
+            "diagnostics": [
+                {"severity": "warning", "message": "unused", "line": 8, "column": 1},
+                {"severity": "error", "message": "undefined: foo", "line": 42, "column": 9, "source": "compiler"},
+            ]
+        });
+        let problems = decode_lsp_diagnostics(&event).expect("shape");
+        assert_eq!(problems.path, "internal/x.go");
+        assert_eq!(problems.count, 3);
+        assert_eq!(problems.diagnostics[0].severity, "error");
+        assert_eq!(problems.diagnostics[0].source, "compiler");
+        assert_eq!(problems.diagnostics.len(), 2);
+
+        assert!(
+            decode_lsp_diagnostics(&serde_json::json!({
+                "type": "harness.lsp.diagnostics",
+                "path": "clean.go",
+                "count": 0
+            }))
+            .is_none()
+        );
+        assert!(
+            decode_lsp_diagnostics(&serde_json::json!({
+                "type": "loop.token",
+                "count": 2
+            }))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn decode_rewind_needs_ok() {
+        assert_eq!(
+            decode_rewind(&serde_json::json!({"ok": true, "last_user": "hi"})).as_deref(),
+            Some("hi")
+        );
+        assert_eq!(decode_rewind(&serde_json::json!({"ok": false})), None);
+        assert_eq!(decode_rewind(&serde_json::json!({})), None);
+    }
+
+    #[test]
     fn session_short_id() {
         let s = SessionInfo::from_value(&serde_json::json!({
             "session_id":"0123456789abcdef","workspace":"/w","model":"gpt-5-mini"
@@ -1062,5 +1469,32 @@ mod tests {
         assert_eq!(list.default, "none");
         assert_eq!(list.efforts.len(), 2);
         assert!(list.efforts[1].current);
+    }
+
+    #[test]
+    fn steer_params_reject_empty_text() {
+        let err = steer_params("   ").unwrap_err();
+        assert!(
+            err.to_string().contains("steer text must not be empty"),
+            "{err}"
+        );
+        assert_eq!(
+            steer_params("focus on tests").unwrap()["text"],
+            "focus on tests"
+        );
+    }
+
+    #[test]
+    fn context_usage_from_value() {
+        let usage = ContextUsage::from_value(&serde_json::json!({
+            "tokens": 12300,
+            "context_window": 200000,
+            "remaining": 187700,
+            "percent": 6.15
+        }));
+        assert_eq!(usage.tokens, 12_300);
+        assert_eq!(usage.context_window, Some(200_000));
+        assert_eq!(usage.remaining, Some(187_700));
+        assert_eq!(usage.percent, Some(6.15));
     }
 }

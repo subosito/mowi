@@ -33,38 +33,43 @@ that it shows a "terminal too small" card instead of a broken one.
 
 **Header — identity left, usage right, safety never drops.** The left cluster
 is only `mowi`, the workspace *basename*, and `model (effort)` with the
-effort word dimmed. Token count and the context gauge sit right-aligned
-against the capability / ask chips and peel first (tokens, then gauge) so a
-tight row keeps identity. The gauge is not offered below `GAUGE_MIN_COLS`.
+effort word dimmed. Token usage sits immediately before the context
+gauge; the gauge is the far-rightmost chip whenever it is shown. A
+` · ` joins safety to the first metric and is omitted when both
+metrics are hidden. Both peel first (tokens, then gauge) so a tight
+row keeps identity. The gauge is not offered below `GAUGE_MIN_COLS`.
 Session id is never a header chip. The painted row has a one-column inset on
-each side so it shares a vertical rhythm with the composer and footer.
+each side so it shares a vertical rhythm with the composer and footer. Header
+and status sit on the terminal default background — they do not paint a
+second mantle fill over the document ground.
 
-**One live clock.** The activity band above the composer owns the spinner,
-elapsed time and typing pulse, each painted in its own role (`spinner` /
+**One live clock.** The status bar owns the spinner, elapsed time and
+typing pulse while a turn runs, each painted in its own role (`spinner` /
 `timing` / verb / `typing`) so the row has hierarchy instead of reading as
-one muted sentence. The footer names the state (`idle`, or the current verb
-while a turn runs) and never repeats the clock. Its enter hint says `queue`
-while a turn is running. Two clocks tick out of step and both stop being
-believed.
+one muted sentence. Idle is a state light (`● idle`). There is no second
+activity band above the composer — two clocks tick out of step and both
+stop being believed. The enter hint says `queue` while a turn is running.
 
 **The footer is a status bar.** State flushed left, key hints flushed right,
 hints degrade through progressively shorter variants and drop before the
 state does. `ctx%` appears only past `CTX_FOOTER_PCT` — a number that is
-always on screen stops being read. The full session id sits with the state
-when status and the minimum `?` hint still fit; long hints degrade around
-it. It is hidden only when those two cannot take ` · <id>`. The bar owns a
-two-row region: a top hairline plus the status text, so the rule never
-eats the line.
+always on screen stops being read. Session id is never status-bar chrome;
+the help overlay titles the full id. The bar owns a two-row region: a top
+hairline plus the status text, so the rule never eats the line.
 
 **Bottom chrome is one hairline.** The composer sits on the document ground
-with a horizontal inset and no box. The status line is a separate sunk bar
-with its own top rule. Activity stays a one-line transient band immediately
-above the composer; it is not folded into the status line.
+with a horizontal inset and no box — no blank pad rows, because those
+share the transcript ground and read as a tall empty well against the
+status rule. The status line is a separate bar on the terminal default with
+its own top rule. The live
+clock folds into that bar while a turn runs; it is not a transient band
+above the composer.
 
-**Scroll and recall are different keys.** PgUp/PgDn move the transcript and
-never rewrite the composer. Arrow-up recalls the last user prompt only when
-the input is empty; it does not scroll. `t` always types. `ctrl+u` / `ctrl+d`
-are unbound.
+**Scroll and recall are different keys.** ↑/↓ and PgUp/PgDn move the
+transcript and never rewrite the composer. Last-prompt recall is `/edit`
+only. `t` always types. `ctrl+u` / `ctrl+d` are unbound. The client does
+not capture the mouse; a wheel event, if one arrives, scrolls the
+transcript only.
 
 **Modals sit on the document.** Overlays are drawn into the transcript
 region, never the full frame, so the composer and status bar stay usable
@@ -72,8 +77,12 @@ underneath. `draw_scrim` dims what is behind them (DIM attribute under
 NO_COLOR), but never the header chips or the footer decision bar — those are
 what the operator reads to decide. The welcome card degrades by height so
 access and `type to begin` survive at `MIN_WIDTH`×`MIN_HEIGHT`; the help
-table sizes its key column to the keys so actions are not sheared at a
-normal 80-wide frame. The permission card uses the same overlay ground as
+card sizes to its rows (capped) so a tall frame is not a pane-filling
+empty table, and the key column yields on a narrow pane so actions stay
+readable. The full session id sits on the title rail (the title shortens
+to `help` when the long name plus the id would collide) so the card does
+not grow a header row. At a normal 80-wide frame the key column still
+fits the keys so actions are not sheared. The permission card uses the same overlay ground as
 the other modals — urgency lives in the warn border and the decision keys,
 not a second fill.
 
@@ -97,6 +106,14 @@ slides and whatever the operator was reading — usually their own prompt — is
 pushed off the top of the pane. So estimates count *wrapped* rows, not
 logical lines, and `estimated_height_matches_painted_height` pins it.
 
+**User prompts carry an inline clock, not a label.** A prompt this client
+recorded is prefixed with a muted UTC `HH:MM` on the first band row — same
+row as the text, not a timestamp line above it. Resumed `transcript`
+messages have no per-message time on the wire, so they render without a
+stamp rather than inventing one. The wrap estimate uses the same display
+string as the painter. Pinned by `user_prompt_stamp_is_inline_when_recorded`
+and `resumed_user_prompt_has_no_invented_stamp`.
+
 **Tool rows are labels, not transcripts of the command.** `tool_label` emits
 `verb · argument`, collapsing a chained shell blob
 (`bash echo ---; cat …; ls -la`) to its first command plus `(+n more)`. This
@@ -106,7 +123,7 @@ something ran. Pinned by `tool_labels_collapse_shell_chains` and the
 `shellblob` snapshot scene.
 
 **Tool calls group per turn, not per call.** `tool.start`/`tool.end` events
-accumulate in `live_tools` while the loop runs (the activity band owns the
+accumulate in `live_tools` while the loop runs (the status bar owns the
 live "tool · name" readout); `run.end` (or the turn's end, whichever comes
 first — commit is idempotent) folds them into one `Entry::Tools`. A single
 call stays the plain one-row entry it always was; two or more collapse to
@@ -120,7 +137,9 @@ every call, so the scrollbar extent never drifts. Pinned by
 
 Widgets never name raw colours — they ask `Theme` for a semantic role
 (`header`, `badge(Tone::Warn)`, `user_rail`). The palette is Catppuccin
-Mocha; a flavour swap should be one table in `theme.rs`.
+Mocha; a flavour swap should be one table in `theme.rs`. Historical user
+text is peach on the user band (not blue). Header and footer grounds are
+`Color::Reset` (the terminal default).
 
 Every role must degrade under `NO_COLOR` to modifiers only. This is enforced
 by `no_color_theme_never_emits_color` — if you add a role, add it there.

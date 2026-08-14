@@ -23,7 +23,7 @@ parity. Do not block v0 on diffs.
 - Exclusive slash refused when busy
 - `/sessions` from `sessions`
 - Token chip from `prompt.usage` + delegate.usage events
-- Follow-bottom / scroll (pgup/pgdn)
+- Follow-bottom / scroll (↑↓ / pgup/pgdn)
 
 ## Phase 2 — document quality ✓
 
@@ -48,23 +48,27 @@ parity. Do not block v0 on diffs.
 Ratatui widgets carry the chrome; the transcript stays the product.
 
 - **Header chips** built as spans: left identity is `mowi` / workspace
-  basename / `model (effort)`; token (`⇄` peer) and the context gauge sit
-  right-aligned and drop first. The capability chip (`read-only` /
+  basename / `model (effort)`; the token chip (`⇄` peer) sits immediately
+  before the context gauge, which is the far-rightmost element when shown.
+  A ` · ` joins safety to the first metric and is omitted when both
+  metrics are hidden. Usage drops first. The capability chip (`read-only` /
   `write` / `shell` / `write+shell`) and the `ask` ↔ `auto` chip never drop.
-  The full session id is status-bar chrome (when status and `?` fit), not
-  a header chip. `status`
+  Session id is never a header or status-bar chip; the help overlay
+  titles the full id. `status`
   seeds them at handshake.
 - **Min size 40×10** — below that a centered `Clear` + bordered warning Block
   instead of a broken frame.
 - **Welcome splash** for a fresh session (no transcript seed); any key
   dismisses it.
-- **Activity band** only while busy: a top-rule Block titled with spinner +
-  verb + elapsed. `MOW_NO_ANIM=1` pins a static `●` and the clock still ticks.
+- **Status bar** owns the live clock while busy (spinner + elapsed + verb;
+  typing pulse while tokens land). Idle is `● idle`. `MOW_NO_ANIM=1` pins a
+  static `●` and the clock still ticks. There is no separate activity band.
 - **Transcript** gets `Paragraph` + a `Scrollbar` bound to the scroll state,
   and diffs render as a review card with a `─ <file>` title parsed from `+++`.
 - **Input** is a multi-line Paragraph that grows 1–6 rows; `ctrl+j` inserts a
-  newline, arrow-up on empty input loads the last prompt without scrolling,
-  `ctrl+l` clears the painted transcript (Engine history is untouched).
+  newline, ↑/↓ scroll the transcript without rewriting the prompt, `/edit`
+  loads the last user prompt, `ctrl+l` clears the painted transcript (Engine
+  history is untouched).
 - **Overlays** (`Clear` + centered Block): help (`List` of local keys plus
   `slash.list` rows), `/sessions` (id / updated / preview + `mowi --session
   <id>` hint), peer buffer, and permissions (tool name + command string or
@@ -90,7 +94,8 @@ Still deliberately out: a remappable keymap file, PTY cell smoke.
 - **Chrome** — header chips close with a hairline rule; the transcript reserves
   the scrollbar column so bands never run under the thumb; the input sits on
   the document ground with no box, with a `❯` glyph (`>` when colour
-  is off); the footer is its own sunk bar with a top rule and goes
+  is off); the footer is its own status bar on the terminal default with a
+  top rule and goes
   quiet while the permission overlay owns the decision.
 - **Permission overlay** — the tool name titles the block and `y/n/a` sits on
   the title-right, with args as a wrapped Paragraph.

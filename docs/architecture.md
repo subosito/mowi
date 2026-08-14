@@ -13,7 +13,7 @@ mowi never:
 
 mowi does:
 
-- paint a document (header, transcript, activity, input, overlays)
+- paint a document (header, transcript, input, overlays)
 - send `prompt` / `cancel` / `steer` / `slash` / `perm.set` / `perm.decide`
 - render `event` and `perm.ask` notifications
 
@@ -65,9 +65,10 @@ See [protocol.md](protocol.md).
 Workspace trust (`mow trust`) stays out-of-band. mowi may shell out to
 `mow trust` or document it; it does not invent a second trust store.
 
-`--allow-write` / `--allow-shell` / `--ask` / `--auto` are **engine flags**
-passed through to `mow rpc`. After connect, `perm.set` mirrors ask/auto so
-the UI and Engine agree.
+`--allow-write` / `--allow-shell` / `--ask` / `--auto` / `--extra-root` are
+**engine flags** passed through to `mow rpc`. `--extra-root` is repeatable
+and uses mow's spec: `PATH`, `PATH:ro`, or explicit `PATH:rw`. After
+connect, `perm.set` mirrors ask/auto so the UI and Engine agree.
 
 ## Packs
 

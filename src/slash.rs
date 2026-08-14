@@ -52,6 +52,9 @@ const DISPATCH: &[(&str, Builtin)] = &[
     ("undo", Builtin::Local),
     ("skills", Builtin::Local),
     ("steer", Builtin::Local),
+    ("btw", Builtin::Local),
+    ("perm", Builtin::Local),
+    ("lsp", Builtin::Local),
 ];
 
 /// Canonical names offered by autocomplete (no one-letter aliases).
@@ -68,7 +71,15 @@ const COMPLETIONS: &[&str] = &[
     "edit",
     "retry",
     "status",
+    "context",
+    "compact",
+    "rewind",
+    "undo",
+    "skills",
     "steer",
+    "btw",
+    "perm",
+    "lsp",
     "quit",
     "exit",
 ];
@@ -219,11 +230,44 @@ mod tests {
             "edit",
             "retry",
             "status",
+            "context",
+            "compact",
+            "rewind",
+            "undo",
+            "skills",
             "steer",
+            "btw",
+            "perm",
+            "lsp",
             "find",
             "yank",
         ] {
             assert_eq!(slash_route(name, &[]), SlashRoute::Local, "/{name}");
+        }
+    }
+
+    #[test]
+    fn steer_stays_local_even_if_a_pack_claims_it() {
+        let packs = [pack("steer")];
+        assert_eq!(slash_route("steer", &packs), SlashRoute::Local);
+        assert_eq!(slash_route("steer", &[]), SlashRoute::Local);
+    }
+
+    #[test]
+    fn local_commands_win_over_registered_pack_names() {
+        let packs = [
+            pack("context"),
+            pack("compact"),
+            pack("rewind"),
+            pack("undo"),
+            pack("skills"),
+            pack("perm"),
+            pack("lsp"),
+        ];
+        for name in [
+            "context", "compact", "rewind", "undo", "skills", "perm", "lsp",
+        ] {
+            assert_eq!(slash_route(name, &packs), SlashRoute::Local, "/{name}");
         }
     }
 
@@ -233,6 +277,11 @@ mod tests {
         let all = slash_completions("", &packs);
         assert!(all.contains(&"effort".into()), "{all:?}");
         assert!(all.contains(&"model".into()), "{all:?}");
+        for name in [
+            "context", "compact", "rewind", "undo", "skills", "perm", "lsp",
+        ] {
+            assert!(all.contains(&name.to_string()), "{name}: {all:?}");
+        }
         assert!(all.contains(&"review".into()), "{all:?}");
         assert_eq!(slash_completions("eff", &packs), vec!["effort".to_string()]);
         assert!(slash_completions("bogus", &packs).is_empty());

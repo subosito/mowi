@@ -131,9 +131,16 @@ impl Theme {
         }
     }
 
-    /// Header / sunk chrome (`mantle`).
+    /// Header / sunk chrome (`mantle`). Not used for the header/status rails —
+    /// those sit on the terminal default so a second fill cannot misalign.
     pub fn mantle(self) -> Style {
         self.bg(mocha::MANTLE)
+    }
+
+    /// Terminal default ground (`Color::Reset`). Clears a previous document
+    /// fill so the header and status rails do not keep a mismatched wash.
+    pub fn terminal(self) -> Style {
+        Style::default().bg(Color::Reset)
     }
 
     /// Deepest ground, for the modal scrim (`crust`).
@@ -152,16 +159,16 @@ impl Theme {
     }
 
     pub fn header_bg(self) -> Style {
-        self.mantle()
+        self.terminal()
     }
 
-    /// Status bar ground. Same sunk tone as the header so the frame reads as a
-    /// document held between two rails.
+    /// Status bar ground. Terminal default, same as the header — a second
+    /// fill here is what read as a misaligned top/bottom panel.
     pub fn footer_bg(self) -> Style {
         if self.colored {
-            Style::default().bg(mocha::MANTLE).fg(mocha::SUBTEXT0)
+            Style::default().bg(Color::Reset).fg(mocha::SUBTEXT0)
         } else {
-            Style::default()
+            self.terminal()
         }
     }
 
@@ -210,16 +217,17 @@ impl Theme {
         if self.colored {
             Style::default()
                 .fg(mocha::MAUVE)
-                .bg(mocha::MANTLE)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         }
     }
 
+    /// Historical user prompt. Peach, not blue: blue collided with tool
+    /// chrome and read as a leftover composer artifact on the band.
     pub fn user(self) -> Style {
         if self.colored {
-            Style::default().fg(mocha::BLUE).patch(self.user_bg())
+            Style::default().fg(mocha::PEACH).patch(self.user_bg())
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         }
@@ -297,12 +305,11 @@ impl Theme {
         }
     }
 
-    /// A status badge on the header/status ground.
+    /// A status badge on the header/status ground (terminal default).
     pub fn badge(self, tone: Tone) -> Style {
         if self.colored {
             Style::default()
                 .fg(tone.color())
-                .bg(mocha::MANTLE)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
@@ -560,13 +567,22 @@ mod tests {
             assert!(style.fg.is_none(), "fg leaked with NO_COLOR");
             assert!(style.bg.is_none(), "bg leaked with NO_COLOR");
         }
+        // Chrome rails use Reset (terminal default), not a palette wash.
+        assert!(t.header_bg().fg.is_none());
+        assert_eq!(t.header_bg().bg, Some(Color::Reset));
+        assert!(t.footer_bg().fg.is_none());
+        assert_eq!(t.footer_bg().bg, Some(Color::Reset));
     }
 
     #[test]
     fn colored_theme_grounds_the_frame() {
         let t = Theme { colored: true };
         assert_eq!(t.base().bg, Some(mocha::BASE));
-        assert_eq!(t.header().bg, Some(mocha::MANTLE));
+        assert_eq!(t.header_bg().bg, Some(Color::Reset));
+        assert_eq!(t.footer_bg().bg, Some(Color::Reset));
+        assert_eq!(t.header().bg, None);
+        assert_eq!(t.user().fg, Some(mocha::PEACH));
+        assert_ne!(t.user().fg, Some(mocha::BLUE));
     }
 
     #[test]

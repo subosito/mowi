@@ -7,9 +7,9 @@ operator experience**, not a subset that forgets permissions or resume.
 
 | Region | Behavior |
 |---|---|
-| Header | Left: `mowi`, workspace basename, `model (effort)`. Right: token chip / context gauge when they fit, then safety chips (write/shell, ask/auto). Usage peels before identity; safety never drops. Full session id lives on the status bar when status and the minimum `?` hint fit; long hints degrade around it. |
+| Header | Left: `mowi`, workspace basename, `model (effort)`. Right: safety chips (write/shell, ask/auto), then ` · ` and the token chip, then the context gauge at the far right when it fits. The ` · ` before metrics is omitted when both are hidden. Usage peels before identity; safety never drops. Session id is never a header or status-bar chip; the help overlay titles the full id. |
 | Transcript | User blocks (soft fill), assistant markdown, one compact tool line per call — a turn's calls collapse into a single `⚙ N tool calls` row (Esc collapses an expanded group). Edits = inline review cards (−/+). |
-| Activity band | Only while busy: spinner, verb (“searching · grep · loop.go”), elapsed. |
+| Status bar | Idle: `● idle`. Busy: spinner, elapsed, verb (and typing pulse while tokens land) on this row — no separate activity band. Hints flush right and degrade before state does. |
 | Input | Sits on the document ground with a horizontal inset and no box. Enter sends; busy queues. `/steer` redirects the running turn. |
 | Welcome | Splash, dismisses on any key. Short panes drop the tagline/effort first so access and `type to begin` still fit. |
 | Min size | 40×10; below that a size warning, not a broken frame. |
@@ -20,14 +20,13 @@ operator experience**, not a subset that forgets permissions or resume.
 |---|---|
 | Enter | send (queue if busy) |
 | ctrl+j | newline (input grows 1–10 rows) |
-| pgup / pgdn | scroll transcript (never rewrites the prompt) |
+| ↑ / ↓, pgup / pgdn | scroll transcript (never rewrites the prompt) |
 | Esc | dismiss overlay, else collapse tool calls, else cancel turn, else ignore |
 | ctrl+l | clear transcript (UI-local; Engine history remains) |
 | shift+tab | ask ↔ auto (`perm.set`) |
 | ctrl+p | expand the last peer buffer in an overlay |
 | ctrl+/ or `?` on empty | help overlay (local keys + `slash.list`) |
 | ctrl+c | quit (cancel first if busy) |
-| Arrow-up on empty | edit last prompt (does not scroll) |
 | home / end | cursor to start / end of input |
 | left / right | move cursor |
 | delete | delete forward |
@@ -45,11 +44,11 @@ Host-side (this crate, or slash if registered):
 
 | Command | Notes |
 |---|---|
-| `/steer <text>` | RPC `steer` while busy |
+| `/steer <text>` | RPC `steer` while busy (async; local error when idle or unsupported) |
 | `/status` | RPC `status` + last usage; show peer share |
 | `/sessions` | RPC `sessions` — overlay list + `mowi --session <id>` hint |
 | `/search` | UI-local find in painted transcript |
-| `/copy` `/retry` `/edit` | UI-local / re-`prompt` |
+| `/copy` `/retry` `/edit` | UI-local / re-`prompt` (`/edit` loads the last user prompt) |
 | `/clear` | UI-local: clear painted transcript (engine history kept) |
 | `/quit` `/exit` `/q` | UI-local quit (cancels an in-flight turn first) |
 | `/model` | UI-local: `model.list` overlay (enter to set), or `/model gpt-5-mini` → `model.set` |
@@ -116,16 +115,18 @@ when the rows share enough affix to make a word-level edit meaningful.
 Follow-bottom until the user scrolls up; rebuild visible window on scroll
 (Go bug: placeholders stayed blank). Do not GC unreadied seed.
 
-Transcript scroll is **PgUp / PgDn** only. Those keys never recall or rewrite
-the composer. Arrow-up on empty input is the only history-recall binding.
-`ctrl+u` / `ctrl+d` are unbound (they do not scroll and they do not type).
+Transcript scroll is **↑ / ↓** and **PgUp / PgDn**. Those keys never recall or
+rewrite the composer. Last-prompt recall is `/edit` only. `ctrl+u` / `ctrl+d`
+are unbound (they do not scroll and they do not type). The client does not
+capture the mouse (native select/copy); if a wheel event still arrives it
+scrolls the transcript only.
 
 ## Theme / a11y
 
 - Default theme name: catppuccin-mocha (chroma-compatible idea)
 - `NO_COLOR=1` — glyphs still distinct (◇ ⚙ ✕ ▲)
 - `MOW_NO_ANIM=1` — still spinner; elapsed still ticks
-- Native terminal selection/copy (no mouse capture; scroll with pgup/pgdn)
+- Native terminal selection/copy (no mouse capture; scroll with ↑↓ / pgup/pgdn)
 - Not screen-reader complete; keyboard-complete is required
 
 ## Config (Go: `extensions.tui`)

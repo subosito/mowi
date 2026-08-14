@@ -12,9 +12,19 @@ use ratatui::{
     style::{Color, Modifier},
 };
 
+use std::time::{Duration, UNIX_EPOCH};
+
 use crate::app::{App, Entry, draw};
 use crate::rpc::{ContextUsage, SessionInfo};
 use crate::theme::Theme;
+
+/// Fixed UTC `04:02` so snapshot frames do not change every run.
+fn snapshot_user(text: impl Into<String>) -> Entry {
+    Entry::User {
+        text: text.into(),
+        at: Some(UNIX_EPOCH + Duration::from_secs(4 * 3600 + 2 * 60)),
+    }
+}
 
 /// Every scene the snapshot tool can paint.
 pub const SCENES: [&str; 8] = [
@@ -70,11 +80,11 @@ pub fn scene(name: &str) -> App {
             app.welcome = true;
         }
         "help" => {
-            app.entries.push(Entry::User("what changed?".into()));
+            app.entries.push(snapshot_user("what changed?"));
             app.overlay = crate::app::Overlay::help();
         }
         "permission" => {
-            app.entries.push(Entry::User("run the tests".into()));
+            app.entries.push(snapshot_user("run the tests"));
             app.entries.push(Entry::Assistant(
                 "Running the suite now — this needs shell access.".into(),
             ));
@@ -87,7 +97,7 @@ pub fn scene(name: &str) -> App {
         }
         "busy" => {
             app.entries
-                .push(Entry::User("refactor the transcript renderer".into()));
+                .push(snapshot_user("refactor the transcript renderer"));
             app.entries.push(Entry::Tool {
                 name: "read src/app.rs".into(),
                 duration_ms: Some(180),
@@ -102,7 +112,7 @@ pub fn scene(name: &str) -> App {
                 .push_str("Looking at the wrapper now. The current implementation");
         }
         "diff" => {
-            app.entries.push(Entry::User("fix the off-by-one".into()));
+            app.entries.push(snapshot_user("fix the off-by-one"));
             app.entries.push(Entry::Assistant(
                 "The guard used `<=` where the slice is exclusive.\n\n\
                  ```diff\n--- a/src/app.rs\n+++ b/src/app.rs\n@@ -212,7 +212,7 @@\n \
@@ -117,8 +127,7 @@ pub fn scene(name: &str) -> App {
         // Regression scene: a chained shell command arriving as a tool name.
         // Raw, this wrapped to four rows and pushed the user prompt off pane.
         "shellblob" => {
-            app.entries
-                .push(Entry::User("what is in this repo?".into()));
+            app.entries.push(snapshot_user("what is in this repo?"));
             app.entries.push(Entry::Tool {
                 name: "bash ls -la; echo ----; cat AGENTS.md 2>/dev/null || \
                        cat CLAUDE.md 2>/dev/null; git log --oneline | head -20"
@@ -132,7 +141,7 @@ pub fn scene(name: &str) -> App {
         // Tool-grouping scene: one turn's four tool calls collapse to a
         // single row; an expanded group below shows the drill-down state.
         "tools" => {
-            app.entries.push(Entry::User("fix the flaky test".into()));
+            app.entries.push(snapshot_user("fix the flaky test"));
             app.entries.push(Entry::Tools {
                 tools: vec![
                     ("read src/app.rs".into(), Some(120)),
@@ -154,13 +163,13 @@ pub fn scene(name: &str) -> App {
             ));
         }
         "narrow" => {
-            app.entries.push(Entry::User("status?".into()));
+            app.entries.push(snapshot_user("status?"));
             app.entries
                 .push(Entry::Assistant("All green: 102 tests passing.".into()));
         }
         _ => {
             app.entries
-                .push(Entry::User("summarise the architecture doc".into()));
+                .push(snapshot_user("summarise the architecture doc"));
             app.entries.push(Entry::Assistant(
                 "## Split\n\n\
                  The Engine is **headless** (`mow rpc`); this client only paints.\n\n\

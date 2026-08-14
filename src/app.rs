@@ -3,13 +3,19 @@
 //! The app owns no Engine. Every state change is either a local key edit or a
 //! message from the `mow rpc` child (`rpc::Client`).
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::VecDeque;
+use std::io::Write;
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+};
 use ratatui::{
     Frame, Terminal,
     backend::Backend,
@@ -27,8 +33,10 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::render::{Segment, diff_title, markdown_lines, split_markdown_and_diffs};
 use crate::rpc::{
-    Client, ContextUsage, EffortList, Error, ModelList, Notification, PermissionRequest,
-    SessionInfo, SessionSummary, SlashCommand, TranscriptMessage, token_delta,
+    Client, ContextUsage, EVENT_LSP_DIAGNOSTICS, EffortList, Error, LspDiagnostic, LspProblems,
+    ModelList, Notification, PermissionRequest, SessionInfo, SessionSummary, SlashCommand,
+    TranscriptMessage, decode_lsp_diagnostics, decode_rewind, extract_thinking, reasoning_delta,
+    token_delta,
 };
 use crate::slash::{
     SlashRoute, canonical_slash, slash_completions, slash_route, unknown_slash_message,
@@ -48,6 +56,23 @@ const CTX_FOOTER_PCT: f64 = 60.0;
 /// session identity: knowing *which* model you are talking to outranks knowing
 /// how full its window is.
 const GAUGE_MIN_COLS: u16 = 100;
+/// Extra transcript rows materialized above and below the viewport so a
+/// PageUp does not have to rebuild the document from scratch.
+const TRANSCRIPT_OVERSCAN: usize = 16;
+/// Cached painted entries kept around the viewport. Enough for a burst of
+/// scroll keys without retaining a whole resumed session.
+const TRANSCRIPT_CACHE_ENTRIES: usize = 48;
+/// Bound work per event-loop turn so a continuously streaming RPC cannot
+/// starve input and painting. Remaining notifications are handled next turn.
+const NOTIFICATION_BATCH: usize = 256;
+/// Likewise, a held key must not keep the input-drain loop alive forever.
+const INPUT_BATCH: usize = 64;
+/// Newest retained LSP batches (one per path).
+const MAX_LSP_PROBLEM_PATHS: usize = 10;
+/// `/lsp` dumps at most this many newest batches.
+const MAX_LSP_RECENT_BATCHES: usize = 5;
+/// `/lsp` dumps at most this many transcript lines.
+const MAX_LSP_RECENT_LINES: usize = 40;
 
 /// Compact token count for status text: 950 -> "950", 12_300 -> "12.3k".
 fn human_tokens(n: u64) -> String {
@@ -65,7 +90,13 @@ fn human_tokens(n: u64) -> String {
 /// One painted transcript block.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Entry {
-    User(String),
+    /// Operator prompt. `at` is the wall clock when *this client* recorded
+    /// it. Resumed engine history has no per-message time on the wire, so
+    /// those entries stay `None` rather than inventing a stamp.
+    User {
+        text: String,
+        at: Option<SystemTime>,
+    },
     Assistant(String),
     Note(String),
     Tool {
@@ -79,6 +110,32 @@ pub enum Entry {
         tools: Vec<(String, Option<u64>)>,
         expanded: bool,
     },
+}
+
+impl Entry {
+    /// A prompt recorded now. Snapshots and resumed history should set `at`
+    /// explicitly (`Some` fixed, or `None`) instead of calling this.
+    pub fn user(text: impl Into<String>) -> Self {
+        Entry::User {
+            text: text.into(),
+            at: Some(SystemTime::now()),
+        }
+    }
+}
+
+/// UTC `HH:MM` for a recorded user prompt. UTC keeps the stamp timezone-stable
+/// without a datetime crate; resumed entries omit it entirely.
+fn format_user_stamp(at: SystemTime) -> String {
+    let secs = at.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let mins = (secs / 60) % (24 * 60);
+    format!("{:02}:{:02}", mins / 60, mins % 60)
+}
+
+fn user_display_text(text: &str, at: Option<SystemTime>) -> String {
+    match at {
+        Some(at) => format!("{} {text}", format_user_stamp(at)),
+        None => text.to_string(),
+    }
 }
 
 /// Host and delegated token usage for the header chip.
@@ -223,12 +280,81 @@ enum IdentityChip {
     Model(String),
 }
 
-/// Right-aligned usage chips, least important first. Safety sits past these
-/// and never drops.
+/// Right-side usage chips, least important first. Tokens sit immediately
+/// before the gauge; the gauge is the far-rightmost chip when shown.
+/// Safety never drops.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum MetricChip {
     Tokens(String),
     Gauge(String),
+}
+
+/// Painted lines for one transcript block, reused across the 50ms redraws.
+#[derive(Debug, Clone)]
+struct CachedPaint {
+    bytes: usize,
+    expanded: bool,
+    lines: Vec<Line<'static>>,
+}
+
+/// Viewport-local paint cache. Width/theme changes drop it; entries are
+/// evicted in bulk past [`TRANSCRIPT_CACHE_ENTRIES`].
+#[derive(Debug, Default)]
+struct TranscriptCache {
+    width: u16,
+    colored: bool,
+    entries: HashMap<usize, CachedPaint>,
+    live: Option<CachedPaint>,
+}
+
+impl TranscriptCache {
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.live = None;
+    }
+
+    fn matches(&self, width: u16, colored: bool) -> bool {
+        self.width == width && self.colored == colored
+    }
+}
+
+/// Per-entry wrap estimate, keyed by the same fingerprint as the paint cache.
+#[derive(Debug, Clone, Copy)]
+struct CachedHeight {
+    bytes: usize,
+    expanded: bool,
+    rows: usize,
+}
+
+/// Document-height cache. `estimated_total_lines` used to re-wrap every
+/// entry (and the whole live buffer) on every 50ms tick; a buried 2k-line
+/// answer made that the dominant cost even when the window never painted it.
+#[derive(Debug, Default)]
+struct HeightCache {
+    width: u16,
+    entries: Vec<CachedHeight>,
+    live_bytes: usize,
+    live_height: usize,
+    live_last_line_start: usize,
+    live_last_line_cols: usize,
+    live_last_line_head: [u8; 8],
+    live_last_line_head_len: u8,
+}
+
+impl HeightCache {
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.invalidate_live();
+    }
+
+    fn invalidate_live(&mut self) {
+        self.live_bytes = 0;
+        self.live_height = 0;
+        self.live_last_line_start = 0;
+        self.live_last_line_cols = 0;
+        self.live_last_line_head = [0; 8];
+        self.live_last_line_head_len = 0;
+    }
 }
 
 /// UI state. `draw` is pure over this struct so `TestBackend` can assert on it.
@@ -275,6 +401,8 @@ pub struct App {
     pub perm_shown: Option<Instant>,
     /// Agent whose buffer `ctrl+p` expands.
     pub peer_focus: Option<String>,
+    /// Peer overlay scroll offset measured upward from the newest output.
+    pub peer_scroll: u16,
     pub animate: bool,
     /// Reasoning effort from `effort.list` / `effort.set`.
     pub effort: String,
@@ -287,6 +415,26 @@ pub struct App {
     /// Ratatui frame counter, used for the busy spinner.
     pub tick: u64,
     pub scrollbar_state: ScrollbarState,
+    transcript_cache: RefCell<TranscriptCache>,
+    height_cache: RefCell<HeightCache>,
+    /// Local RPC operation currently using `slash_rx` (kept off the UI thread).
+    pending_local: Option<String>,
+    /// Operator cancelled the in-flight turn; queued follow-ups must not start.
+    cancelled: bool,
+    /// Last-user text from an in-flight `rewind`, used after transcript refresh.
+    rewind_user: Option<String>,
+    /// OSC52 payload to flush on the next terminal write (not painted).
+    pending_osc52: Option<String>,
+    /// Raw host-token accumulator for `<think>` extraction (never painted).
+    think_raw: String,
+    /// Reasoning channel or an open think tag is armed — status says thinking.
+    thinking: bool,
+    /// Newest LSP batch per path, newest first, capped at `MAX_LSP_PROBLEM_PATHS`.
+    lsp_problems: Vec<LspProblems>,
+    /// `/compact` requested while a non-control compact would block the worker.
+    pending_compact: Option<i64>,
+    /// Methods the host answers while a prompt is in flight (empty = unknown).
+    control_caps: Vec<String>,
 }
 
 impl Default for App {
@@ -322,6 +470,7 @@ impl Default for App {
             overlay: Overlay::None,
             perm_shown: None,
             peer_focus: None,
+            peer_scroll: 0,
             animate: std::env::var_os("MOW_NO_ANIM").is_none(),
             effort: String::new(),
             ctx: None,
@@ -329,6 +478,17 @@ impl Default for App {
             cursor: 0,
             tick: 0,
             scrollbar_state: ScrollbarState::default(),
+            transcript_cache: RefCell::new(TranscriptCache::default()),
+            height_cache: RefCell::new(HeightCache::default()),
+            pending_local: None,
+            cancelled: false,
+            rewind_user: None,
+            pending_osc52: None,
+            think_raw: String::new(),
+            thinking: false,
+            lsp_problems: Vec::new(),
+            pending_compact: None,
+            control_caps: Vec::new(),
         }
     }
 }
@@ -347,7 +507,10 @@ impl App {
         app.entries = messages
             .into_iter()
             .map(|message| match message.role.as_str() {
-                "user" => Entry::User(message.content),
+                "user" => Entry::User {
+                    text: message.content,
+                    at: None,
+                },
                 "assistant" => Entry::Assistant(message.content),
                 _ => Entry::Note(format!("{}: {}", message.role, message.content)),
             })
@@ -376,6 +539,48 @@ impl App {
         if let Some(effort) = status.get("effort").and_then(Value::as_str) {
             self.effort = effort.to_string();
         }
+        if let Some(workspace) = status.get("workspace").and_then(Value::as_str)
+            && !workspace.is_empty()
+        {
+            self.session.workspace = workspace.to_string();
+        }
+        if let Some(session_id) = status.get("session_id").and_then(Value::as_str)
+            && !session_id.is_empty()
+        {
+            self.session.session_id = session_id.to_string();
+        }
+    }
+
+    /// Curated `/status` note: chips the operator already sees, not raw JSON.
+    pub fn status_summary(&self) -> String {
+        let mut bits = Vec::new();
+        if !self.session.model.is_empty() {
+            bits.push(self.session.model.clone());
+        }
+        let workspace = workspace_basename(&self.session.workspace);
+        if !workspace.is_empty() {
+            bits.push(workspace);
+        }
+        bits.push(format!("perm {}", self.mode_chip()));
+        bits.push(self.capability_chip());
+        if !self.effort.is_empty() {
+            bits.push(format!("effort {}", self.effort));
+        }
+        if self.busy {
+            bits.push("busy".into());
+        }
+        let mut lines = vec![bits.join(" · ")];
+        let ctx = self.context_summary();
+        if ctx != "context: unknown" {
+            lines.push(ctx);
+        }
+        if self.usage.total() > 0 || self.usage.peer_tokens > 0 {
+            lines.push(self.usage.chip());
+        }
+        if !self.session.session_id.is_empty() {
+            lines.push(format!("session {}", self.session.session_id));
+        }
+        lines.join("\n")
     }
 
     /// Show the model catalog overlay and keep the header chip in sync.
@@ -421,6 +626,18 @@ impl App {
         self.caps = methods.to_vec();
     }
 
+    /// Record methods the host answers while a prompt is in flight.
+    pub fn set_control_methods(&mut self, methods: &[String]) {
+        self.control_caps = methods.to_vec();
+    }
+
+    /// `compact` is a worker method on current hosts unless advertised as control.
+    pub fn compact_is_control(&self) -> bool {
+        self.control_caps
+            .iter()
+            .any(|method| method.eq_ignore_ascii_case("compact"))
+    }
+
     /// Feature-detect a method; an empty list (older server) means assume yes.
     pub fn supports(&self, method: &str) -> bool {
         self.caps.is_empty() || self.caps.iter().any(|m| m == method)
@@ -429,6 +646,54 @@ impl App {
     /// Store a `context` result for the gauge.
     pub fn apply_context(&mut self, usage: &ContextUsage) {
         self.ctx = Some(usage.clone());
+    }
+
+    /// Keep the newest batch per path and paint one summary line — not every finding.
+    fn ingest_lsp_problems(&mut self, problems: LspProblems) {
+        self.lsp_problems
+            .retain(|existing| existing.path != problems.path);
+        self.lsp_problems.insert(0, problems.clone());
+        if self.lsp_problems.len() > MAX_LSP_PROBLEM_PATHS {
+            self.lsp_problems.truncate(MAX_LSP_PROBLEM_PATHS);
+        }
+        let note = format!("lsp · {} · {} problem(s)", problems.path, problems.count);
+        self.status = note.clone();
+        self.entries.push(Entry::Note(note));
+    }
+
+    /// Dump retained batches without replaying an unbounded session transcript.
+    fn show_lsp_problems(&mut self) {
+        if self.lsp_problems.is_empty() {
+            self.status = "lsp · none".into();
+            self.entries.push(Entry::Note("lsp · none".into()));
+            return;
+        }
+        let mut lines = 0usize;
+        let mut batches = 0usize;
+        let mut notes = Vec::new();
+        for problems in &self.lsp_problems {
+            if batches >= MAX_LSP_RECENT_BATCHES || lines >= MAX_LSP_RECENT_LINES {
+                break;
+            }
+            notes.push(format!(
+                "lsp · {} · {} problem(s)",
+                problems.path, problems.count
+            ));
+            lines += 1;
+            for diagnostic in &problems.diagnostics {
+                if lines >= MAX_LSP_RECENT_LINES {
+                    break;
+                }
+                notes.push(lsp_diagnostic_text(&problems.path, diagnostic));
+                lines += 1;
+            }
+            batches += 1;
+        }
+        if batches < self.lsp_problems.len() || lines >= MAX_LSP_RECENT_LINES {
+            notes.push("lsp · …older omitted".into());
+        }
+        self.status = format!("lsp · {} file(s)", batches);
+        self.entries.push(Entry::Note(notes.join("\n")));
     }
 
     /// One-line context summary, e.g. "context: 12.3k / 200k (6%)".
@@ -520,6 +785,7 @@ impl App {
     }
 
     /// Right-side usage chips in **drop order**: tokens first, then the gauge.
+    /// Tokens peel first even though they paint immediately before the gauge.
     ///
     /// Below `GAUGE_MIN_COLS` the meter is not offered at all, so leftover
     /// columns go to identity and safety rather than a bar.
@@ -584,60 +850,74 @@ impl App {
         spans
     }
 
-    fn header_metric_spans(&self, metrics: &[MetricChip]) -> Vec<Span<'static>> {
-        let mut groups: Vec<Vec<Span<'static>>> = Vec::new();
-        for chip in metrics {
-            match chip {
-                MetricChip::Tokens(text) => groups.push(vec![Span::styled(
+    fn header_token_spans(&self, metrics: &[MetricChip]) -> Vec<Span<'static>> {
+        metrics
+            .iter()
+            .find_map(|chip| match chip {
+                MetricChip::Tokens(text) => Some(vec![Span::styled(
                     text.clone(),
                     self.theme.note().patch(self.theme.header_bg()),
                 )]),
-                MetricChip::Gauge(text) => groups.push(vec![Span::styled(
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
+    fn header_gauge_spans(&self, metrics: &[MetricChip]) -> Vec<Span<'static>> {
+        metrics
+            .iter()
+            .find_map(|chip| match chip {
+                MetricChip::Gauge(text) => Some(vec![Span::styled(
                     text.clone(),
                     self.theme
                         .badge(self.context_tone())
                         .patch(self.theme.header_bg()),
                 )]),
-            }
-        }
-        let mut spans = Vec::new();
-        for (i, group) in groups.into_iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::styled(" · ", self.theme.header()));
-            }
-            spans.extend(group);
-        }
-        spans
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 
-    /// Header as spans. Left is identity only. Usage/gauge sit right-aligned
-    /// against the safety chips and drop before identity does. Safety never
-    /// drops. Session id is not painted here.
+    /// Header as spans. Left is identity only. Token usage sits immediately
+    /// before the context gauge; the gauge is the far-rightmost chip
+    /// whenever it is shown. A ` · ` joins safety to the first metric and
+    /// is omitted when both metrics are hidden. Usage drops before
+    /// identity. Safety never drops. Session id is not painted here.
     pub fn header_line(&self, width: u16) -> Line<'static> {
         let safety = format!("{} · {}", self.capability_chip(), self.mode_chip());
         let mut identity = self.identity_chips();
         let mut metrics = self.metric_chips(width);
         let width = width as usize;
         let safety_w = Span::raw(safety.as_str()).width();
+        let chip = self.theme.chip().patch(self.theme.header_bg());
         loop {
             let left = self.header_identity_spans(&identity);
-            let metric_spans = self.header_metric_spans(&metrics);
+            let token_spans = self.header_token_spans(&metrics);
+            let gauge_spans = self.header_gauge_spans(&metrics);
             let left_w: usize = left.iter().map(Span::width).sum();
-            let metric_w: usize = metric_spans.iter().map(Span::width).sum();
-            let gap = if metric_w > 0 { 2 } else { 0 };
-            let right_w = metric_w + gap + safety_w;
+            let token_w: usize = token_spans.iter().map(Span::width).sum();
+            let gauge_w: usize = gauge_spans.iter().map(Span::width).sum();
+            let sep = if token_w > 0 || gauge_w > 0 {
+                " · "
+            } else {
+                ""
+            };
+            let sep_w = Span::raw(sep).width();
+            let metric_gap = if token_w > 0 && gauge_w > 0 { 2 } else { 0 };
+            let right_w = safety_w + sep_w + token_w + metric_gap + gauge_w;
             if left_w + right_w <= width || (identity.is_empty() && metrics.is_empty()) {
                 let pad = width.saturating_sub(left_w + right_w);
                 let mut spans = left;
                 spans.push(Span::styled(" ".repeat(pad), self.theme.header_bg()));
-                spans.extend(metric_spans);
-                if gap > 0 {
+                spans.push(Span::styled(safety, chip));
+                if !sep.is_empty() {
+                    spans.push(Span::styled(sep, chip));
+                }
+                spans.extend(token_spans);
+                if metric_gap > 0 {
                     spans.push(Span::styled("  ", self.theme.header_bg()));
                 }
-                spans.push(Span::styled(
-                    safety,
-                    self.theme.chip().patch(self.theme.header_bg()),
-                ));
+                spans.extend(gauge_spans);
                 return Line::from(spans);
             }
             if !metrics.is_empty() {
@@ -678,15 +958,11 @@ impl App {
             }
         };
 
-        // The activity band owns the live clock (spinner, elapsed, pulse).
-        // The footer names the state — idle, or the current verb when busy —
-        // so the two rows do not tick two clocks.
+        // One live clock, on this row. Busy owns spinner + elapsed + verb
+        // (and the typing pulse while tokens land). Idle is a state light.
+        // Session identity lives in the help overlay, not here.
         if self.busy {
-            left.push(Span::styled("● ", self.theme.badge(Tone::Active)));
-            left.push(Span::styled(
-                clip_display(self.status_or_default(), 28),
-                self.theme.badge(Tone::Active),
-            ));
+            left.extend(self.live_clock_spans());
         } else {
             left.push(Span::styled("● ", self.theme.badge(Tone::Ok)));
             left.push(Span::styled("idle", self.theme.note()));
@@ -699,7 +975,7 @@ impl App {
                 self.theme.badge(Tone::Warn),
             ));
         }
-        // Idle-only news: while busy the verb above already carries status.
+        // Idle-only news: while busy the verb already carries status.
         if !self.status.is_empty() && !self.busy {
             sep(&mut left);
             let tone = if self.peers.is_empty() {
@@ -726,21 +1002,8 @@ impl App {
         }
 
         let hints = self.footer_hints();
-        let mut left_w: usize = left.iter().map(Span::width).sum();
+        let left_w: usize = left.iter().map(Span::width).sum();
         let width = width as usize;
-        let min_hint_w = Span::raw("?").width();
-
-        // Full session id outranks long hints. Hide it only when status plus
-        // the minimum `?` cannot take ` · <id>` without evicting either.
-        let session_id = self.session.session_id.as_str();
-        if !session_id.is_empty() {
-            let extra = 3 + Span::raw(session_id).width();
-            if left_w + extra + min_hint_w + 2 <= width {
-                sep(&mut left);
-                left.push(Span::styled(session_id.to_string(), self.theme.note()));
-                left_w = left.iter().map(Span::width).sum();
-            }
-        }
 
         let mut chosen_hint = None;
         for hint in hints {
@@ -775,7 +1038,7 @@ impl App {
             "enter send"
         };
         vec![
-            format!("{enter} · esc cancel · pgup/pgdn scroll · ? help"),
+            format!("{enter} · esc cancel · ↑↓ scroll · ? help"),
             format!("{enter} · esc cancel · ? help"),
             "enter · esc · ?".to_string(),
             "?".to_string(),
@@ -815,10 +1078,10 @@ impl App {
         out
     }
 
-    fn entry_lines<'a>(&self, entry: &'a Entry) -> Vec<Line<'a>> {
+    fn entry_lines(&self, entry: &Entry) -> Vec<Line<'static>> {
         let width = self.last_view_w.max(8) as usize;
         match entry {
-            Entry::User(t) => self.user_lines(t),
+            Entry::User { text, at } => self.user_lines(text, *at),
             Entry::Assistant(t) => self.assistant_lines(t),
             Entry::Note(t) => {
                 wrap_styled_line(Line::styled(t.to_string(), self.theme.note()), width)
@@ -892,21 +1155,27 @@ impl App {
 
     /// User prompt as a full-width filled band: accent bar, padded body, blank
     /// rows above and below so it reads as a message, not a leftover prompt.
-    fn user_lines(&self, text: &str) -> Vec<Line<'static>> {
+    /// A recorded `at` becomes an inline muted `HH:MM` on the first row.
+    fn user_lines(&self, text: &str, at: Option<SystemTime>) -> Vec<Line<'static>> {
         let width = self.last_view_w.max(8) as usize;
-        let blank = self.user_band_row("", width);
+        let stamp = at.map(format_user_stamp);
+        let display = user_display_text(text, at);
+        let blank = self.user_band_row("", width, None);
         let mut out = vec![blank.clone()];
-        for raw in text.split('\n') {
+        let mut first = true;
+        for raw in display.split('\n') {
             let inner = width.saturating_sub(3).max(1); // accent + gutters
             for chunk in wrap_cols(raw, inner) {
-                out.push(self.user_band_row(&chunk, width));
+                let row_stamp = if first { stamp.as_deref() } else { None };
+                first = false;
+                out.push(self.user_band_row(&chunk, width, row_stamp));
             }
         }
         out.push(blank);
         out
     }
 
-    fn user_band_row(&self, body: &str, width: usize) -> Line<'static> {
+    fn user_band_row(&self, body: &str, width: usize, stamp: Option<&str>) -> Line<'static> {
         let mut spans = Vec::new();
         // A saturated one-column rail on the left edge. This is the only
         // full-height accent in the transcript, so scanning up the pane the
@@ -922,13 +1191,33 @@ impl App {
             format!(" {body}")
         };
         let text: String = text.chars().take(room).collect();
-        spans.push(Span::styled(text, self.theme.user()));
+        if let Some(stamp) = stamp.filter(|stamp| text.contains(*stamp)) {
+            let muted = format!(" {stamp} ");
+            let (head, tail) = if let Some(rest) = text.strip_prefix(muted.as_str()) {
+                (muted, rest.to_string())
+            } else if let Some(rest) = text.strip_prefix(&format!(" {stamp}")) {
+                (format!(" {stamp}"), rest.to_string())
+            } else {
+                (String::new(), text)
+            };
+            if !head.is_empty() {
+                spans.push(Span::styled(
+                    head,
+                    self.theme.timing().patch(self.theme.user_bg()),
+                ));
+            }
+            if !tail.is_empty() {
+                spans.push(Span::styled(tail, self.theme.user()));
+            }
+        } else if !text.is_empty() {
+            spans.push(Span::styled(text, self.theme.user()));
+        }
         let painted: usize = spans.iter().map(Span::width).sum();
         let pad = width.saturating_sub(painted);
         if pad > 0 {
             spans.push(Span::styled(" ".repeat(pad), self.theme.user()));
         }
-        Line::from(spans).style(self.theme.user())
+        Line::from(spans).style(self.theme.user_bg())
     }
 
     /// Markdown by default; only fenced or bare unified-diff bodies become cards.
@@ -975,36 +1264,200 @@ impl App {
     }
 
     /// Materialize only a bounded transcript window for painting large sessions.
-    fn visible_transcript_lines(&self) -> (Vec<Line<'_>>, u16) {
-        const OVERSCAN_LINES: usize = 16;
-        let total_lines = self.estimated_total_lines();
+    ///
+    /// Entries (and live) that overlap the window are painted, then sliced to
+    /// the overlapping rows. A buried 2k-line answer must not become 2k
+    /// `Line`s on every PageUp, and a streaming `live` buffer must not be
+    /// re-parsed when the operator has scrolled into earlier history.
+    fn visible_transcript_lines(&self) -> (Vec<Line<'static>>, u16) {
+        let (total_lines, live_height) = self.ensure_heights();
+        let entries_height = total_lines.saturating_sub(live_height);
         let viewport = self.last_view_h.max(1) as usize;
         let target = if self.follow {
-            total_lines.saturating_sub(viewport + OVERSCAN_LINES)
+            total_lines.saturating_sub(viewport + TRANSCRIPT_OVERSCAN)
         } else {
-            (self.scroll as usize).saturating_sub(OVERSCAN_LINES)
+            (self.scroll as usize).saturating_sub(TRANSCRIPT_OVERSCAN)
         };
-        let window_end = target + viewport + (OVERSCAN_LINES * 2);
+        let window_end = target + viewport + (TRANSCRIPT_OVERSCAN * 2);
         let mut lines = Vec::new();
-        let mut base = 0usize;
+        let mut base = target;
         let mut cursor = 0usize;
-        for entry in &self.entries {
-            let entry_height = self.estimated_entry_lines(entry);
+        let entry_rows: Vec<usize> = self
+            .height_cache
+            .borrow()
+            .entries
+            .iter()
+            .map(|height| height.rows)
+            .collect();
+        for (index, entry_height) in entry_rows.into_iter().enumerate() {
             let entry_end = cursor + entry_height;
             if entry_end > target && cursor < window_end {
-                if lines.is_empty() {
-                    base = cursor;
-                }
-                lines.extend(self.entry_lines(entry));
-                lines.push(Line::raw(""));
+                self.push_entry_window(&mut lines, &mut base, index, cursor, target, window_end);
             }
             cursor = entry_end;
+            if cursor >= window_end {
+                break;
+            }
         }
-        if !self.live.is_empty() && cursor >= target {
-            lines.extend(self.assistant_lines(self.live.as_str()));
+        if live_height > 0 && entries_height < window_end && entries_height + live_height > target {
+            self.push_live_window(
+                &mut lines,
+                &mut base,
+                entries_height,
+                live_height,
+                target,
+                window_end,
+            );
         }
-        lines.extend(self.peer_lines());
+        if !self.peers.is_empty() {
+            let peer_at = entries_height + live_height;
+            if peer_at < window_end {
+                let painted = self.peer_lines();
+                push_window_slice(&mut lines, &mut base, peer_at, target, window_end, &painted);
+            }
+        }
         (lines, base.min(u16::MAX as usize) as u16)
+    }
+
+    fn push_entry_window(
+        &self,
+        out: &mut Vec<Line<'static>>,
+        base: &mut usize,
+        index: usize,
+        cursor: usize,
+        target: usize,
+        window_end: usize,
+    ) {
+        let (bytes, expanded) = match self.entries.get(index) {
+            Some(entry) => entry_fingerprint(entry),
+            None => return,
+        };
+        {
+            let cache = self.transcript_cache.borrow();
+            if cache.matches(self.last_view_w, self.theme.colored)
+                && let Some(hit) = cache.entries.get(&index)
+                && hit.bytes == bytes
+                && hit.expanded == expanded
+            {
+                push_window_slice_with_sep(out, base, cursor, target, window_end, &hit.lines);
+                return;
+            }
+        }
+        let painted = self.entry_lines(&self.entries[index]);
+        self.store_entry_paint(index, bytes, expanded, painted.clone());
+        push_window_slice_with_sep(out, base, cursor, target, window_end, &painted);
+    }
+
+    fn push_live_window(
+        &self,
+        out: &mut Vec<Line<'static>>,
+        base: &mut usize,
+        entries_height: usize,
+        live_height: usize,
+        target: usize,
+        window_end: usize,
+    ) {
+        let from = target.saturating_sub(entries_height);
+        let to = window_end.saturating_sub(entries_height).min(live_height);
+        let (painted, cursor) = self.live_window_lines(from, to, entries_height, live_height);
+        push_window_slice(out, base, cursor, target, window_end, &painted);
+    }
+
+    /// Paint the live overlap. A follow-mode tail only parses a source suffix
+    /// so a multi-thousand-line stream does not re-run markdown every tick.
+    fn live_window_lines(
+        &self,
+        from: usize,
+        to: usize,
+        entries_height: usize,
+        live_height: usize,
+    ) -> (Vec<Line<'static>>, usize) {
+        let need = to.saturating_sub(from).max(1);
+        let wants_tail = from > 0 && to + TRANSCRIPT_OVERSCAN >= live_height;
+        if wants_tail {
+            let width = self.last_view_w.max(8) as usize;
+            let source = live_tail_source(&self.live, need, width);
+            if source.len() < self.live.len() {
+                let painted = self.assistant_lines(source);
+                let tail_est = estimated_wrapped_lines(source, width) + 1;
+                let cursor = entries_height + live_height.saturating_sub(tail_est);
+                return (painted, cursor);
+            }
+        }
+        (self.cached_live_lines(), entries_height)
+    }
+
+    fn cached_live_lines(&self) -> Vec<Line<'static>> {
+        let bytes = self.live.len();
+        if let Some(lines) = self.cached_paint(true, 0, bytes, false) {
+            return lines;
+        }
+        let lines = self.assistant_lines(self.live.as_str());
+        self.store_live_paint(bytes, lines.clone());
+        lines
+    }
+
+    fn cached_paint(
+        &self,
+        live: bool,
+        index: usize,
+        bytes: usize,
+        expanded: bool,
+    ) -> Option<Vec<Line<'static>>> {
+        let cache = self.transcript_cache.borrow();
+        if !cache.matches(self.last_view_w, self.theme.colored) {
+            return None;
+        }
+        let hit = if live {
+            cache.live.as_ref()
+        } else {
+            cache.entries.get(&index)
+        }?;
+        if hit.bytes == bytes && hit.expanded == expanded {
+            Some(hit.lines.clone())
+        } else {
+            None
+        }
+    }
+
+    fn store_entry_paint(
+        &self,
+        index: usize,
+        bytes: usize,
+        expanded: bool,
+        lines: Vec<Line<'static>>,
+    ) {
+        let mut cache = self.transcript_cache.borrow_mut();
+        self.prepare_cache(&mut cache);
+        if cache.entries.len() >= TRANSCRIPT_CACHE_ENTRIES {
+            cache.entries.clear();
+        }
+        cache.entries.insert(
+            index,
+            CachedPaint {
+                bytes,
+                expanded,
+                lines,
+            },
+        );
+    }
+
+    fn store_live_paint(&self, bytes: usize, lines: Vec<Line<'static>>) {
+        let mut cache = self.transcript_cache.borrow_mut();
+        self.prepare_cache(&mut cache);
+        cache.live = Some(CachedPaint {
+            bytes,
+            expanded: false,
+            lines,
+        });
+    }
+
+    fn prepare_cache(&self, cache: &mut TranscriptCache) {
+        if !cache.matches(self.last_view_w, self.theme.colored) {
+            cache.clear();
+            cache.width = self.last_view_w;
+            cache.colored = self.theme.colored;
+        }
     }
 
     /// Height an entry will occupy once painted, in transcript rows.
@@ -1020,23 +1473,14 @@ impl App {
     /// that made this matter: it reported 1 row and painted four.
     fn estimated_entry_lines(&self, entry: &Entry) -> usize {
         let width = self.last_view_w.max(8) as usize;
-        // Rows a block of text needs once hard-wrapped into `inner` columns.
-        let wrapped = |text: &str, inner: usize| -> usize {
-            let inner = inner.max(1);
-            text.split('\n')
-                .map(|line| {
-                    let cols = line.width();
-                    if cols == 0 { 1 } else { cols.div_ceil(inner) }
-                })
-                .sum::<usize>()
-                .max(1)
-        };
         (match entry {
             // The user band reserves the accent rail plus its gutters, and
             // pads with a blank row above and below.
-            Entry::User(text) => wrapped(text, width.saturating_sub(3)) + 2,
-            Entry::Assistant(text) => wrapped(text, width),
-            Entry::Note(text) => wrapped(text, width),
+            Entry::User { text, at } => {
+                estimated_wrapped_lines(&user_display_text(text, *at), width.saturating_sub(3)) + 2
+            }
+            Entry::Assistant(text) => estimated_wrapped_lines(text, width),
+            Entry::Note(text) => estimated_wrapped_lines(text, width),
             Entry::Tool { name, duration_ms } => {
                 // Estimate against the *label*, not the raw name: the label is
                 // what gets painted, and it is bounded by TOOL_ARG_COLS.
@@ -1073,25 +1517,131 @@ impl App {
                     if total_ms > 0 {
                         text.push_str(&format!(" · {:.1}s", total_ms as f64 / 1000.0));
                     }
-                    wrapped(&text, width)
+                    estimated_wrapped_lines(&text, width)
                 }
             }
         }) + 1
     }
 
-    fn estimated_total_lines(&self) -> usize {
-        self.entries
-            .iter()
-            .map(|entry| self.estimated_entry_lines(entry))
-            .sum::<usize>()
-            + usize::from(!self.live.is_empty())
+    /// Live text is a real document block. Counting it as one row made
+    /// follow/scroll math treat a multi-thousand-line stream as a single
+    /// line, so every frame rematerialized the whole buffer.
+    fn estimated_live_lines(&self) -> usize {
+        self.ensure_heights().1
     }
 
-    /// The activity band: the single live readout for a running turn.
-    ///
-    /// This is the only place spinner, elapsed time and the typing pulse are
-    /// painted. The footer deliberately carries just the coarse state word, so
-    /// there is never a second clock ticking out of step with this one.
+    fn estimated_total_lines(&self) -> usize {
+        self.ensure_heights().0
+    }
+
+    /// `(total, live)` row counts, reused across the 50ms tick.
+    fn ensure_heights(&self) -> (usize, usize) {
+        let mut cache = self.height_cache.borrow_mut();
+        if cache.width != self.last_view_w {
+            cache.clear();
+            cache.width = self.last_view_w;
+        }
+        if cache.entries.len() > self.entries.len() {
+            cache.entries.truncate(self.entries.len());
+        }
+        for (index, entry) in self.entries.iter().enumerate() {
+            let (bytes, expanded) = entry_fingerprint(entry);
+            if cache
+                .entries
+                .get(index)
+                .is_some_and(|hit| hit.bytes == bytes && hit.expanded == expanded)
+            {
+                continue;
+            }
+            let rec = CachedHeight {
+                bytes,
+                expanded,
+                rows: self.estimated_entry_lines(entry),
+            };
+            if index < cache.entries.len() {
+                cache.entries[index] = rec;
+            } else {
+                cache.entries.push(rec);
+            }
+        }
+        let live = self.ensure_live_height(&mut cache);
+        let entries: usize = cache.entries.iter().map(|height| height.rows).sum();
+        (entries + live, live)
+    }
+
+    fn ensure_live_height(&self, cache: &mut HeightCache) -> usize {
+        if self.live.is_empty() {
+            cache.invalidate_live();
+            return 0;
+        }
+        let width = self.last_view_w.max(8) as usize;
+        if cache.live_bytes == self.live.len() && cache.live_height > 0 {
+            return cache.live_height;
+        }
+        if self.live_is_append(cache) {
+            self.extend_live_height(cache, width);
+        } else {
+            self.recompute_live_height(cache, width);
+        }
+        cache.live_height
+    }
+
+    fn live_is_append(&self, cache: &HeightCache) -> bool {
+        if cache.live_bytes == 0 || self.live.len() < cache.live_bytes {
+            return false;
+        }
+        if cache.live_last_line_start > cache.live_bytes {
+            return false;
+        }
+        if cache.live_last_line_start > 0
+            && self.live.as_bytes().get(cache.live_last_line_start - 1) != Some(&b'\n')
+        {
+            return false;
+        }
+        let head_len = cache.live_last_line_head_len as usize;
+        let start = cache.live_last_line_start;
+        let Some(slice) = self.live.get(start..start.saturating_add(head_len)) else {
+            return false;
+        };
+        slice.as_bytes() == &cache.live_last_line_head[..head_len]
+    }
+
+    fn recompute_live_height(&self, cache: &mut HeightCache, width: usize) {
+        cache.live_height = estimated_wrapped_lines(&self.live, width) + 1;
+        cache.live_bytes = self.live.len();
+        self.store_live_last_line(cache);
+    }
+
+    fn extend_live_height(&self, cache: &mut HeightCache, width: usize) {
+        let start = cache.live_last_line_start;
+        let old_last_rows = if cache.live_last_line_cols == 0 {
+            1
+        } else {
+            cache.live_last_line_cols.div_ceil(width.max(1))
+        };
+        let Some(tail) = self.live.get(start..) else {
+            self.recompute_live_height(cache, width);
+            return;
+        };
+        let new_tail = estimated_wrapped_lines(tail, width);
+        cache.live_height = cache.live_height.saturating_sub(old_last_rows) + new_tail;
+        cache.live_bytes = self.live.len();
+        self.store_live_last_line(cache);
+    }
+
+    fn store_live_last_line(&self, cache: &mut HeightCache) {
+        let start = self.live.rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let last = &self.live[start..];
+        cache.live_last_line_start = start;
+        cache.live_last_line_cols = last.width();
+        let bytes = last.as_bytes();
+        let n = bytes.len().min(8);
+        cache.live_last_line_head = [0; 8];
+        cache.live_last_line_head[..n].copy_from_slice(&bytes[..n]);
+        cache.live_last_line_head_len = n as u8;
+    }
+
+    /// Plain-text live clock (styling dropped) — used by tests.
     pub fn activity(&self) -> String {
         self.activity_line()
             .spans
@@ -1100,16 +1650,24 @@ impl App {
             .collect()
     }
 
-    /// Styled activity row: spinner, elapsed, verb and (when streaming) pulse
-    /// each keep their own role, so the live clock has hierarchy instead of
+    /// Styled live clock: spinner, elapsed, verb and (when streaming) pulse
+    /// each keep their own role, so the status bar has hierarchy instead of
     /// reading as one muted sentence.
     pub fn activity_line(&self) -> Line<'static> {
         if !self.busy {
             return Line::default();
         }
+        Line::from(self.live_clock_spans())
+    }
+
+    /// Spans for the running turn: spinner · elapsed · verb [pulse].
+    ///
+    /// Painted on the status bar so there is one clock, not a band plus a
+    /// second state word ticking out of step with it.
+    fn live_clock_spans(&self) -> Vec<Span<'static>> {
         let elapsed = self.elapsed().unwrap_or_else(|| "0.0s".into());
         let status = self.status_or_default();
-        let status_style = if status.starts_with("tool") {
+        let status_style = if is_tool_activity_status(&status) {
             self.theme.tool()
         } else {
             self.theme.text()
@@ -1129,7 +1687,7 @@ impl App {
                 self.theme.typing(),
             ));
         }
-        Line::from(spans)
+        spans
     }
 
     /// Spinner frame. `MOW_NO_ANIM=1` pins a static `●`; elapsed still ticks.
@@ -1188,6 +1746,7 @@ impl App {
         match agents.last() {
             Some(agent) => {
                 self.peer_focus = Some((*agent).clone());
+                self.peer_scroll = 0;
                 true
             }
             None => {
@@ -1205,6 +1764,8 @@ impl App {
         self.search_term.clear();
         self.scroll = 0;
         self.follow = true;
+        self.transcript_cache.borrow_mut().clear();
+        self.height_cache.borrow_mut().clear();
         self.status = "transcript cleared (engine history kept)".into();
     }
 
@@ -1250,11 +1811,13 @@ impl App {
                 // A fresh loop owns a fresh tool group (a no-op if the
                 // previous turn already committed its group at run.end).
                 self.live_tools.clear();
+                self.reset_think_state();
             }
             "loop.run.end" | "run.end" => {
                 self.busy = false;
                 self.status.clear();
                 self.activity_started = None;
+                self.thinking = false;
                 self.finish_peers();
                 // Commit the turn's tool calls as one entry. Idempotent: the
                 // group is consumed, so a later finish_turn has nothing left.
@@ -1266,8 +1829,13 @@ impl App {
                     .or_else(|| params.get("name"))
                     .and_then(|v| v.as_str())
                 {
-                    self.status = format!("tool · {name}");
+                    self.status = activity_tool_label(name);
                     self.live_tools.push((name.to_string(), None));
+                }
+            }
+            k if k == EVENT_LSP_DIAGNOSTICS || k.ends_with("lsp.diagnostics") => {
+                if let Some(problems) = decode_lsp_diagnostics(params) {
+                    self.ingest_lsp_problems(problems);
                 }
             }
             k if k.ends_with("tool.end") || k == "tool.end" => {
@@ -1309,8 +1877,45 @@ impl App {
                 sanitize_preview(phase)
             );
         }
+        if reasoning_delta(params).is_some() {
+            self.arm_thinking();
+        }
         if let Some(d) = token_delta(params) {
-            self.live.push_str(d);
+            self.push_visible_token(d);
+        }
+    }
+
+    fn reset_think_state(&mut self) {
+        self.think_raw.clear();
+        self.thinking = false;
+    }
+
+    fn arm_thinking(&mut self) {
+        self.thinking = true;
+        if self.live.is_empty() && !is_tool_activity_status(&self.status) {
+            self.status = "thinking".into();
+        }
+    }
+
+    /// Ingest a host-token delta: strip think wrappers, hide an open block,
+    /// and never let the reasoning body reach `live`.
+    fn push_visible_token(&mut self, delta: &str) {
+        self.think_raw.push_str(delta);
+        let (visible, think, unclosed) = extract_thinking(&self.think_raw);
+        if !think.is_empty() || unclosed {
+            self.arm_thinking();
+        }
+        if unclosed {
+            if !self.live.is_empty() {
+                self.live.clear();
+            }
+            return;
+        }
+        if visible != self.live {
+            self.live = visible;
+            if !self.live.is_empty() && self.status == "thinking" {
+                self.status.clear();
+            }
             if self.follow {
                 self.scroll = u16::MAX;
             }
@@ -1399,6 +2004,7 @@ impl App {
     pub fn finish_turn(&mut self, result: Result<Value, Error>) {
         self.busy = false;
         self.activity_started = None;
+        self.thinking = false;
         // Fallback commit: engines that never emit run.end still get their
         // tool group. No-op when run.end already committed it.
         self.commit_tool_group();
@@ -1409,29 +2015,72 @@ impl App {
                 self.usage.output_tokens +=
                     token_count(v.get("usage").unwrap_or(&Value::Null), "output_tokens");
                 let text = v.get("text").and_then(|t| t.as_str()).unwrap_or("");
-                let body = if !text.is_empty() {
+                let raw = if !text.is_empty() {
                     text.to_string()
                 } else {
                     std::mem::take(&mut self.live)
                 };
                 self.live.clear();
+                let body = visible_answer(&raw);
                 if !body.trim().is_empty() {
                     self.entries.push(Entry::Assistant(body));
                 }
             }
             Err(e) => {
                 if !self.live.trim().is_empty() {
-                    let body = std::mem::take(&mut self.live);
-                    self.entries.push(Entry::Assistant(body));
+                    let body = visible_answer(&std::mem::take(&mut self.live));
+                    if !body.trim().is_empty() {
+                        self.entries.push(Entry::Assistant(body));
+                    }
                 }
                 self.live.clear();
                 self.entries.push(Entry::Note(format!("error: {e}")));
             }
         }
+        self.reset_think_state();
         self.status.clear();
         self.finish_peers();
         if self.follow {
             self.scroll = u16::MAX;
+        }
+    }
+
+    /// Discard queued follow-ups. Cancelled turns must not send them later.
+    pub fn drop_queue(&mut self) -> usize {
+        let n = self.queue.len();
+        self.queue.clear();
+        if n > 0 {
+            let msg = format!("cancelled · dropped {n} queued message(s)");
+            self.status = msg.clone();
+            self.entries.push(Entry::Note(msg));
+        }
+        n
+    }
+
+    /// Mark the in-flight turn cancelled and drop any parked prompts.
+    pub fn request_cancel(&mut self) {
+        self.cancelled = true;
+        self.drop_queue();
+    }
+
+    /// Start the next queued prompt only after a successful, uncancelled turn.
+    pub fn take_queued_after_turn(&mut self, completed_ok: bool) -> Option<String> {
+        if self.cancelled || !completed_ok {
+            self.cancelled = false;
+            None
+        } else {
+            self.next_queued_prompt()
+        }
+    }
+
+    /// Remove the most recent painted turn (last user prompt through the end).
+    fn drop_last_turn_entries(&mut self) {
+        if let Some(i) = self
+            .entries
+            .iter()
+            .rposition(|entry| matches!(entry, Entry::User { .. }))
+        {
+            self.entries.truncate(i);
         }
     }
 
@@ -1459,7 +2108,7 @@ impl App {
 
     pub fn last_user_prompt(&self) -> Option<String> {
         self.entries.iter().rev().find_map(|entry| match entry {
-            Entry::User(text) => Some(text.clone()),
+            Entry::User { text, .. } => Some(text.clone()),
             _ => None,
         })
     }
@@ -1563,9 +2212,22 @@ impl App {
             self.status = "nothing to copy".into();
             return false;
         }
-        self.last_copy = text;
-        self.status = "copied locally".into();
-        true
+        self.last_copy = text.clone();
+        match osc52_sequence(&text) {
+            Some(seq) => {
+                self.pending_osc52 = Some(seq);
+                self.status = "copied".into();
+                true
+            }
+            None => {
+                self.status = "copy failed — select in the terminal instead".into();
+                false
+            }
+        }
+    }
+
+    fn take_osc52(&mut self) -> Option<String> {
+        self.pending_osc52.take()
     }
 
     pub fn search(&mut self, term: &str) -> Option<(usize, usize)> {
@@ -1606,11 +2268,13 @@ impl App {
         &mut self,
         decision: &str,
         client: &mut Client,
+        slash_rx: &mut Option<Receiver<Result<Value, Error>>>,
     ) -> Result<(), Error> {
         if let Some(permission) = self.pending_perm.take() {
             self.perm_shown = None;
             self.status = format!("{} {}", permission.name, decision);
-            client.perm_decide(&permission.id, decision, Duration::from_secs(20))?;
+            *slash_rx = Some(client.request_perm_decide(&permission.id, decision)?);
+            self.pending_local = Some("perm.decide".into());
         }
         Ok(())
     }
@@ -1629,7 +2293,7 @@ impl App {
         let mut rows: Vec<(String, String)> = [
             ("enter", "send (queue while busy)"),
             ("ctrl+j", "newline"),
-            ("↑ (empty input)", "edit last prompt"),
+            ("↑ / ↓", "scroll transcript"),
             ("pgup / pgdn", "scroll transcript"),
             ("ctrl+l", "clear transcript (engine history kept)"),
             ("shift+tab", "ask ↔ auto"),
@@ -1640,10 +2304,15 @@ impl App {
             ("esc", "dismiss overlay, else collapse tools, else cancel"),
             ("ctrl+c", "quit (cancel first if busy)"),
             ("tab (on /)", "slash autocomplete"),
+            ("/edit", "rewind last turn into the composer"),
+            ("/steer", "guide the running turn (while busy)"),
+            ("/btw", "aside — not added to context"),
             ("/model", "list models, or /model <id> to set"),
             ("/effort", "list efforts, or /effort high to set"),
             ("/clear", "clear transcript (engine history kept)"),
             ("/quit", "quit"),
+            ("/status /lsp", "session summary · diagnostics"),
+            ("/perm /compact", "ask/auto · compact history"),
         ]
         .iter()
         .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
@@ -1665,7 +2334,14 @@ impl App {
             Overlay::Models { list, state } => step_list(state, list.models.len(), delta),
             Overlay::Efforts { list, state } => step_list(state, list.efforts.len(), delta),
             Overlay::Completions { items, state } => step_list(state, items.len(), delta),
-            Overlay::Peer | Overlay::None => {}
+            Overlay::Peer => {
+                if delta < 0 {
+                    self.peer_scroll = self.peer_scroll.saturating_add(delta.unsigned_abs() as u16);
+                } else {
+                    self.peer_scroll = self.peer_scroll.saturating_sub(delta as u16);
+                }
+            }
+            Overlay::None => {}
         }
     }
 
@@ -1709,7 +2385,10 @@ impl App {
         self.entries = messages
             .into_iter()
             .map(|message| match message.role.as_str() {
-                "user" => Entry::User(message.content),
+                "user" => Entry::User {
+                    text: message.content,
+                    at: None,
+                },
                 "assistant" => Entry::Assistant(message.content),
                 _ => Entry::Note(format!("{}: {}", message.role, message.content)),
             })
@@ -1743,6 +2422,64 @@ impl App {
 
 fn token_count(value: &Value, field: &str) -> u64 {
     value.get(field).and_then(Value::as_u64).unwrap_or(0)
+}
+
+fn visible_answer(text: &str) -> String {
+    extract_thinking(text).0
+}
+
+/// OSC52 clipboard write. Not a colour sequence — emitted even under NO_COLOR.
+/// Mouse capture stays off so native terminal select/copy still works.
+fn osc52_sequence(text: &str) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+    const MAX: usize = 100_000;
+    let bytes = text.as_bytes();
+    let slice = if bytes.len() > MAX {
+        &bytes[..MAX]
+    } else {
+        bytes
+    };
+    Some(format!("\x1b]52;c;{}\x07", base64_encode(slice)))
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[((n >> 6) & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(n & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+fn flush_clipboard(app: &mut App) {
+    let Some(seq) = app.take_osc52() else {
+        return;
+    };
+    let mut out = std::io::stdout();
+    if out
+        .write_all(seq.as_bytes())
+        .and_then(|_| out.flush())
+        .is_err()
+    {
+        app.status = "copy failed — select in the terminal instead".into();
+    }
 }
 
 /// Strip terminal control sequences from foreign (ACP peer) text.
@@ -1931,9 +2668,82 @@ fn tool_label(name: &str) -> (String, String) {
     (verb, rest)
 }
 
+/// Broad activity phase from Go `toolActivityState`, used on the live status bar.
+fn tool_activity_state(name: &str) -> &'static str {
+    let clean = sanitize_preview(name);
+    let name = clean.trim().to_ascii_lowercase();
+    if name.is_empty() {
+        return "";
+    }
+    if is_delegate_name(&name) || name.contains(':') {
+        return "delegating";
+    }
+    let mut verb = name.split_whitespace().next().unwrap_or(&name).to_string();
+    if let Some(slash) = verb.rfind('/') {
+        verb = verb[slash + 1..].to_string();
+    }
+    let verb = verb.trim_end_matches(':');
+    match verb {
+        "read" | "glob" | "grep" => "searching",
+        "write" | "edit" => "shaping",
+        "mcp" | "lsp" => "connecting",
+        "generate_image" | "generate_speech" | "generate_video" => "creating",
+        "understand_image" | "understand_voice" | "understand_video" => "inspecting",
+        "bash" | "proc_start" | "proc_status" | "proc_stop" => "running",
+        _ => "working",
+    }
+}
+
+fn is_delegate_name(name: &str) -> bool {
+    if name == "acp_delegate" {
+        return true;
+    }
+    name.split_once(':')
+        .is_some_and(|(_, rest)| rest.trim() == "acp_delegate")
+}
+
+/// Status-bar label: `searching · grep · file`, keeping the concrete tool_label.
+fn activity_tool_label(name: &str) -> String {
+    let (verb, rest) = tool_label(name);
+    let phase = tool_activity_state(name);
+    if phase.is_empty() {
+        return if rest.is_empty() {
+            verb
+        } else {
+            format!("{verb} · {rest}")
+        };
+    }
+    if rest.is_empty() {
+        format!("{phase} · {verb}")
+    } else {
+        format!("{phase} · {verb} · {rest}")
+    }
+}
+
+fn is_tool_activity_status(status: &str) -> bool {
+    status.starts_with("tool")
+        || status.starts_with("searching")
+        || status.starts_with("shaping")
+        || status.starts_with("connecting")
+        || status.starts_with("creating")
+        || status.starts_with("inspecting")
+        || status.starts_with("running")
+        || status.starts_with("working")
+        || status.starts_with("delegating")
+}
+
+fn lsp_diagnostic_text(path: &str, diagnostic: &LspDiagnostic) -> String {
+    let mut text = format!("lsp · {path}:{} {}", diagnostic.line, diagnostic.message);
+    if !diagnostic.source.is_empty() {
+        text.push_str(" · ");
+        text.push_str(&diagnostic.source);
+    }
+    text
+}
+
 fn entry_text(entry: &Entry) -> String {
     match entry {
-        Entry::User(text) | Entry::Assistant(text) | Entry::Note(text) => text.clone(),
+        Entry::User { text, .. } | Entry::Assistant(text) | Entry::Note(text) => text.clone(),
         Entry::Tool { name, .. } => name.clone(),
         Entry::Tools { tools, .. } => tools
             .iter()
@@ -1949,10 +2759,166 @@ fn max_scroll(app: &App) -> u16 {
     n.saturating_sub(h)
 }
 
+/// Rows a block of text needs once hard-wrapped into `inner` columns.
+fn estimated_wrapped_lines(text: &str, inner: usize) -> usize {
+    let inner = inner.max(1);
+    text.split('\n')
+        .map(|line| {
+            let cols = line.width();
+            if cols == 0 { 1 } else { cols.div_ceil(inner) }
+        })
+        .sum::<usize>()
+        .max(1)
+}
+
+fn entry_fingerprint(entry: &Entry) -> (usize, bool) {
+    match entry {
+        Entry::User { text, .. } | Entry::Assistant(text) | Entry::Note(text) => {
+            (text.len(), false)
+        }
+        Entry::Tool { name, duration_ms } => (
+            name.len().saturating_add(duration_ms.unwrap_or(0) as usize),
+            false,
+        ),
+        Entry::Tools { tools, expanded } => (tools.len(), *expanded),
+    }
+}
+
+/// Keep only the rows of `lines` that overlap `[target, window_end)` in
+/// document coordinates starting at `cursor`.
+///
+/// If the estimate over-reported and the requested rows sit past what was
+/// painted, keep the actual tail so follow does not land on a blank pane.
+fn push_window_slice(
+    out: &mut Vec<Line<'static>>,
+    base: &mut usize,
+    cursor: usize,
+    target: usize,
+    window_end: usize,
+    lines: &[Line<'static>],
+) {
+    if lines.is_empty() {
+        return;
+    }
+    let start = target.saturating_sub(cursor);
+    let end = window_end.saturating_sub(cursor);
+    let (start, end) = if start < lines.len() {
+        (start, end.min(lines.len()).max(start))
+    } else if cursor < window_end {
+        let keep = end.saturating_sub(start).min(lines.len()).max(1);
+        let start = lines.len().saturating_sub(keep);
+        (start, lines.len())
+    } else {
+        return;
+    };
+    if start >= end {
+        return;
+    }
+    if out.is_empty() {
+        *base = cursor + start;
+    }
+    out.extend(lines[start..end].iter().cloned());
+}
+
+/// Like [`push_window_slice`], but the block is `painted` plus a trailing
+/// blank separator — without cloning the whole painted entry first.
+fn push_window_slice_with_sep(
+    out: &mut Vec<Line<'static>>,
+    base: &mut usize,
+    cursor: usize,
+    target: usize,
+    window_end: usize,
+    painted: &[Line<'static>],
+) {
+    let blank = Line::raw("");
+    if painted.is_empty() {
+        push_window_slice(out, base, cursor, target, window_end, &[blank]);
+        return;
+    }
+    let virtual_len = painted.len() + 1;
+    let start = target.saturating_sub(cursor);
+    let end = window_end.saturating_sub(cursor);
+    let (start, end) = if start < virtual_len {
+        (start, end.min(virtual_len).max(start))
+    } else if cursor < window_end {
+        let keep = end.saturating_sub(start).min(virtual_len).max(1);
+        let start = virtual_len.saturating_sub(keep);
+        (start, virtual_len)
+    } else {
+        return;
+    };
+    if start >= end {
+        return;
+    }
+    if out.is_empty() {
+        *base = cursor + start;
+    }
+    let painted_end = end.min(painted.len());
+    if start < painted.len() {
+        out.extend(painted[start..painted_end].iter().cloned());
+    }
+    if end > painted.len() {
+        out.push(blank);
+    }
+}
+
+/// Source suffix whose wrap estimate covers at least `need_rows` rows.
+///
+/// Used so follow-mode live paint can markdown-parse only the visible tail.
+/// An odd fence count means the cut landed inside a code block; the suffix
+/// is extended back to the opening fence so highlighting stays intact.
+fn live_tail_source(text: &str, need_rows: usize, width: usize) -> &str {
+    if text.is_empty() || need_rows == 0 {
+        return text;
+    }
+    let width = width.max(1);
+    let slack = need_rows.saturating_add(TRANSCRIPT_OVERSCAN);
+    let mut rows = 0usize;
+    let mut start = 0usize;
+    let mut line_end = text.len();
+    while line_end > 0 && rows < slack {
+        let line_start = text[..line_end].rfind('\n').map(|i| i + 1).unwrap_or(0);
+        let line = &text[line_start..line_end];
+        let cols = line.width();
+        rows += if cols == 0 { 1 } else { cols.div_ceil(width) };
+        start = line_start;
+        if line_start == 0 {
+            break;
+        }
+        line_end = line_start - 1;
+    }
+    if start == 0 {
+        return text;
+    }
+    extend_to_open_fence(text, start)
+}
+
+fn extend_to_open_fence(text: &str, start: usize) -> &str {
+    let suffix = &text[start..];
+    let fences = suffix
+        .lines()
+        .filter(|line| line.trim_start().starts_with("```"))
+        .count();
+    if fences % 2 == 0 {
+        return suffix;
+    }
+    let Some(open) = text[..start].rfind("```") else {
+        return text;
+    };
+    let line_start = text[..open].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    &text[line_start..]
+}
+
 fn leave_follow(app: &mut App, n: u16) {
     if app.follow {
+        let max = max_scroll(app);
+        // When the document still fits, there is nowhere to scroll away
+        // from the tail. Keep following so incoming output remains visible.
+        if max == 0 {
+            return;
+        }
         app.follow = false;
-        app.scroll = max_scroll(app).saturating_sub(n);
+        app.scroll = max.saturating_sub(n);
         return;
     }
     app.scroll = app.scroll.saturating_sub(n);
@@ -2008,6 +2974,45 @@ fn overlay_block_hint(app: &App, title: &str, hint: &str) -> Block<'static> {
         )])
         .alignment(Alignment::Right),
     )
+}
+
+/// Help chrome: title left, full session id right, keys on the bottom rail.
+///
+/// The id is identity, not a key row — putting it on the title keeps the
+/// card from growing a header line. The title shortens to `help` when the
+/// long name plus the id would collide.
+fn overlay_block_help(app: &App, width: u16, hint: &str) -> Block<'static> {
+    let id = app.session.session_id.as_str();
+    let title = help_card_title(width, id);
+    let mut block = overlay_block_hint(app, title, hint);
+    if id.is_empty() {
+        return block;
+    }
+    let title_w = title.width() + 2;
+    let room = (width as usize).saturating_sub(2 + title_w + 1);
+    let shown = clip_display(id, room.max(8));
+    block = block.title(
+        Line::from(Span::styled(
+            format!(" {shown} "),
+            app.theme.note().patch(app.theme.overlay()),
+        ))
+        .alignment(Alignment::Right),
+    );
+    block
+}
+
+fn help_card_title(width: u16, session_id: &str) -> &'static str {
+    let id_w = if session_id.is_empty() {
+        0
+    } else {
+        session_id.width() + 3
+    };
+    let long = "keyboard reference".width() + 2;
+    if 2 + long + id_w + 1 <= width as usize {
+        "keyboard reference"
+    } else {
+        "help"
+    }
 }
 
 /// Dim the document behind a modal so the eye lands on the overlay.
@@ -2110,6 +3115,16 @@ fn wrap_styled_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
 
 const MIN_WIDTH: u16 = 40;
 const MIN_HEIGHT: u16 = 10;
+/// Help card chrome: two border columns, two padding columns, one gutter
+/// between the key and action cells.
+const HELP_CHROME_W: u16 = 5;
+/// Top border, column header, bottom border.
+const HELP_CHROME_H: u16 = 3;
+/// Caps so a tall or wide terminal still sees a floating table, not a slab.
+const HELP_MAX_WIDTH: u16 = 62;
+const HELP_MAX_HEIGHT: u16 = 24;
+/// Action column keeps at least this many columns when the pane is tight.
+const HELP_ACTION_FLOOR: u16 = 18;
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     app.tick = frame.count() as u64;
@@ -2119,16 +3134,14 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         return;
     }
 
-    frame.render_widget(Block::new().style(app.theme.base()), area);
-
-    // header · hairline · transcript · [activity] · input · footer
+    // header · hairline · transcript · input · footer
     let mut rows = vec![Constraint::Length(1), Constraint::Length(1)];
     rows.push(Constraint::Fill(1));
-    if app.busy {
-        rows.push(Constraint::Length(1));
-    }
     // Composer sits on the document ground with no box: horizontal padding
-    // is the only inset. The status bar owns the bottom hairline.
+    // is the only inset. Blank pad rows share that ground and read as a
+    // tall empty well against the footer hairline, so they stay off.
+    // The status bar owns the bottom hairline — and the live clock, when a
+    // turn is running.
     let input_cols = area.width.saturating_sub(2);
     rows.push(Constraint::Length(input_height(app, input_cols)));
     // Footer hairline consumes a row; keep the status text on the row below.
@@ -2137,12 +3150,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         .direction(Direction::Vertical)
         .constraints(rows)
         .split(area);
-    let rest = &areas[2..];
-    let (transcript_area, activity, input_area, footer_area) = if app.busy {
-        (rest[0], Some(rest[1]), rest[2], rest[3])
-    } else {
-        (rest[0], None, rest[1], rest[2])
-    };
+    let transcript_area = areas[2];
+    let input_area = areas[3];
+    let footer_area = areas[4];
+
+    // Document ground only. Header, hairline, and status sit on the
+    // terminal default so a second fill cannot misalign with the pane.
+    frame.render_widget(Block::new().style(app.theme.base()), transcript_area);
 
     paint_filled_header(frame, app, areas[0]);
     frame.render_widget(
@@ -2153,16 +3167,6 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         .style(app.theme.header_bg()),
         areas[1],
     );
-
-    // The activity band exists only while a turn runs.
-    if let Some(band) = activity {
-        frame.render_widget(
-            Paragraph::new(app.activity_line())
-                .style(app.theme.base())
-                .block(Block::new().padding(Padding::horizontal(1))),
-            band,
-        );
-    }
 
     draw_transcript(frame, app, transcript_area);
 
@@ -2197,7 +3201,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     // The scrim covers the document only: header safety chips, the composer
     // and the footer decision bar all stay sharp, because those are what the
     // operator reads and types into while a modal is up. `doc` is the
-    // transcript plus the activity band (when present), ending at the composer.
+    // transcript, ending at the composer.
     let doc = Rect {
         x: area.x,
         y: transcript_area.y,
@@ -2232,7 +3236,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     app.overlay = overlay;
 }
 
-/// Paint the header as a solid mantle bar: fill every cell, then overlay chips.
+/// Paint the header on the terminal default: clear the row, then overlay chips.
 ///
 /// One column of inset on each side matches the composer and footer, so the
 /// three chrome rows share a vertical rhythm instead of the header kissing
@@ -2395,16 +3399,13 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             .scroll((scroll, 0)),
         inner,
     );
-    let content = app.estimated_total_lines().max(1);
-    let position = if app.follow {
-        content.saturating_sub(height)
-    } else {
-        app.scroll as usize
-    };
-    app.scrollbar_state = ScrollbarState::new(content)
-        .position(position)
-        .viewport_content_length(height);
-    if overflow > 0 {
+    // Paint the bar on `area` (not `inner`): VerticalRight uses the last
+    // column, which the right padding reserved. Composer/footer are outside
+    // this rect, so the end symbol sits on the last transcript row.
+    let content = app.estimated_total_lines();
+    app.scrollbar_state =
+        transcript_scrollbar_state(content, height, app.scroll as usize, app.follow);
+    if content > height {
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .style(app.theme.chrome())
@@ -2414,6 +3415,32 @@ fn draw_transcript(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             &mut app.scrollbar_state,
         );
     }
+}
+
+/// Map a document scroll offset onto ratatui `ScrollbarState`.
+///
+/// `ScrollbarState::new(n)` is an item count; `position` is an index in
+/// `[0, n)`, and the thumb reaches the end only at `n - 1`. Our offset
+/// lives in `[0, max_scroll]`, so `n` is `max_scroll + 1`. Passing the raw
+/// line count made the thumb stop a cell short of `↓` when following the
+/// bottom (`position = content - viewport`, while ratatui's last slot is
+/// `content - 1`).
+fn transcript_scrollbar_state(
+    content: usize,
+    viewport: usize,
+    scroll: usize,
+    follow: bool,
+) -> ScrollbarState {
+    let viewport = viewport.max(1);
+    let max_scroll = content.saturating_sub(viewport);
+    let position = if follow {
+        max_scroll
+    } else {
+        scroll.min(max_scroll)
+    };
+    ScrollbarState::new(max_scroll.saturating_add(1).max(1))
+        .position(position)
+        .viewport_content_length(viewport)
 }
 
 fn draw_too_small(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -2590,15 +3617,63 @@ fn field_row(app: &App, label: &str, value: &str, inner_w: usize) -> Line<'stati
     ])
 }
 
+/// Size the help card to its table, not the document pane.
+///
+/// Height hugs header + rows + borders, then caps so a long `slash.list`
+/// scrolls instead of becoming a slab. Width hugs a readable action column
+/// up to `HELP_MAX_WIDTH`; on a narrow pane the key column yields so
+/// actions stay readable.
+fn help_geometry(rows: &[(String, String)], area: Rect, session_id: &str) -> (Rect, u16) {
+    let key_natural = rows
+        .iter()
+        .map(|(key, _)| key.width())
+        .max()
+        .unwrap_or(12)
+        .saturating_add(2)
+        .clamp(12, 18) as u16;
+    let action_natural = rows
+        .iter()
+        .map(|(_, what)| what.width())
+        .max()
+        .unwrap_or(24) as u16;
+    // Size to a readable action column; the longest outlier can clip.
+    let action_want = action_natural.min(40).max(HELP_ACTION_FLOOR);
+    let want_w = key_natural
+        .saturating_add(action_want)
+        .saturating_add(HELP_CHROME_W);
+    let mut width = if area.width <= MIN_WIDTH + 8 {
+        // Floor widths: every column matters, so use the pane.
+        area.width.saturating_sub(2).max(24.min(area.width))
+    } else {
+        want_w
+            .min(HELP_MAX_WIDTH)
+            .min(area.width.saturating_sub(4))
+            .max(32.min(area.width.saturating_sub(2)))
+    };
+    // Title rail must be able to hold `help` plus the full session id
+    // when the pane allows — identity is not the first thing to clip.
+    if !session_id.is_empty() {
+        let rail = 11u16.saturating_add(session_id.width() as u16);
+        width = width.max(rail.min(area.width.saturating_sub(2)));
+    }
+
+    let want_h = (rows.len() as u16).saturating_add(HELP_CHROME_H);
+    let height = want_h
+        .min(HELP_MAX_HEIGHT)
+        .min(area.height)
+        .max(5.min(area.height));
+
+    let spot = centered(area, Constraint::Length(width), Constraint::Length(height));
+    let inner_w = width.saturating_sub(4);
+    let key_w = key_natural.min(inner_w.saturating_sub(1 + HELP_ACTION_FLOOR).max(8));
+    (spot, key_w)
+}
+
 fn draw_help(frame: &mut Frame<'_>, app: &App, state: &mut TableState, area: Rect) {
-    let spot = centered(
-        area,
-        Constraint::Length(area.width.saturating_sub(2).min(64)),
-        Constraint::Length(area.height.saturating_sub(2)),
-    );
+    let rows_data = app.help_rows();
+    let (spot, key_w) = help_geometry(&rows_data, area, &app.session.session_id);
     frame.render_widget(Clear, spot);
-    let rows: Vec<Row<'static>> = app
-        .help_rows()
+    let rows: Vec<Row<'static>> = rows_data
         .into_iter()
         .map(|(key, what)| {
             Row::new(vec![
@@ -2607,17 +3682,6 @@ fn draw_help(frame: &mut Frame<'_>, app: &App, state: &mut TableState, area: Rec
             ])
         })
         .collect();
-    // Size the key column to the keys (plus the `▸ ` highlight), not a
-    // fixed 20: that leftover is what sheared "engine history kept)" off
-    // the action column at a normal 80-wide frame.
-    let key_w = app
-        .help_rows()
-        .iter()
-        .map(|(key, _)| key.width())
-        .max()
-        .unwrap_or(12)
-        .saturating_add(2)
-        .clamp(12, 18) as u16;
     let table = Table::new(rows, [Constraint::Length(key_w), Constraint::Fill(1)])
         .header(
             Row::new(vec!["key", "action"]).style(app.theme.accent().add_modifier(Modifier::BOLD)),
@@ -2625,9 +3689,9 @@ fn draw_help(frame: &mut Frame<'_>, app: &App, state: &mut TableState, area: Rec
         .column_spacing(1)
         .row_highlight_style(app.theme.selected())
         .highlight_symbol("▸ ")
-        .block(overlay_block_hint(
+        .block(overlay_block_help(
             app,
-            "keyboard reference",
+            spot.width,
             "↑↓/jk scroll · esc close",
         ));
     frame.render_stateful_widget(table, spot, state);
@@ -2811,29 +3875,53 @@ fn draw_completions(
 }
 
 fn draw_peer(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let spot = centered(
-        area,
-        Constraint::Length(area.width.saturating_sub(4).min(72)),
-        Constraint::Length(area.height.saturating_sub(2)),
-    );
-    frame.render_widget(Clear, spot);
     let agent = app.peer_focus.clone().unwrap_or_else(|| "peer".to_string());
-    let raw = app.peers.get(&agent).cloned().unwrap_or_default();
-    // Same rule as the collapsed row: foreign bytes are stripped per line
-    // before they can reach the backend.
+    let raw = app.peers.get(&agent).map(String::as_str).unwrap_or("");
+
+    // Hug readable content instead of opening a document-height slab. Width is
+    // bounded first; the same inner width then drives wrapping and height.
+    let natural = raw
+        .lines()
+        .map(|line| sanitize_preview(line).width() as u16)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(4);
+    let max_w = area.width.saturating_sub(2).min(72);
+    let width = natural.clamp(32.min(max_w), max_w.max(1));
+    let inner_w = width.saturating_sub(4).max(1) as usize;
     let body: Vec<Line<'static>> = raw
         .lines()
-        .map(|line| Line::styled(sanitize_preview(line), app.theme.context()))
+        .flat_map(|line| wrap_cols(&sanitize_preview(line), inner_w))
+        .map(|line| Line::styled(line, app.theme.context()))
         .collect();
-    let tail = body
-        .len()
-        .saturating_sub(spot.height.saturating_sub(2) as usize);
+    let wanted_h = (body.len() as u16).saturating_add(2).max(5);
+    let height = wanted_h.min(18).min(area.height.max(1));
+    let spot = centered(area, Constraint::Length(width), Constraint::Length(height));
+    frame.render_widget(Clear, spot);
+
+    let viewport = spot.height.saturating_sub(2) as usize;
+    let max_top = body.len().saturating_sub(viewport);
+    let from_bottom = (app.peer_scroll as usize).min(max_top);
+    let top = max_top.saturating_sub(from_bottom);
+    let end = (top + viewport).min(body.len());
+    let visible = if top < end {
+        body[top..end].to_vec()
+    } else {
+        Vec::new()
+    };
+    let position = if body.len() > viewport {
+        format!(" · {}/{}", top.saturating_add(1), max_top.saturating_add(1))
+    } else {
+        String::new()
+    };
     frame.render_widget(
-        Paragraph::new(body)
+        Paragraph::new(visible)
             .style(app.theme.context())
-            .scroll((tail as u16, 0))
-            .wrap(Wrap { trim: false })
-            .block(overlay_block_hint(app, &format!("⇄ {agent}"), "esc close")),
+            .block(overlay_block_hint(
+                app,
+                &format!("⇄ {agent}{position}"),
+                "↑↓ scroll · esc close",
+            )),
         spot,
     );
 }
@@ -2907,7 +3995,7 @@ fn permission_preview(permission: &PermissionRequest) -> String {
     }
 }
 
-/// Terminal loop: keys in, RPC messages out, one repaint per tick.
+/// Terminal loop: drain RPC, paint when dirty or busy, then wait for keys.
 pub fn run<B: Backend>(
     terminal: &mut Terminal<B>,
     client: &mut Client,
@@ -2915,111 +4003,364 @@ pub fn run<B: Backend>(
 ) -> Result<(), Error> {
     let mut turn: Option<Receiver<Result<Value, Error>>> = None;
     let mut slash_rx: Option<Receiver<Result<Value, Error>>> = None;
+    let mut context_rx: Option<Receiver<Result<Value, Error>>> = None;
+    let mut dirty = true;
 
     while !app.quit {
-        terminal.draw(|f| draw(f, app)).map_err(Error::Io)?;
-
-        // Drain notifications without blocking the key loop.
-        loop {
-            match client.notifications().try_recv() {
-                Ok(n) => app.on_notification(&n),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    app.entries.push(Entry::Note("mow rpc exited".into()));
-                    app.quit = true;
-                    break;
-                }
-            }
+        if drain_notifications(client, app) {
+            dirty = true;
         }
-
-        if let Some(rx) = turn.as_ref() {
-            match rx.try_recv() {
-                Ok(res) => {
-                    app.finish_turn(res);
-                    turn = None;
-                    // Usage only moves at turn end; refresh the gauge here
-                    // rather than polling. A failure is not fatal to the UI.
-                    if app.supports("context")
-                        && let Ok(usage) = client.context(Duration::from_secs(5))
-                    {
-                        app.apply_context(&usage);
-                    }
-                    if let Some(next) = app.next_queued_prompt() {
-                        turn = Some(start_prompt(client, app, &next)?);
-                    }
-                }
-                Err(TryRecvError::Empty) => {}
-                Err(TryRecvError::Disconnected) => {
-                    // The child died mid-turn. Its stderr is captured (never
-                    // inherited, or it would paint over this frame), so show
-                    // the tail instead of a bare "closed".
-                    for line in client.stderr_tail() {
-                        app.entries
-                            .push(Entry::Note(format!("mow: {}", sanitize_preview(&line))));
-                    }
-                    app.finish_turn(Err(Error::Closed));
-                    turn = None;
-                    if let Some(next) = app.next_queued_prompt() {
-                        turn = Some(start_prompt(client, app, &next)?);
-                    }
-                }
-            }
+        if poll_turn(client, app, &mut turn, &mut context_rx)? {
+            dirty = true;
         }
-        if let Some(rx) = slash_rx.as_ref() {
-            match rx.try_recv() {
-                Ok(result) => {
-                    match result {
-                        Ok(value) => {
-                            let title = value
-                                .get("title")
-                                .and_then(Value::as_str)
-                                .unwrap_or("slash");
-                            let body = value.get("body").and_then(Value::as_str).unwrap_or("");
-                            let error = value.get("error").and_then(Value::as_str);
-                            app.entries.push(Entry::Note(if let Some(error) = error {
-                                format!("{title}: {error}")
-                            } else {
-                                format!("{title}: {body}")
-                            }));
-                        }
-                        Err(error) => app.entries.push(Entry::Note(format!("error: {error}"))),
-                    }
-                    slash_rx = None;
-                }
-                Err(TryRecvError::Disconnected) => {
-                    app.entries
-                        .push(Entry::Note("slash connection closed".into()));
-                    slash_rx = None;
-                }
-                Err(TryRecvError::Empty) => {}
-            }
+        if try_start_pending_compact(client, app, &mut slash_rx, &turn) {
+            dirty = true;
         }
-
-        if event::poll(Duration::from_millis(50)).map_err(Error::Io)? {
-            match event::read().map_err(Error::Io)? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => {
-                    handle_key(key, client, app, &mut turn, &mut slash_rx)?;
-                }
-                // Bracketed paste lands at the input cursor, multi-line safe.
-                Event::Paste(text) => {
-                    // A stray paste must never answer a permission prompt.
-                    if app.pending_perm.is_none() {
-                        if app.welcome {
-                            app.welcome = false;
-                        }
-                        app.insert_text(&text);
-                    }
-                }
-                Event::Resize(..) if !app.follow => {
-                    // Layout recomputes on the next draw; just clamp scroll so
-                    // a shrink cannot strand the viewport past the end.
-                    app.scroll = app.scroll.min(max_scroll(app));
-                }
-                _ => {}
-            }
+        if poll_slash(client, app, &mut slash_rx, &mut turn) {
+            dirty = true;
+        }
+        if poll_context(app, &mut context_rx) {
+            dirty = true;
+        }
+        if needs_paint(app, dirty) {
+            terminal.draw(|f| draw(f, app)).map_err(Error::Io)?;
+            flush_clipboard(app);
+            dirty = false;
+        }
+        if poll_input(client, app, &mut turn, &mut slash_rx)? {
+            dirty = true;
         }
     }
     Ok(())
+}
+
+fn needs_paint(app: &App, dirty: bool) -> bool {
+    dirty || app.busy
+}
+
+fn drain_notifications(client: &Client, app: &mut App) -> bool {
+    let mut any = false;
+    for _ in 0..NOTIFICATION_BATCH {
+        match client.notifications().try_recv() {
+            Ok(n) => {
+                app.on_notification(&n);
+                any = true;
+            }
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                app.entries.push(Entry::Note("mow rpc exited".into()));
+                app.quit = true;
+                any = true;
+                break;
+            }
+        }
+    }
+    any
+}
+
+fn poll_turn(
+    client: &mut Client,
+    app: &mut App,
+    turn: &mut Option<Receiver<Result<Value, Error>>>,
+    context_rx: &mut Option<Receiver<Result<Value, Error>>>,
+) -> Result<bool, Error> {
+    let Some(rx) = turn.as_ref() else {
+        return Ok(false);
+    };
+    match rx.try_recv() {
+        Ok(res) => {
+            let ok = res.is_ok();
+            app.finish_turn(res);
+            *turn = None;
+            // Usage only moves at turn end; refresh the gauge without
+            // blocking the 50ms loop. A failure is not fatal to the UI.
+            if app.supports("context")
+                && let Ok(rx) = client.request_context()
+            {
+                *context_rx = Some(rx);
+            }
+            if let Some(next) = app.take_queued_after_turn(ok) {
+                *turn = Some(start_prompt(client, app, &next)?);
+            }
+            Ok(true)
+        }
+        Err(TryRecvError::Empty) => Ok(false),
+        Err(TryRecvError::Disconnected) => {
+            // The child died mid-turn. Its stderr is captured (never
+            // inherited, or it would paint over this frame), so show
+            // the tail instead of a bare "closed".
+            for line in client.stderr_tail() {
+                app.entries
+                    .push(Entry::Note(format!("mow: {}", sanitize_preview(&line))));
+            }
+            app.finish_turn(Err(Error::Closed));
+            *turn = None;
+            let _ = app.take_queued_after_turn(false);
+            Ok(true)
+        }
+    }
+}
+
+fn poll_slash(
+    client: &mut Client,
+    app: &mut App,
+    slash_rx: &mut Option<Receiver<Result<Value, Error>>>,
+    turn: &mut Option<Receiver<Result<Value, Error>>>,
+) -> bool {
+    let Some(rx) = slash_rx.as_ref() else {
+        return false;
+    };
+    match rx.try_recv() {
+        Ok(result) => {
+            if let Some(kind) = app.pending_local.take() {
+                match (kind.as_str(), result) {
+                    ("compact", Ok(value)) => {
+                        let rep = Client::decode_compact(&value);
+                        let saved = if rep.over_budget {
+                            " (still over budget)"
+                        } else {
+                            ""
+                        };
+                        app.entries.push(Entry::Note(format!(
+                            "compacted [{}]: {} -> {} messages, {} chars saved{saved}",
+                            rep.layer, rep.messages_before, rep.messages_after, rep.chars_saved
+                        )));
+                        app.status = format!("compacted · {} tokens · refreshing", rep.tokens);
+                        match client.send("transcript", None) {
+                            Ok(rx) => {
+                                *slash_rx = Some(rx);
+                                app.pending_local = Some("compact.transcript".into());
+                            }
+                            Err(error) => {
+                                app.entries
+                                    .push(Entry::Note(format!("transcript refresh: {error}")));
+                                *slash_rx = None;
+                            }
+                        }
+                    }
+                    ("compact.transcript", Ok(value)) => {
+                        match crate::rpc::decode_transcript(&value) {
+                            Ok(messages) => app.load_transcript(messages),
+                            Err(error) => app
+                                .entries
+                                .push(Entry::Note(format!("transcript refresh: {error}"))),
+                        }
+                        app.status = "compacted".into();
+                        *slash_rx = None;
+                    }
+                    ("steer", Ok(_)) => {
+                        app.status = "steered".into();
+                        *slash_rx = None;
+                    }
+                    ("rewind.edit" | "rewind.retry" | "rewind.composer", Ok(value)) => {
+                        let follow = kind.as_str();
+                        match decode_rewind(&value) {
+                            Some(last_user) => {
+                                app.rewind_user = Some(last_user);
+                                match client.request_transcript() {
+                                    Ok(rx) => {
+                                        *slash_rx = Some(rx);
+                                        app.pending_local = Some(format!("{follow}.transcript"));
+                                    }
+                                    Err(error) => {
+                                        app.entries.push(Entry::Note(format!(
+                                            "transcript refresh: {error}"
+                                        )));
+                                        app.drop_last_turn_entries();
+                                        apply_rewind_followup(app, turn, client, follow);
+                                        *slash_rx = None;
+                                    }
+                                }
+                            }
+                            None => {
+                                app.status = rewind_empty_status(follow).into();
+                                *slash_rx = None;
+                            }
+                        }
+                    }
+                    (
+                        "rewind.edit.transcript"
+                        | "rewind.retry.transcript"
+                        | "rewind.composer.transcript",
+                        Ok(value),
+                    ) => {
+                        let follow = kind.strip_suffix(".transcript").unwrap_or(kind.as_str());
+                        match crate::rpc::decode_transcript(&value) {
+                            Ok(messages) => app.load_transcript(messages),
+                            Err(error) => {
+                                app.drop_last_turn_entries();
+                                app.entries
+                                    .push(Entry::Note(format!("transcript refresh: {error}")));
+                            }
+                        }
+                        apply_rewind_followup(app, turn, client, follow);
+                        *slash_rx = None;
+                    }
+                    ("model.list", Ok(value)) => {
+                        match crate::rpc::decode_model_list(&value) {
+                            Ok(list) => app.apply_model_list(list),
+                            Err(error) => {
+                                app.entries.push(Entry::Note(format!("model: {error}")));
+                            }
+                        }
+                        *slash_rx = None;
+                    }
+                    ("model.set", Ok(value)) => {
+                        let model = value
+                            .get("model")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        app.apply_model_set(model);
+                        *slash_rx = None;
+                    }
+                    ("effort.list", Ok(value)) => {
+                        match crate::rpc::decode_effort_list(&value) {
+                            Ok(list) => app.apply_effort_list(list),
+                            Err(error) => {
+                                app.entries.push(Entry::Note(format!("effort: {error}")));
+                            }
+                        }
+                        *slash_rx = None;
+                    }
+                    ("effort.set", Ok(value)) => {
+                        let effort = value
+                            .get("effort")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default();
+                        app.apply_effort_set(effort);
+                        *slash_rx = None;
+                    }
+                    ("perm.set" | "perm.decide", Ok(_)) => {
+                        *slash_rx = None;
+                    }
+                    (_, Err(error)) => {
+                        if kind.ends_with(".transcript") && kind.starts_with("rewind.") {
+                            app.drop_last_turn_entries();
+                            apply_rewind_followup(
+                                app,
+                                turn,
+                                client,
+                                kind.strip_suffix(".transcript").unwrap_or(&kind),
+                            );
+                        } else if kind.starts_with("rewind.") {
+                            app.status = "rewind failed".into();
+                            app.rewind_user = None;
+                        } else {
+                            app.status = "operation failed".into();
+                        }
+                        app.entries
+                            .push(Entry::Note(format!("operation failed: {error}")));
+                        *slash_rx = None;
+                    }
+                    _ => {
+                        *slash_rx = None;
+                    }
+                }
+                return true;
+            }
+            match result {
+                Ok(value) => {
+                    let title = value
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .unwrap_or("slash");
+                    let body = value.get("body").and_then(Value::as_str).unwrap_or("");
+                    let error = value.get("error").and_then(Value::as_str);
+                    app.entries.push(Entry::Note(if let Some(error) = error {
+                        format!("{title}: {error}")
+                    } else {
+                        format!("{title}: {body}")
+                    }));
+                }
+                Err(error) => app.entries.push(Entry::Note(format!("error: {error}"))),
+            }
+            *slash_rx = None;
+            true
+        }
+        Err(TryRecvError::Disconnected) => {
+            app.entries
+                .push(Entry::Note("slash connection closed".into()));
+            *slash_rx = None;
+            true
+        }
+        Err(TryRecvError::Empty) => false,
+    }
+}
+
+fn poll_context(app: &mut App, context_rx: &mut Option<Receiver<Result<Value, Error>>>) -> bool {
+    let Some(rx) = context_rx.as_ref() else {
+        return false;
+    };
+    match rx.try_recv() {
+        Ok(Ok(value)) => {
+            app.apply_context(&ContextUsage::from_value(&value));
+            *context_rx = None;
+            true
+        }
+        Ok(Err(_)) | Err(TryRecvError::Disconnected) => {
+            *context_rx = None;
+            false
+        }
+        Err(TryRecvError::Empty) => false,
+    }
+}
+
+fn poll_input(
+    client: &mut Client,
+    app: &mut App,
+    turn: &mut Option<Receiver<Result<Value, Error>>>,
+    slash_rx: &mut Option<Receiver<Result<Value, Error>>>,
+) -> Result<bool, Error> {
+    if !event::poll(Duration::from_millis(50)).map_err(Error::Io)? {
+        return Ok(false);
+    }
+    let mut dirty = false;
+    // Drain the complete input burst before repainting. Key-repeat can
+    // enqueue hundreds of events while an arrow is held; consuming one
+    // per 50 ms tick leaves a minute-long backlog that looks like a
+    // frozen app even after the key is released.
+    for _ in 0..INPUT_BATCH {
+        match event::read().map_err(Error::Io)? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                handle_key(key, client, app, turn, slash_rx)?;
+                dirty = true;
+            }
+            // Repeat events are intentionally consumed here. A single
+            // Press already moves the viewport; dropping repeats keeps
+            // scrolling predictable and prevents redraw starvation.
+            Event::Key(key) if key.kind == KeyEventKind::Repeat => {}
+            // Bracketed paste lands at the input cursor, multi-line safe.
+            Event::Paste(text) => {
+                // A stray paste must never answer a permission prompt.
+                if app.pending_perm.is_none() {
+                    if app.welcome {
+                        app.welcome = false;
+                    }
+                    app.insert_text(&text);
+                    dirty = true;
+                }
+            }
+            Event::Resize(..) => {
+                // Layout recomputes on the next draw; clamp scroll so a
+                // shrink cannot strand the viewport past the end.
+                if !app.follow {
+                    app.scroll = app.scroll.min(max_scroll(app));
+                }
+                dirty = true;
+            }
+            // Wheel is transcript-only. Mouse capture is off (native
+            // select/copy), so this only fires if a host still delivers it.
+            Event::Mouse(mouse) => {
+                handle_mouse(app, mouse.kind);
+                dirty = true;
+            }
+            _ => {}
+        }
+        if !event::poll(Duration::ZERO).map_err(Error::Io)? {
+            break;
+        }
+    }
+    Ok(dirty)
 }
 
 fn handle_key(
@@ -3038,9 +4379,11 @@ fn handle_key(
             return Ok(());
         }
         match key.code {
-            KeyCode::Char('y') => return app.permission_decision("allow", client),
-            KeyCode::Char('n') | KeyCode::Esc => return app.permission_decision("deny", client),
-            KeyCode::Char('a') => return app.permission_decision("always", client),
+            KeyCode::Char('y') => return app.permission_decision("allow", client, slash_rx),
+            KeyCode::Char('n') | KeyCode::Esc => {
+                return app.permission_decision("deny", client, slash_rx);
+            }
+            KeyCode::Char('a') => return app.permission_decision("always", client, slash_rx),
             _ => return Ok(()),
         }
     }
@@ -3058,7 +4401,7 @@ fn handle_key(
             KeyCode::Char('c') if ctrl => app.quit = true,
             KeyCode::Up | KeyCode::Char('k') => app.overlay_move(-1),
             KeyCode::Down | KeyCode::Char('j') => app.overlay_move(1),
-            KeyCode::Enter => overlay_activate(client, app)?,
+            KeyCode::Enter => overlay_activate(client, app, slash_rx)?,
             _ => {}
         }
         return Ok(());
@@ -3067,13 +4410,15 @@ fn handle_key(
     match key.code {
         KeyCode::Char('c') if ctrl => {
             if app.busy || turn.is_some() {
+                app.request_cancel();
                 let _ = client.cancel();
             }
             app.quit = true;
         }
         KeyCode::BackTab => {
             let mode = app.toggle_ask_mode();
-            client.perm_set(mode, Duration::from_secs(20))?;
+            *slash_rx = Some(client.request_perm_set(mode)?);
+            app.pending_local = Some("perm.set".into());
             app.status = format!("mode: {mode}");
         }
         KeyCode::Esc => {
@@ -3082,26 +4427,16 @@ fn handle_key(
                 // Esc is a view op first: collapse an expanded tool group
                 // before it ever reaches the destructive cancel.
             } else if app.busy || turn.is_some() {
+                app.request_cancel();
                 client.cancel()?;
-                app.status = "cancelling".into();
+                if !app.status.starts_with("cancelled ·") {
+                    app.status = "cancelling".into();
+                }
             }
         }
         KeyCode::Enter => {
             let text = app.input.trim().to_string();
-            if text.starts_with("/steer") {
-                let steer_text = text.strip_prefix("/steer").unwrap_or("").trim();
-                if app.busy || turn.is_some() {
-                    if steer_text.is_empty() {
-                        app.status = "steer text must not be empty".into();
-                    } else {
-                        client.steer(steer_text, Duration::from_secs(20))?;
-                        app.status = "steered".into();
-                    }
-                } else {
-                    app.status = "no turn in flight".into();
-                }
-                app.clear_input();
-            } else if text.starts_with('/') {
+            if text.starts_with('/') {
                 handle_slash(&text, client, app, turn, slash_rx)?;
                 app.clear_input();
             } else if app.busy || turn.is_some() {
@@ -3121,9 +4456,9 @@ fn handle_key(
 
 /// Composer, transcript scroll, and other local keys. Never talks to the Engine.
 ///
-/// Scroll is PgUp/PgDn only and never rewrites the prompt. Arrow-up recalls
-/// the last user prompt when the composer is empty; otherwise it is ignored.
-/// Plain letters, including `t`, always type.
+/// ↑/↓, PgUp/PgDn, and the mouse wheel scroll the transcript and never rewrite
+/// the composer. Last-prompt recall is `/edit` only. Plain letters, including
+/// `t`, always type.
 fn handle_view_key(app: &mut App, key: KeyEvent) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
@@ -3154,12 +4489,8 @@ fn handle_view_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Left => app.move_cursor(-1),
         KeyCode::Right => app.move_cursor(1),
-        KeyCode::Up => {
-            if app.input.is_empty() {
-                let _ = app.edit_last_prompt();
-            }
-        }
-        KeyCode::Down => {}
+        KeyCode::Up => leave_follow(app, 1),
+        KeyCode::Down => scroll_down(app, 1),
         // Unknown chords must not leak a letter into the composer.
         KeyCode::Char(_) if ctrl => {}
         KeyCode::Char(c) => app.insert_char(c),
@@ -3167,7 +4498,25 @@ fn handle_view_key(app: &mut App, key: KeyEvent) {
     }
 }
 
-fn overlay_activate(client: &mut Client, app: &mut App) -> Result<(), Error> {
+fn handle_mouse(app: &mut App, kind: MouseEventKind) {
+    if app.pending_perm.is_some() || app.overlay.is_open() {
+        return;
+    }
+    if app.welcome {
+        app.welcome = false;
+    }
+    match kind {
+        MouseEventKind::ScrollUp => leave_follow(app, 3),
+        MouseEventKind::ScrollDown => scroll_down(app, 3),
+        _ => {}
+    }
+}
+
+fn overlay_activate(
+    client: &mut Client,
+    app: &mut App,
+    slash_rx: &mut Option<Receiver<Result<Value, Error>>>,
+) -> Result<(), Error> {
     let selection = app.overlay_selection();
     let picker = match &app.overlay {
         Overlay::Help(_) | Overlay::Peer => "close",
@@ -3188,19 +4537,19 @@ fn overlay_activate(client: &mut Client, app: &mut App) -> Result<(), Error> {
             app.overlay = Overlay::None;
         }
         "model" => {
+            app.overlay = Overlay::None;
             if let Some(id) = selection {
-                let model = client.model_set(&id, Duration::from_secs(20))?;
-                app.apply_model_set(&model);
-            } else {
-                app.overlay = Overlay::None;
+                *slash_rx = Some(client.request_model_set(&id)?);
+                app.pending_local = Some("model.set".into());
+                app.status = "switching model…".into();
             }
         }
         "effort" => {
+            app.overlay = Overlay::None;
             if let Some(id) = selection {
-                let effort = client.effort_set(&id, Duration::from_secs(20))?;
-                app.apply_effort_set(&effort);
-            } else {
-                app.overlay = Overlay::None;
+                *slash_rx = Some(client.request_effort_set(&id)?);
+                app.pending_local = Some("effort.set".into());
+                app.status = "switching effort…".into();
             }
         }
         "complete" => {
@@ -3212,6 +4561,84 @@ fn overlay_activate(client: &mut Client, app: &mut App) -> Result<(), Error> {
         _ => {}
     }
     Ok(())
+}
+
+const STEER_USAGE: &str = "steer · usage: /steer <guidance>  (while a turn runs)";
+const STEER_IDLE: &str = "steer · no turn running — just send your message";
+const STEER_UNSUPPORTED: &str = "steer is not supported by this host";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactPlan {
+    Send,
+    Defer,
+}
+
+/// Host `compact` is a worker method unless advertised in `control_methods`.
+fn plan_compact(busy: bool, compact_is_control: bool) -> CompactPlan {
+    if busy && !compact_is_control {
+        CompactPlan::Defer
+    } else {
+        CompactPlan::Send
+    }
+}
+
+fn start_compact(
+    client: &mut Client,
+    app: &mut App,
+    slash_rx: &mut Option<Receiver<Result<Value, Error>>>,
+    max_chars: i64,
+) -> Result<(), Error> {
+    let params = (max_chars > 0).then(|| serde_json::json!({ "max_chars": max_chars }));
+    *slash_rx = Some(client.send("compact", params)?);
+    app.pending_local = Some("compact".into());
+    app.status = "compacting…".into();
+    Ok(())
+}
+
+fn try_start_pending_compact(
+    client: &mut Client,
+    app: &mut App,
+    slash_rx: &mut Option<Receiver<Result<Value, Error>>>,
+    turn: &Option<Receiver<Result<Value, Error>>>,
+) -> bool {
+    if app.busy || turn.is_some() || slash_rx.is_some() {
+        return false;
+    }
+    let Some(max_chars) = app.pending_compact.take() else {
+        return false;
+    };
+    match start_compact(client, app, slash_rx, max_chars) {
+        Ok(()) => true,
+        Err(error) => {
+            app.pending_compact = Some(max_chars);
+            app.status = format!("compact: {error}");
+            false
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SteerPlan {
+    Usage,
+    Idle,
+    Unsupported,
+    Send(String),
+}
+
+/// Decide what `/steer` should do. Local so a missing host method never
+/// blocks the composer, and so idle/empty stay UI errors instead of RPC.
+fn plan_steer(args: &[String], busy: bool, supported: bool) -> SteerPlan {
+    if !supported {
+        return SteerPlan::Unsupported;
+    }
+    let text = args.join(" ");
+    if text.is_empty() {
+        return SteerPlan::Usage;
+    }
+    if !busy {
+        return SteerPlan::Idle;
+    }
+    SteerPlan::Send(text)
 }
 
 fn handle_slash(
@@ -3226,9 +4653,13 @@ fn handle_slash(
         return Ok(());
     };
     let args: Vec<String> = words.map(ToString::to_string).collect();
+    if name == "perm" {
+        return handle_perm_slash(&args, client, app, slash_rx);
+    }
     match slash_route(name, &app.slash_commands) {
         SlashRoute::Quit => {
             if app.busy || turn.is_some() {
+                app.request_cancel();
                 let _ = client.cancel();
             }
             app.quit = true;
@@ -3256,20 +4687,31 @@ fn handle_slash(
             app.copy_last_assistant();
         }
         "edit" => {
-            if !app.edit_last_prompt() {
-                app.status = "no user prompt to edit".into();
+            start_rewind(client, app, slash_rx, turn, "rewind.edit")?;
+        }
+        "btw" => {
+            let question = args.join(" ");
+            if question.trim().is_empty() {
+                app.status = "usage: /btw <question>".into();
+            } else if app.busy || turn.is_some() {
+                app.status = "/btw is unavailable while busy".into();
+            } else {
+                app.entries
+                    .push(Entry::Note("btw · aside — not added to context".into()));
+                app.entries.push(Entry::user(&question));
+                app.live.clear();
+                app.reset_think_state();
+                app.cancelled = false;
+                app.busy = true;
+                app.follow = true;
+                app.scroll = u16::MAX;
+                app.status = "running aside".into();
+                app.activity_started = Some(Instant::now());
+                *turn = Some(client.prompt_with(&question, true)?);
             }
         }
         "retry" => {
-            if let Some(prompt) = app.last_user_prompt() {
-                if app.busy || turn.is_some() {
-                    app.enqueue_prompt(prompt);
-                } else {
-                    *turn = Some(start_prompt(client, app, &prompt)?);
-                }
-            } else {
-                app.status = "no user prompt to retry".into();
-            }
+            start_rewind(client, app, slash_rx, turn, "rewind.retry")?;
         }
         "help" => {
             app.overlay = Overlay::help();
@@ -3294,26 +4736,33 @@ fn handle_slash(
         }
         "model" => {
             if args.is_empty() {
-                let list = client.model_list(Duration::from_secs(20))?;
-                app.apply_model_list(list);
+                *slash_rx = Some(client.send("model.list", None)?);
+                app.pending_local = Some("model.list".into());
+                app.status = "listing models…".into();
             } else {
-                let model = client.model_set(&args.join(" "), Duration::from_secs(20))?;
-                app.apply_model_set(&model);
+                *slash_rx = Some(client.request_model_set(&args.join(" "))?);
+                app.pending_local = Some("model.set".into());
+                app.status = "switching model…".into();
             }
         }
         "effort" => {
             if args.is_empty() {
-                let list = client.effort_list(Duration::from_secs(20))?;
-                app.apply_effort_list(list);
+                *slash_rx = Some(client.send("effort.list", None)?);
+                app.pending_local = Some("effort.list".into());
+                app.status = "listing efforts…".into();
             } else {
-                let effort = client.effort_set(&args.join(" "), Duration::from_secs(20))?;
-                app.apply_effort_set(&effort);
+                *slash_rx = Some(client.request_effort_set(&args.join(" "))?);
+                app.pending_local = Some("effort.set".into());
+                app.status = "switching effort…".into();
             }
         }
         "status" => {
             let status = client.status(Duration::from_secs(20))?;
             app.apply_status(&status);
-            app.entries.push(Entry::Note(format!("status: {status}")));
+            app.entries.push(Entry::Note(app.status_summary()));
+        }
+        "lsp" => {
+            app.show_lsp_problems();
         }
         "context" => {
             let usage = client.context(Duration::from_secs(20))?;
@@ -3325,30 +4774,22 @@ fn handle_slash(
                 .first()
                 .and_then(|a| a.trim().parse::<i64>().ok())
                 .unwrap_or(0);
-            let rep = client.compact(max_chars, Duration::from_secs(120))?;
-            let saved = if rep.over_budget {
-                " (still over budget)"
-            } else {
-                ""
-            };
-            app.entries.push(Entry::Note(format!(
-                "compacted [{}]: {} -> {} messages, {} chars saved{saved}",
-                rep.layer, rep.messages_before, rep.messages_after, rep.chars_saved
-            )));
-            // Engine history changed under us; repaint from the new truth.
-            let messages = client.transcript(Duration::from_secs(20))?;
-            app.load_transcript(messages);
-            app.status = format!("compacted · {} tokens", rep.tokens);
-        }
-        "rewind" | "undo" => match client.rewind(Duration::from_secs(20))? {
-            Some(last_user) => {
-                let messages = client.transcript(Duration::from_secs(20))?;
-                app.load_transcript(messages);
-                app.set_input(last_user);
-                app.status = "rewound — edit and send again".into();
+            let busy = app.busy || turn.is_some();
+            match plan_compact(busy, app.compact_is_control()) {
+                CompactPlan::Defer => {
+                    app.pending_compact = Some(max_chars);
+                    let msg = "compact · applies when the turn finishes";
+                    app.status = msg.into();
+                    app.entries.push(Entry::Note(msg.into()));
+                }
+                CompactPlan::Send => {
+                    start_compact(client, app, slash_rx, max_chars)?;
+                }
             }
-            None => app.status = "nothing to rewind".into(),
-        },
+        }
+        "rewind" | "undo" => {
+            start_rewind(client, app, slash_rx, turn, "rewind.composer")?;
+        }
         "skills" => {
             if args.is_empty() {
                 let skills = client.skill_list(Duration::from_secs(20))?;
@@ -3374,7 +4815,25 @@ fn handle_slash(
             }
         }
         "steer" => {
-            app.status = "steer is /steer <text> while a turn is running".into();
+            let busy = app.busy || turn.is_some();
+            match plan_steer(&args, busy, app.supports("steer")) {
+                SteerPlan::Unsupported => {
+                    app.status = STEER_UNSUPPORTED.into();
+                }
+                SteerPlan::Usage => {
+                    app.status = STEER_USAGE.into();
+                }
+                SteerPlan::Idle => {
+                    app.status = STEER_IDLE.into();
+                }
+                SteerPlan::Send(text) => {
+                    *slash_rx = Some(client.request_steer(&text)?);
+                    app.pending_local = Some("steer".into());
+                    app.entries
+                        .push(Entry::Note(format!("steer · {}", clip_display(&text, 80))));
+                    app.status = "steering…".into();
+                }
+            }
         }
         _ => {
             app.status = format!("/{name} is handled locally");
@@ -3383,13 +4842,112 @@ fn handle_slash(
     Ok(())
 }
 
+fn start_rewind(
+    client: &mut Client,
+    app: &mut App,
+    slash_rx: &mut Option<Receiver<Result<Value, Error>>>,
+    turn: &mut Option<Receiver<Result<Value, Error>>>,
+    follow: &str,
+) -> Result<(), Error> {
+    if app.busy || turn.is_some() {
+        app.status = match follow {
+            "rewind.retry" => "retry · wait for the current turn to finish",
+            "rewind.edit" => "edit · wait for the current turn to finish",
+            _ => "rewind · wait for the current turn to finish",
+        }
+        .into();
+        return Ok(());
+    }
+    if !app.supports("rewind") {
+        app.status = "rewind is not supported by this host".into();
+        return Ok(());
+    }
+    *slash_rx = Some(client.request_rewind()?);
+    app.pending_local = Some(follow.into());
+    app.status = "rewinding…".into();
+    Ok(())
+}
+
+fn rewind_empty_status(follow: &str) -> &'static str {
+    match follow {
+        "rewind.retry" => "retry · nothing to retry",
+        "rewind.edit" => "edit · nothing to edit",
+        _ => "nothing to rewind",
+    }
+}
+
+fn apply_rewind_followup(
+    app: &mut App,
+    turn: &mut Option<Receiver<Result<Value, Error>>>,
+    client: &mut Client,
+    follow: &str,
+) {
+    let last = app.rewind_user.take().unwrap_or_default();
+    match follow {
+        "rewind.edit" => {
+            app.set_input(last);
+            app.status = "editing last message — change it and press enter".into();
+        }
+        "rewind.retry" => {
+            if last.trim().is_empty() {
+                app.status = "retry · nothing to retry".into();
+            } else if turn.is_some() {
+                app.enqueue_prompt(last);
+            } else {
+                match start_prompt(client, app, &last) {
+                    Ok(rx) => *turn = Some(rx),
+                    Err(error) => {
+                        app.entries
+                            .push(Entry::Note(format!("retry failed: {error}")));
+                        app.status = "retry failed".into();
+                    }
+                }
+            }
+        }
+        "rewind.composer" => {
+            app.set_input(last);
+            app.status = "rewound — edit and send again".into();
+        }
+        _ => {}
+    }
+}
+
+fn handle_perm_slash(
+    args: &[String],
+    client: &mut Client,
+    app: &mut App,
+    slash_rx: &mut Option<Receiver<Result<Value, Error>>>,
+) -> Result<(), Error> {
+    let mode = match args.first().map(String::as_str) {
+        None => app.toggle_ask_mode(),
+        Some("ask") => {
+            app.ask_mode = true;
+            "ask"
+        }
+        Some("auto") => {
+            app.ask_mode = false;
+            "auto"
+        }
+        Some(_) => {
+            app.status = "usage: /perm [ask|auto]".into();
+            return Ok(());
+        }
+    };
+    *slash_rx = Some(client.request_perm_set(mode)?);
+    app.pending_local = Some("perm.set".into());
+    app.status = format!("mode: {mode}");
+    Ok(())
+}
+
 fn start_prompt(
     client: &mut Client,
     app: &mut App,
     text: &str,
 ) -> Result<Receiver<Result<Value, Error>>, Error> {
-    app.entries.push(Entry::User(text.to_string()));
+    app.entries.push(Entry::user(text));
     app.live.clear();
+    app.reset_think_state();
+    app.cancelled = false;
     app.busy = true;
     app.follow = true;
     app.scroll = u16::MAX;
@@ -3409,6 +4967,62 @@ mod tests {
             context_window: window,
             remaining: window.map(|w| w.saturating_sub(tokens)),
             percent: pct,
+        }
+    }
+
+    #[test]
+    fn steer_plans_idle_usage_and_unsupported() {
+        assert_eq!(plan_steer(&[], true, true), SteerPlan::Usage);
+        assert_eq!(
+            plan_steer(&["focus".into(), "on".into(), "tests".into()], false, true),
+            SteerPlan::Idle
+        );
+        assert_eq!(
+            plan_steer(&["focus".into()], true, false),
+            SteerPlan::Unsupported
+        );
+        assert_eq!(
+            plan_steer(&["focus".into(), "on".into(), "tests".into()], true, true),
+            SteerPlan::Send("focus on tests".into())
+        );
+        let mut app = App::new(SessionInfo::default());
+        app.set_capabilities(&["prompt".into(), "cancel".into()]);
+        assert!(!app.supports("steer"));
+        assert_eq!(
+            plan_steer(&["go".into()], true, app.supports("steer")),
+            SteerPlan::Unsupported
+        );
+        assert_eq!(
+            STEER_IDLE,
+            "steer · no turn running — just send your message"
+        );
+        assert!(STEER_USAGE.contains("/steer <guidance>"));
+        assert!(STEER_UNSUPPORTED.contains("not supported"));
+    }
+
+    #[test]
+    fn steer_is_not_a_blocking_rpc_from_the_ui() {
+        // A 20s call() here froze the 50ms input loop while a turn ran.
+        // Build the needle at runtime so this assertion does not match itself.
+        let src = include_str!("app.rs");
+        let blocking = format!("client.{}(", "steer");
+        assert!(
+            !src.contains(&blocking),
+            "steer must go through request_steer so the UI stays responsive"
+        );
+        assert!(src.contains("request_steer"));
+        for method in [
+            "rewind",
+            "model_set",
+            "effort_set",
+            "perm_set",
+            "perm_decide",
+        ] {
+            let blocking = format!("client.{method}(");
+            assert!(
+                !src.contains(&blocking),
+                "{method} must use the non-blocking request_* path"
+            );
         }
     }
 
@@ -3459,13 +5073,36 @@ mod tests {
     }
 
     #[test]
+    fn activity_tool_labels_use_phase_verbs() {
+        assert_eq!(activity_tool_label("grep"), "searching · grep");
+        assert_eq!(
+            activity_tool_label("read src/app.rs"),
+            "searching · read · src/app.rs"
+        );
+        assert_eq!(
+            activity_tool_label("write dest.rs"),
+            "shaping · write · dest.rs"
+        );
+        assert_eq!(
+            activity_tool_label("bash echo hi"),
+            "running · bash · echo hi"
+        );
+        assert_eq!(
+            activity_tool_label("acp_delegate"),
+            "delegating · acp_delegate"
+        );
+        assert_eq!(tool_activity_state("mcp"), "connecting");
+        assert_eq!(tool_activity_state("unknown_tool"), "working");
+    }
+
+    #[test]
     fn long_tool_names_do_not_eat_the_user_prompt() {
         // A tool row whose name is a whole shell blob wraps to several lines.
         // The transcript window math must agree with what is painted, or the
         // overflow scrolls the user's own prompt off the top of the pane.
         let mut app = App::new(SessionInfo::default());
         app.theme = Theme { colored: true };
-        app.entries.push(Entry::User("summarise the repo".into()));
+        app.entries.push(Entry::user("summarise the repo"));
         app.entries.push(Entry::Tool {
             name: "bash echo ----; cat AGENTS.md 2>/dev/null || cat CLAUDE.md 2>/dev/null; \
                    echo ----; ls -la; git log --oneline | head -20"
@@ -3492,8 +5129,8 @@ mod tests {
         app.theme = Theme { colored: true };
         app.last_view_w = 40;
         let entries = vec![
-            Entry::User("a short prompt".into()),
-            Entry::User("a prompt that is quite a lot longer than forty columns".into()),
+            Entry::user("a short prompt"),
+            Entry::user("a prompt that is quite a lot longer than forty columns"),
             Entry::Assistant("one line".into()),
             Entry::Assistant("a much longer answer that has to wrap several times over".into()),
             Entry::Tool {
@@ -3562,7 +5199,7 @@ mod tests {
         // undimmed text and the layering is invisible.
         let mut app = App::new(SessionInfo::default());
         app.theme = Theme { colored: false };
-        app.entries.push(Entry::User("hello there".into()));
+        app.entries.push(Entry::user("hello there"));
         app.overlay = Overlay::help();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
@@ -3703,7 +5340,7 @@ mod tests {
         });
         app.theme = Theme { colored: true };
         app.effort = "medium".into();
-        app.entries.push(Entry::User("hi".into()));
+        app.entries.push(Entry::user("hi"));
         app.live.push_str("hello");
 
         let out = render(&mut app, 80, 14);
@@ -3715,8 +5352,8 @@ mod tests {
             "session id is not a header chip: {header}"
         );
         assert!(
-            out.contains("abcdef0123456789"),
-            "full session id belongs in the status bar: {out}"
+            !out.contains("abcdef0123456789"),
+            "session id is not status-bar chrome: {out}"
         );
         assert!(out.contains("hi"), "{out}");
         assert!(!out.contains("❯ hi"), "{out}");
@@ -3826,38 +5463,52 @@ mod tests {
     }
 
     #[test]
-    fn activity_stays_a_band_above_the_composer() {
+    fn busy_clock_lives_on_the_status_bar() {
         let mut app = App::new(SessionInfo::default());
         app.theme = Theme { colored: true };
         app.busy = true;
         app.animate = false;
         app.activity_started = Some(Instant::now());
         app.status = "calling model".into();
+        app.live.push_str("hello");
         app.input.push_str("queued draft");
         let mut terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer();
 
-        let activity_y = find_row(buf, 80, 18, "calling model");
         let composer_y = find_row(buf, 80, 18, "queued draft");
         let footer_y = find_row(buf, 80, 18, "enter queue");
-        assert!(
-            activity_y < composer_y,
-            "activity ({activity_y}) must sit above the composer ({composer_y})"
-        );
-        assert_eq!(
-            activity_y + 1,
-            composer_y,
-            "activity is the row immediately above the composer"
-        );
         let footer = row_text(buf, footer_y, 80);
         assert!(
             footer.contains("calling model"),
-            "footer names the busy verb, not a coarse busy: {footer}"
+            "status bar owns the busy verb: {footer}"
         );
         assert!(
-            !footer.contains("0.0s") && !footer.contains("···"),
-            "live clock stays on the activity band: {footer}"
+            footer.contains("0.0s"),
+            "elapsed lives on the status bar: {footer}"
+        );
+        assert!(
+            footer.contains("···"),
+            "typing pulse lives on the status bar: {footer}"
+        );
+        assert!(
+            !footer.contains("idle"),
+            "idle must not sit beside the clock: {footer}"
+        );
+        assert!(
+            !footer.contains("busy"),
+            "coarse busy is replaced by the verb: {footer}"
+        );
+        // No second clock above the composer — the band is gone.
+        let above = row_text(buf, composer_y.saturating_sub(1), 80);
+        assert!(
+            !above.contains("calling model") && !above.contains("0.0s"),
+            "activity band must not sit above the composer: {above}"
+        );
+        assert_eq!(
+            footer_y - 1,
+            composer_y + 1,
+            "footer rule sits on the row below the composer text"
         );
     }
 
@@ -3931,7 +5582,7 @@ mod tests {
     }
 
     #[test]
-    fn header_row_fills_header_bg() {
+    fn header_and_footer_use_terminal_background() {
         let mut app = App::new(SessionInfo {
             session_id: "abcdef0123456789".into(),
             workspace: "/w".into(),
@@ -3939,26 +5590,39 @@ mod tests {
             wire: "openai-responses".into(),
         });
         app.theme = Theme { colored: true };
+        app.input.push_str("draft");
         let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer();
-        let mantle = Color::Rgb(0x18, 0x18, 0x25);
+        let footer_y = find_row(buf, 100, 14, "idle");
         for x in 0..100 {
             assert_eq!(
                 buf[(x, 0)].bg,
-                mantle,
+                Color::Reset,
                 "header cell ({x},0) bg={:?} symbol={:?}",
                 buf[(x, 0)].bg,
                 buf[(x, 0)].symbol()
             );
+            assert_eq!(
+                buf[(x, footer_y)].bg,
+                Color::Reset,
+                "footer cell ({x},{footer_y}) bg={:?}",
+                buf[(x, footer_y)].bg
+            );
         }
+        let composer_y = find_row(buf, 100, 14, "draft");
+        assert_eq!(
+            buf[(2, composer_y)].bg,
+            crate::theme::mocha::BASE,
+            "composer stays on the document ground"
+        );
     }
 
     #[test]
     fn user_entry_is_a_filled_band() {
         let mut app = App::new(SessionInfo::default());
         app.theme = Theme { colored: true };
-        app.entries.push(Entry::User("hi".into()));
+        app.entries.push(Entry::user("hi"));
         let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer();
@@ -3974,6 +5638,12 @@ mod tests {
         }
         let (x, y) = found.expect("user text not painted");
         assert_eq!(buf[(x, y)].bg, user_bg, "text cell {x},{y}");
+        assert_eq!(
+            buf[(x, y)].fg,
+            crate::theme::mocha::PEACH,
+            "user text is peach, not blue"
+        );
+        assert_ne!(buf[(x, y)].fg, crate::theme::mocha::BLUE);
         // Inner transcript starts at x=1 (left pad); the rail is a lavender
         // glyph on the band ground, not a differently-coloured cell.
         assert_eq!(buf[(1, y)].symbol(), "▎", "accent rail glyph");
@@ -3987,6 +5657,58 @@ mod tests {
         assert_eq!(buf[(x, y - 1)].symbol(), " ", "pad row is spaces");
         assert_eq!(buf[(x, y + 1)].bg, user_bg, "pad row below");
         assert_eq!(buf[(x, y + 1)].symbol(), " ", "pad row is spaces");
+    }
+
+    #[test]
+    fn user_prompt_stamp_is_inline_when_recorded() {
+        let mut app = App::new(SessionInfo::default());
+        app.theme = Theme { colored: true };
+        let at = UNIX_EPOCH + Duration::from_secs(4 * 3600 + 2 * 60);
+        app.entries.push(Entry::User {
+            text: "hello there".into(),
+            at: Some(at),
+        });
+        let out = render(&mut app, 80, 16);
+        let row = out
+            .lines()
+            .find(|line| line.contains("hello there"))
+            .expect("prompt row");
+        assert!(row.contains("04:02"), "inline stamp missing: {row}");
+        assert_eq!(format_user_stamp(at), "04:02");
+        let painted = app.entry_lines(&app.entries[0]).len();
+        let estimated = app.estimated_entry_lines(&app.entries[0]) - 1;
+        assert!(
+            estimated >= painted,
+            "stamp must be in the wrap estimate: estimated {estimated}, painted {painted}"
+        );
+    }
+
+    #[test]
+    fn resumed_user_prompt_has_no_invented_stamp() {
+        let mut app = App::from_transcript(
+            SessionInfo::default(),
+            vec![TranscriptMessage {
+                role: "user".into(),
+                content: "old prompt".into(),
+            }],
+        );
+        match &app.entries[0] {
+            Entry::User { text, at } => {
+                assert_eq!(text, "old prompt");
+                assert_eq!(*at, None, "engine transcript has no per-message time");
+            }
+            other => panic!("{other:?}"),
+        }
+        app.theme = Theme { colored: true };
+        let out = render(&mut app, 80, 16);
+        let row = out
+            .lines()
+            .find(|line| line.contains("old prompt"))
+            .expect("prompt row");
+        assert!(
+            !row.contains("00:") && !row.contains("04:"),
+            "resumed prompt must not invent a clock: {row}"
+        );
     }
 
     #[test]
@@ -4141,16 +5863,39 @@ mod tests {
         assert!(wide.contains("44.7k tok"), "{wide}");
         assert!(wide.contains('▰'), "{wide}");
         assert!(!wide.contains("01J8ZK4M"), "session id stays out: {wide}");
-        // Identity is left of usage: "mowi" before tokens, tokens before safety.
+        // Identity left, safety, then tokens immediately before the gauge.
         let mowi = wide.find("mowi").expect("mowi");
+        let gauge = wide.find('▰').expect("gauge");
         let tokens = wide.find("44.7k tok").expect("tokens");
         let safety = wide.find("read-only").expect("safety");
-        assert!(mowi < tokens && tokens < safety, "{wide}");
+        assert!(mowi < safety && safety < tokens && tokens < gauge, "{wide}");
+        assert!(
+            wide.contains("ask · 44.7k tok"),
+            "safety joins metrics with · : {wide}"
+        );
+        assert!(
+            wide.trim_end().ends_with('%'),
+            "gauge sits at the right edge: {wide}"
+        );
 
         let mid = header_text(&app, 80);
         assert!(mid.contains("mow"), "{mid}");
         assert!(mid.contains("gpt-5-mini (medium)"), "{mid}");
         assert!(!mid.contains('▰'), "gauge waits for a wide row: {mid}");
+        let mid_tokens = mid.find("44.7k tok").expect("tokens");
+        let mid_safety = mid.find("read-only").expect("safety");
+        assert!(
+            mid_safety < mid_tokens,
+            "tokens stay right of safety: {mid}"
+        );
+        assert!(
+            mid.contains("ask · 44.7k tok"),
+            "safety joins tokens when the gauge is gated: {mid}"
+        );
+        assert!(
+            mid.trim_end().ends_with("44.7k tok"),
+            "tokens sit at the right edge when the gauge is gated: {mid}"
+        );
 
         let tight = header_text(&app, 40);
         assert!(tight.contains("gpt-5-mini"), "{tight}");
@@ -4158,6 +5903,14 @@ mod tests {
         assert!(
             !tight.contains("44.7k"),
             "tokens drop before identity: {tight}"
+        );
+        assert!(
+            tight.trim_end().ends_with("ask"),
+            "no trailing separator when metrics are hidden: {tight}"
+        );
+        assert!(
+            !tight.contains("ask ·"),
+            "no trailing · after ask when metrics are hidden: {tight}"
         );
     }
 
@@ -4170,7 +5923,7 @@ mod tests {
     }
 
     #[test]
-    fn footer_busy_names_the_verb_without_the_clock() {
+    fn footer_busy_owns_the_live_clock() {
         let mut app = App::new(SessionInfo::default());
         app.busy = true;
         app.animate = false;
@@ -4178,12 +5931,19 @@ mod tests {
         app.status = "calling model".into();
         let text = footer_text(&app, 80);
         assert!(text.contains("calling model"), "{text}");
-        assert!(!text.contains("0.0s"), "{text}");
+        assert!(
+            text.contains("0.0s"),
+            "elapsed belongs on the status bar: {text}"
+        );
+        assert!(
+            !text.contains("idle"),
+            "idle must not sit beside the clock: {text}"
+        );
         assert!(!text.contains("busy"), "coarse busy is replaced: {text}");
     }
 
     #[test]
-    fn footer_shows_session_id_only_as_leftover() {
+    fn footer_never_shows_session_id() {
         let mut app = App::new(SessionInfo {
             session_id: "20260814abcdef".into(),
             workspace: "/w".into(),
@@ -4192,48 +5952,51 @@ mod tests {
         });
 
         let wide = footer_text(&app, 80);
-        assert!(
-            wide.contains("20260814abcdef"),
-            "full session id when status and ? fit: {wide}"
-        );
-        assert!(wide.contains("?"), "minimum hint stays: {wide}");
         assert!(wide.contains("idle"), "{wide}");
+        assert!(wide.contains("?"), "{wide}");
+        assert!(
+            !wide.contains("20260814abcdef"),
+            "session id is not status-bar chrome: {wide}"
+        );
 
         app.busy = true;
+        app.activity_started = Some(Instant::now());
         app.status = "calling model".into();
         let busy = footer_text(&app, 80);
-        assert!(
-            busy.contains("20260814abcdef"),
-            "id outranks a long hint while busy: {busy}"
-        );
         assert!(busy.contains("calling model"), "{busy}");
         assert!(busy.contains('?'), "{busy}");
+        assert!(
+            !busy.contains("20260814abcdef"),
+            "session id stays off the busy status bar: {busy}"
+        );
         app.busy = false;
         app.status.clear();
 
-        // Status + `?` fit; ` · 20260814abcdef` would push `?` off. Hide the id.
         let tight = footer_text(&app, 16);
         assert!(tight.contains("idle"), "{tight}");
-        assert!(tight.contains('?'), "minimum hint outranks the id: {tight}");
         assert!(
             !tight.contains("20260814"),
-            "no room for leftover id: {tight}"
+            "session id is gone at every width: {tight}"
         );
 
         app.status = "copied locally".into();
         let news = footer_text(&app, 30);
         assert!(news.contains("copied locally"), "{news}");
         assert!(news.contains('?'), "{news}");
+        assert!(!news.contains("20260814"), "{news}");
+
+        app.overlay = Overlay::help();
+        let help = render(&mut app, 80, 24);
         assert!(
-            !news.contains("20260814"),
-            "status and `?` are never evicted for the id: {news}"
+            help.contains("20260814abcdef"),
+            "full session id belongs in the help overlay: {help}"
         );
     }
 
     #[test]
     fn tiny_terminal_paints_a_warning_not_a_broken_frame() {
         let mut app = App::new(SessionInfo::default());
-        app.entries.push(Entry::User("hi".into()));
+        app.entries.push(Entry::user("hi"));
         let out = render(&mut app, 30, 8);
         assert!(out.contains("too small"), "{out}");
         assert!(!out.contains("> hi"), "{out}");
@@ -4288,7 +6051,10 @@ mod tests {
 
     #[test]
     fn help_overlay_lists_local_keys_and_slash_commands() {
-        let mut app = App::new(SessionInfo::default());
+        let mut app = App::new(SessionInfo {
+            session_id: "01J8ZK4M7Q2XN5V9".into(),
+            ..Default::default()
+        });
         app.slash_commands.push(SlashCommand {
             name: "review".into(),
             summary: "review changes".into(),
@@ -4298,6 +6064,10 @@ mod tests {
         app.overlay = Overlay::help();
         let out = render(&mut app, 80, 24);
         assert!(out.contains("help") || out.contains("keyboard"), "{out}");
+        assert!(
+            out.contains("01J8ZK4M7Q2XN5V9"),
+            "full session id belongs on the help card: {out}"
+        );
         assert!(out.contains("ctrl+j"), "{out}");
         assert!(
             out.contains("engine history kept)"),
@@ -4312,8 +6082,21 @@ mod tests {
             "plain t is not a tool-group shortcut: {out}"
         );
         assert!(out.contains("pgup / pgdn"), "{out}");
-        // The table is longer than any overlay: the tail is reachable by
-        // scrolling, not by being painted at once.
+        assert!(out.contains("↑ / ↓"), "{out}");
+        assert!(
+            out.contains("/edit"),
+            "last-prompt recall is /edit, not arrow keys: {out}"
+        );
+        assert!(
+            out.contains("/steer"),
+            "steer must be advertised as a local command: {out}"
+        );
+        assert!(
+            !out.contains("browse prior"),
+            "arrow keys must not be advertised as prompt history: {out}"
+        );
+        // Extra slash rows push the table past a short pane: the tail is
+        // reachable by scrolling, not by being painted at once.
         for _ in 0..app.help_rows().len() {
             app.overlay_move(1);
         }
@@ -4321,12 +6104,74 @@ mod tests {
         assert!(tail.contains("/review"), "{tail}");
         assert!(tail.contains("/model"), "{tail}");
         assert!(tail.contains("/quit"), "{tail}");
+        assert!(tail.contains("/lsp"), "{tail}");
+        assert!(tail.contains("/status"), "{tail}");
         assert!(!out.contains("ctrl+s"), "{out}");
 
         assert!(app.dismiss_overlay());
         assert_eq!(app.overlay, Overlay::None);
         let out = render(&mut app, 70, 20);
         assert!(!out.contains("ctrl+j"), "{out}");
+    }
+
+    #[test]
+    fn help_overlay_hugs_its_rows_and_survives_narrow() {
+        let mut app = App::new(SessionInfo {
+            session_id: "01J8ZK4M7Q2XN5V9".into(),
+            ..Default::default()
+        });
+        app.overlay = Overlay::help();
+        let n = app.help_rows().len() as u16;
+
+        // A 30-row frame has room for the default table: the card must close
+        // after the last row instead of filling the document with empty cells.
+        let tall = render(&mut app, 100, 30);
+        let lines: Vec<&str> = tall.lines().collect();
+        let top = lines
+            .iter()
+            .position(|line| line.contains('╭'))
+            .expect("help top border");
+        let bot = lines
+            .iter()
+            .rposition(|line| line.contains('╰'))
+            .expect("help bottom border");
+        let overlay_h = (bot - top + 1) as u16;
+        assert_eq!(
+            overlay_h,
+            (n + HELP_CHROME_H).min(HELP_MAX_HEIGHT),
+            "help card should hug or cap its rows, got {overlay_h}:\n{tall}"
+        );
+        assert!(
+            overlay_h < 25,
+            "help card filled the document pane:\n{tall}"
+        );
+        assert!(
+            tall.contains("/quit"),
+            "default rows must fit at 100x30:\n{tall}"
+        );
+        assert!(
+            tall.contains("01J8ZK4M7Q2XN5V9"),
+            "session id must not grow the card into a slab:\n{tall}"
+        );
+        assert!(
+            tall.contains("engine history kept)"),
+            "action column must not shear the kept) close: {tall}"
+        );
+
+        // MIN_WIDTH still paints keys, a usable action stub, and the chrome
+        // underneath — a sheared-to-nothing action column is a layout bug.
+        let narrow = render(&mut app, MIN_WIDTH, 20);
+        assert!(narrow.contains("enter"), "{narrow}");
+        assert!(narrow.contains("ctrl+j"), "{narrow}");
+        assert!(
+            narrow.contains("send") || narrow.contains("queue"),
+            "action column vanished at MIN_WIDTH:\n{narrow}"
+        );
+        assert!(narrow.contains("idle"), "{narrow}");
+        assert!(
+            narrow.contains("01J8ZK4M7Q2XN5V9"),
+            "full session id survives MIN_WIDTH:\n{narrow}"
+        );
     }
 
     #[test]
@@ -4496,7 +6341,7 @@ mod tests {
         assert!(!app.ask_mode);
         assert_eq!(app.toggle_ask_mode(), "ask");
 
-        app.entries.push(Entry::User("hi".into()));
+        app.entries.push(Entry::user("hi"));
         app.live.push_str("partial");
         app.clear_transcript();
         assert!(app.entries.is_empty());
@@ -4520,6 +6365,46 @@ mod tests {
         assert_eq!(app.peer_focus.as_deref(), Some("peer-agent"));
         assert!(app.toggle_peer_expand());
         assert!(app.peer_focus.is_none());
+    }
+
+    #[test]
+    fn peer_overlay_hugs_content_and_scrolls_from_the_tail() {
+        let mut app = App::new(SessionInfo::default());
+        app.peers.insert(
+            "peer-agent".into(),
+            (1..=30).map(|n| format!("line {n}\n")).collect(),
+        );
+        assert!(app.toggle_peer_expand());
+        app.overlay = Overlay::Peer;
+        let tail = render(&mut app, 80, 30);
+        assert!(tail.contains("line 30"), "{tail}");
+        assert!(!tail.contains("line 1 "), "{tail}");
+        assert!(!tail.contains("line 10"), "{tail}");
+
+        app.overlay_move(-1);
+        let older = render(&mut app, 80, 30);
+        assert!(
+            older.contains("line 14") || older.contains("line 13"),
+            "one step toward older output:\n{older}"
+        );
+        assert!(
+            !older
+                .lines()
+                .any(|line| line.contains('│') && line.contains("line 30")),
+            "newest card line should leave after scrolling up:\n{older}"
+        );
+
+        let short = render(
+            &mut {
+                app.peers.insert("peer-agent".into(), "one\ntwo".into());
+                app.peer_scroll = 0;
+                app
+            },
+            80,
+            30,
+        );
+        let filled_rows = short.lines().filter(|line| line.contains('│')).count();
+        assert!(filled_rows <= 5, "peer card stayed too tall:\n{short}");
     }
 
     #[test]
@@ -4687,6 +6572,122 @@ mod tests {
     }
 
     #[test]
+    fn status_summary_is_human_readable() {
+        let mut app = App::new(SessionInfo {
+            session_id: "01J8ZK4M7Q2XN5V9".into(),
+            workspace: "/home/dev/mowi".into(),
+            model: "composer-2".into(),
+            ..Default::default()
+        });
+        app.apply_status(&serde_json::json!({
+            "allow_write": true,
+            "allow_shell": true,
+            "ask_mode": "ask",
+            "effort": "high",
+        }));
+        app.apply_context(&usage(12_300, Some(200_000), Some(6.15)));
+        app.usage.input_tokens = 800;
+        app.usage.output_tokens = 400;
+        app.usage.peer_tokens = 250;
+        let summary = app.status_summary();
+        assert!(summary.contains("composer-2"), "{summary}");
+        assert!(summary.contains("mowi"), "{summary}");
+        assert!(summary.contains("perm ask"), "{summary}");
+        assert!(summary.contains("write+shell"), "{summary}");
+        assert!(summary.contains("effort high"), "{summary}");
+        assert!(summary.contains("context: 12.3k / 200k (6%)"), "{summary}");
+        assert!(summary.contains("⇄"), "{summary}");
+        assert!(summary.contains("01J8ZK4M7Q2XN5V9"), "{summary}");
+        assert!(!summary.contains('{'), "raw JSON leaked: {summary}");
+        assert!(
+            !summary.contains("allow_write"),
+            "raw JSON leaked: {summary}"
+        );
+    }
+
+    #[test]
+    fn lsp_events_stay_to_one_summary_note() {
+        let mut app = App::new(SessionInfo::default());
+        app.on_notification(&Notification {
+            method: "event".into(),
+            params: serde_json::json!({
+                "type": "harness.lsp.diagnostics",
+                "tool": "edit",
+                "path": "src/app.rs",
+                "count": 8,
+                "diagnostics": [
+                    {"severity": "error", "message": "undefined: foo", "line": 42, "source": "compiler"},
+                    {"severity": "warning", "message": "unused", "line": 8},
+                    {"severity": "hint", "message": "prefer", "line": 9},
+                ]
+            }),
+        });
+        let notes: Vec<_> = app
+            .entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Note(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notes, vec!["lsp · src/app.rs · 8 problem(s)"]);
+        assert_eq!(app.lsp_problems.len(), 1);
+        assert!(!notes.iter().any(|n| n.contains("undefined: foo")));
+
+        app.on_notification(&Notification {
+            method: "event".into(),
+            params: serde_json::json!({
+                "type": "harness.lsp.diagnostics",
+                "path": "clean.go",
+                "count": 0
+            }),
+        });
+        assert_eq!(app.lsp_problems.len(), 1);
+
+        app.on_notification(&Notification {
+            method: "event".into(),
+            params: serde_json::json!({
+                "type": "harness.lsp.diagnostics",
+                "path": "src/app.rs",
+                "count": 1,
+                "diagnostics": [
+                    {"severity": "error", "message": "newest", "line": 9}
+                ]
+            }),
+        });
+        assert_eq!(app.lsp_problems.len(), 1);
+        assert_eq!(app.lsp_problems[0].count, 1);
+        assert_eq!(app.lsp_problems[0].diagnostics[0].message, "newest");
+
+        app.show_lsp_problems();
+        let last = match app.entries.last() {
+            Some(Entry::Note(text)) => text,
+            other => panic!("expected detail note, got {other:?}"),
+        };
+        assert!(last.contains("newest"), "{last}");
+        assert!(last.contains("src/app.rs:9"), "{last}");
+    }
+
+    #[test]
+    fn compact_defers_while_busy_unless_control() {
+        assert_eq!(plan_compact(true, false), CompactPlan::Defer);
+        assert_eq!(plan_compact(false, false), CompactPlan::Send);
+        assert_eq!(plan_compact(true, true), CompactPlan::Send);
+
+        let mut app = App::new(SessionInfo::default());
+        assert!(!app.compact_is_control());
+        app.busy = true;
+        app.pending_compact = Some(0);
+        let msg = "compact · applies when the turn finishes";
+        app.status = msg.into();
+        app.entries.push(Entry::Note(msg.into()));
+        assert_eq!(app.pending_compact, Some(0));
+
+        app.set_control_methods(&["compact".into()]);
+        assert!(app.compact_is_control());
+    }
+
+    #[test]
     fn static_spinner_when_animation_is_off() {
         let mut app = App::new(SessionInfo::default());
         app.animate = false;
@@ -4702,7 +6703,7 @@ mod tests {
         }
         for name in [
             "help", "search", "copy", "retry", "edit", "steer", "sessions", "status", "model",
-            "effort", "clear",
+            "effort", "clear", "lsp", "perm", "compact",
         ] {
             assert_eq!(slash_route(name, &[]), SlashRoute::Local, "/{name}");
         }
@@ -4812,12 +6813,22 @@ mod tests {
     }
 
     #[test]
-    fn busy_activity_row_does_not_shrink_transcript_height() {
-        let mut app = App::new(SessionInfo::default());
-        app.busy = true;
+    fn busy_does_not_steal_a_transcript_row() {
+        let mut idle = App::new(SessionInfo::default());
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        assert!(app.last_view_h > 10, "height was {}", app.last_view_h);
+        terminal.draw(|frame| draw(frame, &mut idle)).unwrap();
+        let idle_h = idle.last_view_h;
+
+        let mut busy = App::new(SessionInfo::default());
+        busy.busy = true;
+        busy.activity_started = Some(Instant::now());
+        busy.status = "calling model".into();
+        terminal.draw(|frame| draw(frame, &mut busy)).unwrap();
+        assert_eq!(
+            busy.last_view_h, idle_h,
+            "busy must not take a transcript row for a clock band"
+        );
+        assert!(busy.last_view_h > 10, "height was {}", busy.last_view_h);
     }
 
     #[test]
@@ -4868,7 +6879,7 @@ mod tests {
         });
         assert_eq!(app.live_tools, vec![("grep".to_string(), None)]);
         assert!(app.entries.is_empty(), "not committed mid-turn");
-        assert_eq!(app.status, "tool · grep");
+        assert_eq!(app.status, "searching · grep");
         app.on_notification(&Notification {
             method: "event".into(),
             params: serde_json::json!({
@@ -4945,7 +6956,7 @@ mod tests {
     fn tool_group_collapsed_paints_one_row_expanded_paints_all() {
         let mut app = App::new(SessionInfo::default());
         app.theme = Theme { colored: true };
-        app.entries.push(Entry::User("run the suite".into()));
+        app.entries.push(Entry::user("run the suite"));
         app.entries.push(Entry::Tools {
             tools: vec![
                 ("read src/app.rs".into(), Some(120)),
@@ -4982,11 +6993,107 @@ mod tests {
         handle_view_key(app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
     }
 
+    /// Rightmost column of the transcript pane, and the same column under
+    /// the composer + footer (those must stay free of bar glyphs).
+    fn scrollbar_columns(app: &mut App, w: u16, h: u16) -> (String, String) {
+        let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
+        terminal.draw(|f| draw(f, app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let x = w.saturating_sub(1);
+        // header + hairline, then transcript, then composer, then 2-row footer.
+        let input_h = input_height(app, w.saturating_sub(2));
+        let transcript_top = 2u16;
+        let transcript_bot = h.saturating_sub(2 + input_h + 1);
+        let bar: String = (transcript_top..=transcript_bot)
+            .map(|y| buf[(x, y)].symbol().to_string())
+            .collect();
+        let below: String = (transcript_bot.saturating_add(1)..h)
+            .map(|y| buf[(x, y)].symbol().to_string())
+            .collect();
+        (bar, below)
+    }
+
+    fn long_scroll_app() -> App {
+        let mut app = App::new(SessionInfo::default());
+        app.theme = Theme { colored: false };
+        app.welcome = false;
+        for i in 0..40 {
+            app.entries.push(Entry::user(format!("user-line-{i}")));
+            app.entries
+                .push(Entry::Assistant(format!("assistant-line-{i}")));
+        }
+        app
+    }
+
+    #[test]
+    fn scrollbar_state_uses_scroll_offsets_not_line_count() {
+        let follow = format!("{:?}", transcript_scrollbar_state(100, 20, 0, true));
+        assert!(
+            follow.contains("content_length: 81"),
+            "follow length is max_scroll+1, not 100: {follow}"
+        );
+        assert!(
+            follow.contains("position: 80"),
+            "follow position is max_scroll, not 99: {follow}"
+        );
+        let top = format!("{:?}", transcript_scrollbar_state(100, 20, 0, false));
+        assert!(top.contains("position: 0"), "{top}");
+        let mid = format!("{:?}", transcript_scrollbar_state(100, 20, 40, false));
+        assert!(mid.contains("position: 40"), "{mid}");
+    }
+
+    fn assert_scrollbar_track(bar: &str, below: &str, where_: &str) {
+        assert!(
+            bar.starts_with('↑') && bar.ends_with('↓'),
+            "{where_}: track must run ↑…↓ across the transcript, got {bar:?}"
+        );
+        assert!(
+            !below.chars().any(|c| matches!(c, '↑' | '↓' | '║' | '█')),
+            "{where_}: bar leaked into composer/footer {below:?}"
+        );
+    }
+
+    #[test]
+    fn transcript_scrollbar_reaches_the_pane_bottom() {
+        for height in [12u16, 24] {
+            let mut app = long_scroll_app();
+            app.follow = false;
+            app.scroll = 0;
+            let (top, below) = scrollbar_columns(&mut app, 80, height);
+            assert_scrollbar_track(&top, &below, &format!("h={height} top"));
+            assert!(
+                top.chars().nth(1) == Some('█'),
+                "h={height} top: thumb should sit under ↑, got {top}"
+            );
+
+            let max = max_scroll(&app);
+            assert!(max > 4, "fixture must overflow, max={max}");
+            app.scroll = max / 2;
+            let (mid, below) = scrollbar_columns(&mut app, 80, height);
+            assert_scrollbar_track(&mid, &below, &format!("h={height} mid"));
+            let mid_thumb = mid.find('█').expect("mid thumb");
+            let mid_thumb_end = mid.rfind('█').expect("mid thumb end");
+            assert!(
+                mid_thumb > 1 && mid_thumb_end + 1 < mid.len() - 1,
+                "h={height} mid: thumb should sit in the track, got {mid}"
+            );
+
+            app.follow = true;
+            app.scroll = 0;
+            let (bot, below) = scrollbar_columns(&mut app, 80, height);
+            assert_scrollbar_track(&bot, &below, &format!("h={height} bottom"));
+            assert!(
+                bot.chars().rev().nth(1) == Some('█'),
+                "h={height} bottom: thumb should sit on ↓, got {bot}"
+            );
+        }
+    }
+
     fn tall_transcript(app: &mut App) {
         app.last_view_h = 6;
         app.last_view_w = 40;
         for i in 0..20 {
-            app.entries.push(Entry::User(format!("user-{i}")));
+            app.entries.push(Entry::user(format!("user-{i}")));
             app.entries.push(Entry::Assistant(format!("asst-{i}")));
         }
         app.follow = true;
@@ -5018,22 +7125,28 @@ mod tests {
     }
 
     #[test]
-    fn arrow_up_recalls_only_when_composer_is_empty() {
+    fn arrow_keys_scroll_transcript_and_never_rewrite_composer() {
         let mut app = App::new(SessionInfo::default());
         tall_transcript(&mut app);
-        app.entries.push(Entry::User("last prompt".into()));
+        app.entries.push(Entry::user("last prompt"));
+        assert!(app.input.is_empty());
 
-        press(&mut app, KeyCode::Up);
-        assert_eq!(app.input, "last prompt");
-        assert!(app.follow, "history recall must not scroll");
-
-        app.set_input("draft".into());
         press(&mut app, KeyCode::Up);
         assert_eq!(
-            app.input, "draft",
-            "arrow-up is inert when the composer has text"
+            app.input, "",
+            "arrow-up must scroll, not recall the last prompt"
         );
-        assert!(app.follow, "arrow-up must not scroll a non-empty composer");
+        assert!(!app.follow, "arrow-up leaves follow");
+
+        app.set_input("draft".into());
+        let scroll = app.scroll;
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.input, "draft");
+        assert!(app.scroll < scroll || scroll == 0);
+        assert!(!app.follow);
+
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.input, "draft", "arrow-down must not rewrite the draft");
     }
 
     #[test]
@@ -5049,17 +7162,53 @@ mod tests {
         app.follow = true;
         press(&mut app, KeyCode::PageDown);
         assert_eq!(app.input, "keep me");
+        assert!(app.follow, "pgdn at the bottom stays in follow");
 
         app.follow = true;
         press(&mut app, KeyCode::Down);
         assert_eq!(app.input, "keep me");
-        assert!(app.follow, "arrow-down is not a scroll binding");
+        assert!(app.follow, "arrow-down at the bottom stays in follow");
+
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.input, "keep me");
+        assert!(!app.follow, "arrow-up scrolls the transcript");
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.input, "keep me");
 
         app.follow = true;
         press_ctrl(&mut app, 'u');
         press_ctrl(&mut app, 'd');
         assert_eq!(app.input, "keep me", "ctrl+u/d must not type or recall");
         assert!(app.follow, "ctrl+u/d must not scroll");
+    }
+
+    #[test]
+    fn mouse_wheel_scrolls_transcript_only() {
+        let mut app = App::new(SessionInfo::default());
+        tall_transcript(&mut app);
+        app.set_input("keep me".into());
+
+        handle_mouse(&mut app, MouseEventKind::ScrollUp);
+        assert_eq!(app.input, "keep me");
+        assert!(!app.follow, "wheel up scrolls the transcript");
+        // Regression (post-scroll freeze): scrolling back down to the tail
+        // must re-enter follow so streaming auto-scroll resumes.
+        for _ in 0..1000 {
+            handle_mouse(&mut app, MouseEventKind::ScrollDown);
+            if app.follow {
+                break;
+            }
+        }
+        assert!(app.follow, "scrolling back to the bottom re-enters follow");
+
+        handle_mouse(&mut app, MouseEventKind::ScrollDown);
+        assert_eq!(app.input, "keep me", "wheel down must not rewrite input");
+
+        app.overlay = Overlay::help();
+        app.follow = true;
+        handle_mouse(&mut app, MouseEventKind::ScrollUp);
+        assert!(app.follow, "wheel is ignored while an overlay is open");
+        assert_eq!(app.input, "keep me");
     }
 
     #[test]
@@ -5189,7 +7338,10 @@ mod tests {
         assert_eq!(
             app.entries,
             vec![
-                Entry::User("hi".into()),
+                Entry::User {
+                    text: "hi".into(),
+                    at: None,
+                },
                 Entry::Assistant("hello".into()),
                 Entry::Note("tool: grep".into()),
             ]
@@ -5251,7 +7403,7 @@ mod tests {
     #[test]
     fn search_cycles_and_edit_remembers_last_user() {
         let mut app = App::new(SessionInfo::default());
-        app.entries.push(Entry::User("find this".into()));
+        app.entries.push(Entry::user("find this"));
         app.entries.push(Entry::Assistant("find that".into()));
         app.entries.push(Entry::Note("other".into()));
         assert_eq!(app.search("find"), Some((1, 2)));
@@ -5268,7 +7420,438 @@ mod tests {
         assert!(app.copy_last_assistant());
         assert_eq!(app.last_copy, "answer");
         assert!(!app.footer().contains("ctrl+s"), "{}", app.footer());
-        // The copy is a local state note, not an engine round trip.
-        assert!(app.footer().contains("copied locally"), "{}", app.footer());
+        assert!(app.footer().contains("copied"), "{}", app.footer());
+        let seq = app.take_osc52().expect("OSC52 queued for the next draw");
+        assert!(seq.starts_with("\x1b]52;c;"), "{seq:?}");
+        assert!(seq.ends_with('\x07'), "{seq:?}");
+        assert!(!seq.contains("answer"), "payload is base64, not raw text");
+        assert_eq!(osc52_sequence("hi"), Some("\x1b]52;c;aGk=\x07".into()));
+    }
+
+    #[test]
+    fn cancel_drops_queue_and_cancelled_completion_does_not_drain() {
+        let mut app = App::new(SessionInfo::default());
+        assert!(app.enqueue_prompt("follow-up".into()));
+        app.request_cancel();
+        assert!(app.queue.is_empty());
+        assert!(
+            app.entries
+                .iter()
+                .any(|entry| matches!(entry, Entry::Note(text) if text.contains("dropped 1"))),
+            "{:?}",
+            app.entries
+        );
+        assert!(app.take_queued_after_turn(true).is_none());
+        assert!(app.queue.is_empty());
+
+        let mut app = App::new(SessionInfo::default());
+        assert!(app.enqueue_prompt("next".into()));
+        assert_eq!(app.take_queued_after_turn(true).as_deref(), Some("next"));
+
+        let mut app = App::new(SessionInfo::default());
+        assert!(app.enqueue_prompt("keep".into()));
+        assert!(app.take_queued_after_turn(false).is_none());
+        assert_eq!(app.queue.len(), 1);
+    }
+
+    #[test]
+    fn rewind_followup_replaces_the_old_turn_then_edits() {
+        let mut app = App::new(SessionInfo::default());
+        app.entries.push(Entry::user("old prompt"));
+        app.entries.push(Entry::Assistant("old answer".into()));
+        app.rewind_user = Some("old prompt".into());
+        app.load_transcript(vec![TranscriptMessage {
+            role: "user".into(),
+            content: "earlier".into(),
+        }]);
+        let last = app.rewind_user.take().unwrap();
+        app.set_input(last);
+        assert_eq!(app.input, "old prompt");
+        assert!(
+            !app.entries
+                .iter()
+                .any(|entry| matches!(entry, Entry::Assistant(text) if text == "old answer")),
+            "rewound transcript must not keep the discarded answer: {:?}",
+            app.entries
+        );
+        assert_eq!(app.last_user_prompt().as_deref(), Some("earlier"));
+
+        let mut app = App::new(SessionInfo::default());
+        app.entries.push(Entry::user("keep"));
+        app.entries.push(Entry::Assistant("keep-a".into()));
+        app.entries.push(Entry::user("drop"));
+        app.entries.push(Entry::Assistant("drop-a".into()));
+        app.drop_last_turn_entries();
+        assert_eq!(app.last_user_prompt().as_deref(), Some("keep"));
+        assert!(
+            !app.entries
+                .iter()
+                .any(|entry| matches!(entry, Entry::Assistant(text) if text == "drop-a"))
+        );
+    }
+
+    #[test]
+    fn reasoning_and_think_tags_never_paint() {
+        let mut app = App::new(SessionInfo::default());
+        app.busy = true;
+        app.on_notification(&Notification {
+            method: "event".into(),
+            params: serde_json::json!({"type":"loop.reasoning","delta":"secret plan details"}),
+        });
+        assert_eq!(app.status, "thinking");
+        assert!(app.thinking);
+        assert!(app.live.is_empty(), "{}", app.live);
+        let painted = render(&mut app, 80, 18);
+        assert!(
+            !painted.contains("secret plan details"),
+            "reasoning body leaked:\n{painted}"
+        );
+        assert!(painted.contains("thinking"), "{painted}");
+
+        app.on_notification(&Notification {
+            method: "event".into(),
+            params: serde_json::json!({"type":"loop.token","delta":"<think>do not show this"}),
+        });
+        assert!(app.live.is_empty(), "unclosed think must hide answer");
+        assert!(
+            !render(&mut app, 80, 18).contains("do not show this"),
+            "open think leaked"
+        );
+
+        app.on_notification(&Notification {
+            method: "event".into(),
+            params: serde_json::json!({"type":"loop.token","delta":"</think>## Hello"}),
+        });
+        assert_eq!(app.live, "## Hello");
+        assert!(!app.live.contains("do not show"));
+        let painted = render(&mut app, 80, 18);
+        assert!(
+            painted.contains("## Hello") || painted.contains("Hello"),
+            "{painted}"
+        );
+        assert!(!painted.contains("do not show this"), "{painted}");
+        assert!(!painted.contains("secret plan"), "{painted}");
+
+        app.finish_turn(Ok(serde_json::json!({
+            "text": "<think>still secret</think>Final answer."
+        })));
+        assert!(
+            app.entries.iter().any(|entry| matches!(
+                entry,
+                Entry::Assistant(text) if text.contains("Final answer") && !text.contains("still secret")
+            )),
+            "{:?}",
+            app.entries
+        );
+    }
+
+    #[test]
+    fn think_strip_does_not_weld_surrounding_prose() {
+        let mut app = App::new(SessionInfo::default());
+        app.push_visible_token("key files.<think>plan the approach</think>Let me go");
+        assert_eq!(app.live, "key files. Let me go");
+        assert!(!app.live.contains("plan the approach"));
+    }
+
+    fn huge_markdown(sections: usize) -> String {
+        let mut text = String::new();
+        for i in 0..sections {
+            text.push_str(&format!("## Heading {i}\n\n"));
+            text.push_str(
+                "This is a paragraph with **bold** and `code` and a [link](https://example.com).\n\n",
+            );
+            text.push_str("```rust\n");
+            for j in 0..20 {
+                text.push_str(&format!(
+                    "    fn item_{i}_{j}() {{ println!(\"{i}:{j}\"); }}\n"
+                ));
+            }
+            text.push_str("```\n\n");
+        }
+        text
+    }
+
+    fn large_session_with_buried_answer() -> App {
+        let mut app = App::new(SessionInfo::default());
+        app.theme = Theme { colored: true };
+        app.animate = false;
+        app.last_view_w = 80;
+        app.last_view_h = 24;
+        for i in 0..80 {
+            app.entries.push(Entry::user(format!("q{i}")));
+            app.entries
+                .push(Entry::Assistant(format!("short answer {i}")));
+        }
+        app.entries.push(Entry::user("explain the whole file"));
+        app.entries.push(Entry::Assistant(huge_markdown(80)));
+        for i in 0..8 {
+            app.entries.push(Entry::user(format!("followup {i}")));
+            app.entries.push(Entry::Assistant(format!("ok {i}")));
+        }
+        app.follow = true;
+        app.scroll = 0;
+        app
+    }
+
+    fn window_line_bound(viewport: usize) -> usize {
+        viewport + TRANSCRIPT_OVERSCAN * 2 + 8
+    }
+
+    #[test]
+    fn live_height_is_counted_in_the_document() {
+        let mut app = App::new(SessionInfo::default());
+        app.last_view_w = 80;
+        app.live = "hello\nworld\n".repeat(50);
+        let n = app.estimated_total_lines();
+        assert!(
+            n > 50,
+            "live must not collapse to one estimated row, got {n}"
+        );
+    }
+
+    #[test]
+    fn scroll_up_virtualizes_large_transcript_and_live() {
+        use std::time::Instant;
+
+        let mut app = large_session_with_buried_answer();
+        let bound = window_line_bound(24);
+
+        let follow_n = app.visible_transcript_lines().0.len();
+        assert!(
+            follow_n <= bound,
+            "follow materialized {follow_n} lines (bound {bound})"
+        );
+
+        leave_follow(&mut app, 5);
+        for _ in 0..60 {
+            leave_follow(&mut app, 5);
+        }
+        assert!(!app.follow);
+        let scroll_n = app.visible_transcript_lines().0.len();
+        assert!(
+            scroll_n <= bound,
+            "scroll-up materialized {scroll_n} lines (bound {bound})"
+        );
+        let out = render(&mut app, 80, 24);
+        assert!(
+            out.contains("Heading") || out.contains("short answer") || out.contains("followup"),
+            "scrolled frame painted nothing recognizable:\n{out}"
+        );
+
+        // A streaming turn must not rematerialize the whole live buffer when
+        // the operator has already paged into earlier history.
+        app.live = huge_markdown(200);
+        app.busy = true;
+        let with_live = app.visible_transcript_lines().0.len();
+        assert!(
+            with_live <= bound,
+            "scroll-up with live materialized {with_live} lines (bound {bound})"
+        );
+
+        app.follow = true;
+        app.scroll = 0;
+        let follow_live = app.visible_transcript_lines().0.len();
+        assert!(
+            follow_live <= bound,
+            "follow with live materialized {follow_live} lines (bound {bound})"
+        );
+
+        // Hang detector: a handful of scroll+draw steps on this session used
+        // to rematerialize thousands of lines per frame.
+        let started = Instant::now();
+        for _ in 0..8 {
+            leave_follow(&mut app, 5);
+            let _ = render(&mut app, 80, 24);
+        }
+        let ms = started.elapsed().as_millis();
+        assert!(
+            ms < 800,
+            "scroll+draw loop took {ms}ms on a virtualized window"
+        );
+    }
+
+    fn line_text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn height_cache_reuses_estimates_on_large_session() {
+        use std::time::Instant;
+
+        let app = large_session_with_buried_answer();
+        let first = app.estimated_total_lines();
+        assert!(
+            first > 1_000,
+            "buried answer should dominate height, got {first}"
+        );
+        let started = Instant::now();
+        for _ in 0..40 {
+            assert_eq!(app.estimated_total_lines(), first);
+        }
+        let ms = started.elapsed().as_millis();
+        assert!(
+            ms < 40,
+            "cached estimated_total_lines x40 took {ms}ms (was ~80ms uncached)"
+        );
+    }
+
+    #[test]
+    fn live_height_incremental_matches_full_recompute() {
+        let mut app = App::new(SessionInfo::default());
+        app.last_view_w = 80;
+        app.live = "hello\nworld\n".repeat(80);
+        let after_seed = app.estimated_live_lines();
+
+        app.live.push_str("more tokens **bold**\n");
+        app.live.push_str(&"tail line\n".repeat(20));
+        let incremental = app.estimated_live_lines();
+
+        let mut fresh = App::new(SessionInfo::default());
+        fresh.last_view_w = 80;
+        fresh.live = app.live.clone();
+        assert_eq!(incremental, fresh.estimated_live_lines());
+        assert!(incremental > after_seed);
+
+        // Wholesale replace must not be treated as an append.
+        app.live = huge_markdown(12);
+        let replaced = app.estimated_live_lines();
+        fresh.live = app.live.clone();
+        fresh.height_cache.borrow_mut().clear();
+        assert_eq!(replaced, fresh.estimated_live_lines());
+    }
+
+    #[test]
+    fn scrolled_paint_reuses_cached_entry_without_full_clone() {
+        use std::time::Instant;
+
+        let mut app = large_session_with_buried_answer();
+        for _ in 0..80 {
+            leave_follow(&mut app, 5);
+        }
+        let first = app.visible_transcript_lines().0.len();
+        let bound = window_line_bound(24);
+        assert!(first <= bound, "first scroll window {first} > {bound}");
+
+        let started = Instant::now();
+        for _ in 0..30 {
+            let n = app.visible_transcript_lines().0.len();
+            assert!(n <= bound, "cached scroll window {n} > {bound}");
+        }
+        let ms = started.elapsed().as_millis();
+        assert!(
+            ms < 40,
+            "cached scrolled visible_transcript_lines x30 took {ms}ms"
+        );
+    }
+
+    #[test]
+    fn live_follow_parses_visible_tail_not_whole_stream() {
+        use std::time::Instant;
+
+        let mut app = App::new(SessionInfo::default());
+        app.theme = Theme { colored: true };
+        app.animate = false;
+        app.last_view_w = 80;
+        app.last_view_h = 24;
+        app.follow = true;
+        app.busy = true;
+        app.live = huge_markdown(80);
+
+        let (lines, _) = app.visible_transcript_lines();
+        let text = line_text(&lines);
+        assert!(
+            text.contains("Heading 79"),
+            "follow tail must show the latest heading:\n{text}"
+        );
+        assert!(
+            !text.contains("Heading 0"),
+            "follow tail must not rematerialize the start of a 2k-line stream:\n{text}"
+        );
+        assert!(
+            lines.len() <= window_line_bound(24),
+            "live follow materialized {} lines",
+            lines.len()
+        );
+
+        let started = Instant::now();
+        for i in 0..20 {
+            app.live.push_str(&format!("\nstreaming token {i} **x**\n"));
+            let (lines, _) = app.visible_transcript_lines();
+            assert!(
+                lines.len() <= window_line_bound(24),
+                "live tick materialized {} lines",
+                lines.len()
+            );
+        }
+        let ms = started.elapsed().as_millis();
+        assert!(
+            ms < 200,
+            "live follow tail stream x20 took {ms}ms (full markdown was ~8ms/tick)"
+        );
+        let text = line_text(&app.visible_transcript_lines().0);
+        assert!(
+            text.contains("streaming token 19"),
+            "latest tokens must remain visible:\n{text}"
+        );
+    }
+
+    #[test]
+    fn live_tail_source_extends_to_open_fence() {
+        let mut body = String::from("intro\n\n```rust\n");
+        body.push_str(&"    fn buried() {}\n".repeat(40));
+        body.push_str("    fn visible() {}\n```\n");
+        let suffix = live_tail_source(&body, 8, 80);
+        assert!(
+            suffix.contains("```rust"),
+            "odd fence count must pull in the opening fence:\n{suffix}"
+        );
+        assert!(suffix.contains("fn visible"), "{suffix}");
+    }
+
+    #[test]
+    fn needs_paint_skips_idle_and_keeps_busy() {
+        let mut app = App::new(SessionInfo::default());
+        assert!(needs_paint(&app, true));
+        assert!(!needs_paint(&app, false));
+        app.busy = true;
+        assert!(needs_paint(&app, false));
+    }
+
+    #[test]
+    fn two_thousand_entry_session_stays_virtualized() {
+        use std::time::Instant;
+
+        let mut app = App::new(SessionInfo::default());
+        app.theme = Theme { colored: true };
+        app.animate = false;
+        app.last_view_w = 80;
+        app.last_view_h = 24;
+        for i in 0..2_000 {
+            app.entries.push(Entry::user(format!("q{i}")));
+            app.entries
+                .push(Entry::Assistant(format!("short answer {i}")));
+        }
+        app.follow = true;
+        let bound = window_line_bound(24);
+        let first = app.visible_transcript_lines().0.len();
+        assert!(first <= bound, "2k-entry follow materialized {first}");
+        let _ = app.estimated_total_lines();
+
+        let started = Instant::now();
+        for _ in 0..20 {
+            let n = app.visible_transcript_lines().0.len();
+            assert!(n <= bound, "2k-entry window {n} > {bound}");
+        }
+        let ms = started.elapsed().as_millis();
+        assert!(ms < 50, "2k-entry visible_transcript_lines x20 took {ms}ms");
     }
 }

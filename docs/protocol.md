@@ -6,8 +6,12 @@ Responses and notifications always include it.
 Spawn:
 
 ```bash
-mow rpc [--session ID] [--continue] [--model ID] [--allow-write] [--allow-shell] …
+mow rpc [--session ID] [--continue] [--model ID] [--allow-write] [--allow-shell] \
+        [--extra-root PATH | PATH:ro | PATH:rw] …
 ```
+
+`--extra-root` is repeatable. Specs match mow: unsuffixed / `:rw` are
+read-write jail roots; `:ro` is read-only.
 
 Child stdin = requests. Child stdout = responses + notifications.
 Stderr is Engine logs — do not parse it.
@@ -26,7 +30,7 @@ Stderr is Engine logs — do not parse it.
 
 | Method | Control? | Params | Result |
 |---|---|---|---|
-| `prompt` | no (worker) | `{text}` | `{text, session_id, run_id, stop_reason, usage}` |
+| `prompt` | no (worker) | `{text, ephemeral?}` | `{text, session_id, run_id, stop_reason, usage, ephemeral, attached[]}` |
 | `slash` | no (worker) | `{name, args[], color?}` | `{title, body, error?}` |
 | `cancel` | yes | — | `{ok}` |
 | `status` | yes | — | see below |
@@ -47,6 +51,10 @@ Stderr is Engine logs — do not parse it.
 Control methods are answered concurrently with an in-flight `prompt`.
 **`transcript` can return before the current turn is appended.** After
 `prompt` completes, call `transcript` again if you need the stored turns.
+Messages are `{role, content}` only — no per-message timestamp. The client
+stamps prompts it records locally and leaves resumed history untimed.
+
+`prompt.ephemeral=true` runs an aside against current context without persisting the exchange (`/btw`). Prompt text may contain `@path` references; the RPC host resolves them through the Engine path jail (workspace + extra roots), ignores denied/missing/directory references, deduplicates them, and caps each attachment at 100,000 bytes before appending it for the model. The UI continues to display the original prompt.
 
 `prompt` / `slash` share a worker queue (depth 4). Overflow → error, retry.
 
@@ -105,7 +113,7 @@ Exact strings live in mow `Event*` consts (`mow.go`). Handle at least:
 |---|---|
 | token / `loop.token` | append live answer (`delta`) |
 | reasoning / thinking | activity / collapsible thought |
-| `tool.start` / `tool.end` | activity band + tool line (`duration_ms` on end) |
+| `tool.start` / `tool.end` | status-bar verb + tool line (`duration_ms` on end) |
 | `run.start` / `run.end` | busy; usage on end |
 | `harness.delegate.chunk` | peer live buffer (`agent`, `delta`) — **not** host answer |
 | `harness.delegate.progress` | peer phase (`thought`, `tool`, `prompt`) |
