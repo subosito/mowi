@@ -48,14 +48,16 @@ parity. Do not block v0 on diffs.
 Ratatui widgets carry the chrome; the transcript stays the product.
 
 - **Header chips** built as spans: left identity is `mowi` / workspace
-  basename / `model (effort)`; the token chip (`⇄` peer) sits immediately
-  before the context gauge, which is the far-rightmost element when shown.
-  A ` · ` joins safety to the first metric and is omitted when both
-  metrics are hidden. Usage drops first. The capability chip (`read-only` /
-  `write` / `shell` / `write+shell`) and the `ask` ↔ `auto` chip never drop.
-  Session id is never a header or status-bar chip; the help overlay
-  titles the full id. `status`
-  seeds them at handshake.
+  basename / `model (effort)`; after safety, optional git / extra-root /
+  Goal chips, then the token chip (`⇄` peer), then the context size
+  (`32k/128k ctx` or `32k ctx`) at the far right. A ` · ` joins safety
+  to the first optional chip and is omitted when none remain. Drop
+  order: tokens, git, extra-roots, Goal, context, then identity.
+  Safety never drops. Git and extra-roots decode from host
+  `status`/`session` only. Goal is driven by `graph.goal.*` and clears
+  after completion on the next prompt. Session id is never a header or
+  status-bar chip; the help overlay titles the full id. `status` seeds
+  capability chips at handshake.
 - **Min size 40×10** — below that a centered `Clear` + bordered warning Block
   instead of a broken frame.
 - **Welcome splash** for a fresh session (no transcript seed); any key

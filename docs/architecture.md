@@ -16,6 +16,8 @@ mowi does:
 - paint a document (header, transcript, input, overlays)
 - send `prompt` / `cancel` / `steer` / `slash` / `perm.set` / `perm.decide`
 - render `event` and `perm.ask` notifications
+- decode optional host chrome (`git`, `extra_roots`) when `status` /
+  `session` send it — never by running `git` or walking roots per frame
 
 ## Processes
 

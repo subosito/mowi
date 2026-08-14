@@ -101,7 +101,7 @@ pub struct EffortInfo {
     pub current: bool,
 }
 
-/// `context` result — drives the context gauge.
+/// `context` result — drives the header used/window chip.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ContextUsage {
     pub tokens: u64,
@@ -287,6 +287,10 @@ pub struct SessionInfo {
     pub workspace: String,
     pub model: String,
     pub wire: String,
+    /// Present only when the host sent `git` on `session`.
+    pub git: Option<GitInfo>,
+    /// Present only when the host sent `extra_roots` / `extra_root_count`.
+    pub extra_roots: Vec<ExtraRoot>,
 }
 
 impl SessionInfo {
@@ -297,6 +301,8 @@ impl SessionInfo {
             workspace: s("workspace"),
             model: s("model"),
             wire: s("wire"),
+            git: decode_git(v),
+            extra_roots: decode_extra_roots(v).unwrap_or_default(),
         }
     }
 
@@ -465,6 +471,167 @@ fn ascii_lower(s: &str) -> String {
         }
     }
     String::from_utf8(bytes).expect("ASCII fold keeps UTF-8")
+}
+
+/// Frozen host event types for in-session Goal progress (`graph.goal.*`).
+pub const EVENT_GOAL_START: &str = "graph.goal.start";
+pub const EVENT_GOAL_STEP: &str = "graph.goal.step";
+pub const EVENT_GOAL_DONE: &str = "graph.goal.done";
+pub const EVENT_GOAL_FAIL: &str = "graph.goal.fail";
+pub const EVENT_GOAL_PARTIAL: &str = "graph.goal.partial";
+pub const EVENT_GOAL_BLOCKED: &str = "graph.goal.blocked";
+
+/// Git worktree snapshot from `status` / `session`. Absent until the host
+/// sends `git`; the client never runs `git` itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitInfo {
+    pub branch: String,
+    pub dirty: bool,
+}
+
+/// One extra jail root from `status` / `session`. The header chip is a
+/// count; paths stay on the host side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtraRoot {
+    pub path: String,
+    pub read_only: bool,
+}
+
+/// Goal payload from a confirmed `graph.goal.*` event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalInfo {
+    pub id: String,
+    pub status: String,
+    pub step: u64,
+    pub max_steps: u64,
+}
+
+impl GoalInfo {
+    pub fn is_terminal(&self) -> bool {
+        matches!(self.status.as_str(), "done" | "failed")
+    }
+}
+
+/// True when `v` includes a `git` key (including null / empty). Used so a
+/// later `status` without the field does not wipe a previously decoded chip.
+pub fn has_git_field(v: &Value) -> bool {
+    v.get("git").is_some()
+}
+
+/// Decode `git: { branch, dirty }` from `status` or `session`. Empty /
+/// missing branch yields `None` (hide the chip).
+pub fn decode_git(v: &Value) -> Option<GitInfo> {
+    let git = v.get("git")?;
+    if git.is_null() {
+        return None;
+    }
+    let branch = git
+        .get("branch")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if branch.is_empty() {
+        return None;
+    }
+    Some(GitInfo {
+        branch: branch.to_string(),
+        dirty: git.get("dirty").and_then(Value::as_bool).unwrap_or(false),
+    })
+}
+
+/// True when `v` includes `extra_roots` or `extra_root_count`.
+pub fn has_extra_roots_field(v: &Value) -> bool {
+    v.get("extra_roots").is_some() || v.get("extra_root_count").is_some()
+}
+
+/// Decode extra jail roots. Prefers `extra_roots` (objects or path strings);
+/// falls back to `extra_root_count` when the host only exposes a count.
+pub fn decode_extra_roots(v: &Value) -> Option<Vec<ExtraRoot>> {
+    if let Some(items) = v.get("extra_roots").and_then(Value::as_array) {
+        let roots = items
+            .iter()
+            .filter_map(|item| {
+                if let Some(path) = item.as_str() {
+                    let path = path.trim();
+                    if path.is_empty() {
+                        return None;
+                    }
+                    return Some(ExtraRoot {
+                        path: path.to_string(),
+                        read_only: false,
+                    });
+                }
+                let path = item.get("path").and_then(Value::as_str)?.trim();
+                if path.is_empty() {
+                    return None;
+                }
+                Some(ExtraRoot {
+                    path: path.to_string(),
+                    read_only: item
+                        .get("read_only")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                })
+            })
+            .collect();
+        return Some(roots);
+    }
+    let count = v.get("extra_root_count").and_then(Value::as_u64)?;
+    Some(
+        (0..count)
+            .map(|_| ExtraRoot {
+                path: String::new(),
+                read_only: false,
+            })
+            .collect(),
+    )
+}
+
+/// Decode a `graph.goal.*` notification. Event type wins for terminal /
+/// blocked so a stale payload status cannot leave a running chip.
+pub fn decode_goal_event(params: &Value) -> Option<GoalInfo> {
+    let kind = event_type(params);
+    if !kind.starts_with("graph.goal.") {
+        return None;
+    }
+    let goal = params.get("goal")?;
+    let id = goal.get("id").and_then(Value::as_str).unwrap_or("").trim();
+    if id.is_empty() {
+        return None;
+    }
+    let payload = goal
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let status = match kind {
+        EVENT_GOAL_DONE => "done",
+        EVENT_GOAL_FAIL => "failed",
+        EVENT_GOAL_BLOCKED => "blocked",
+        EVENT_GOAL_START | EVENT_GOAL_STEP | EVENT_GOAL_PARTIAL => match payload.as_str() {
+            "done" => "done",
+            "fail" | "failed" => "failed",
+            "blocked" => "blocked",
+            _ => "running",
+        },
+        _ => match payload.as_str() {
+            "done" => "done",
+            "fail" | "failed" => "failed",
+            "blocked" => "blocked",
+            _ => "running",
+        },
+    };
+    let as_u64 = |key: &str| {
+        goal.get(key)
+            .and_then(|n| n.as_u64().or_else(|| n.as_i64().map(|i| i.max(0) as u64)))
+            .unwrap_or(0)
+    };
+    Some(GoalInfo {
+        id: id.to_string(),
+        status: status.to_string(),
+        step: as_u64("step"),
+        max_steps: as_u64("max_steps"),
+    })
 }
 
 /// Frozen host event type for language-server findings after write/edit.
@@ -884,7 +1051,7 @@ impl Client {
             .to_string())
     }
 
-    /// Context-window usage for the gauge. Control method: answered while busy.
+    /// Context-window usage for the header chip. Control method: answered while busy.
     pub fn context(&mut self, timeout: Duration) -> Result<ContextUsage, Error> {
         let value = self.call("context", None, timeout)?;
         Ok(ContextUsage::from_value(&value))
@@ -1403,6 +1570,119 @@ mod tests {
         }));
         assert_eq!(s.short_id(), "01234567");
         assert_eq!(s.model, "gpt-5-mini");
+        assert!(s.git.is_none());
+        assert!(s.extra_roots.is_empty());
+    }
+
+    #[test]
+    fn session_decodes_git_and_extra_roots_when_present() {
+        let s = SessionInfo::from_value(&serde_json::json!({
+            "session_id": "s1",
+            "workspace": "/w",
+            "model": "gpt-5-mini",
+            "git": { "branch": "main", "dirty": true },
+            "extra_roots": [
+                { "path": "/opt/shared", "read_only": true },
+                "/data"
+            ]
+        }));
+        assert_eq!(
+            s.git,
+            Some(GitInfo {
+                branch: "main".into(),
+                dirty: true
+            })
+        );
+        assert_eq!(
+            s.extra_roots,
+            vec![
+                ExtraRoot {
+                    path: "/opt/shared".into(),
+                    read_only: true
+                },
+                ExtraRoot {
+                    path: "/data".into(),
+                    read_only: false
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn decode_git_requires_a_branch() {
+        assert!(decode_git(&serde_json::json!({})).is_none());
+        assert!(decode_git(&serde_json::json!({"git": null})).is_none());
+        assert!(decode_git(&serde_json::json!({"git": {"branch": "  "}})).is_none());
+        assert_eq!(
+            decode_git(&serde_json::json!({"git": {"branch": "feat"}})),
+            Some(GitInfo {
+                branch: "feat".into(),
+                dirty: false
+            })
+        );
+        assert!(has_git_field(&serde_json::json!({"git": null})));
+        assert!(!has_git_field(&serde_json::json!({"busy": true})));
+    }
+
+    #[test]
+    fn decode_extra_roots_accepts_count_only() {
+        assert_eq!(
+            decode_extra_roots(&serde_json::json!({"extra_root_count": 2}))
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            decode_extra_roots(&serde_json::json!({"extra_roots": []}))
+                .unwrap()
+                .len(),
+            0
+        );
+        assert!(decode_extra_roots(&serde_json::json!({"busy": true})).is_none());
+        assert!(!has_extra_roots_field(&serde_json::json!({"busy": true})));
+    }
+
+    #[test]
+    fn decode_goal_event_uses_confirmed_graph_types() {
+        let step = decode_goal_event(&serde_json::json!({
+            "type": "graph.goal.step",
+            "goal": { "id": "fix-bugs", "status": "running", "step": 2, "max_steps": 10 }
+        }))
+        .unwrap();
+        assert_eq!(step.id, "fix-bugs");
+        assert_eq!(step.status, "running");
+        assert_eq!(step.step, 2);
+        assert_eq!(step.max_steps, 10);
+
+        let done = decode_goal_event(&serde_json::json!({
+            "type": "graph.goal.done",
+            "goal": { "id": "fix-bugs", "status": "running", "step": 10, "max_steps": 10 }
+        }))
+        .unwrap();
+        assert_eq!(done.status, "done");
+        assert!(done.is_terminal());
+
+        let blocked = decode_goal_event(&serde_json::json!({
+            "type": "graph.goal.blocked",
+            "goal": { "id": "fix-bugs" }
+        }))
+        .unwrap();
+        assert_eq!(blocked.status, "blocked");
+
+        assert!(
+            decode_goal_event(&serde_json::json!({
+                "type": "loop.token",
+                "goal": { "id": "nope" }
+            }))
+            .is_none()
+        );
+        assert!(
+            decode_goal_event(&serde_json::json!({
+                "type": "graph.goal.step",
+                "goal": { "id": "" }
+            }))
+            .is_none()
+        );
     }
 
     #[test]

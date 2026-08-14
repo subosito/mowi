@@ -33,10 +33,12 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::render::{Segment, diff_title, markdown_lines, split_markdown_and_diffs};
 use crate::rpc::{
-    Client, ContextUsage, EVENT_LSP_DIAGNOSTICS, EffortList, Error, LspDiagnostic, LspProblems,
-    ModelList, Notification, PermissionRequest, SessionInfo, SessionSummary, SlashCommand,
-    TranscriptMessage, decode_lsp_diagnostics, decode_rewind, extract_thinking, reasoning_delta,
-    token_delta,
+    Client, ContextUsage, EVENT_GOAL_BLOCKED, EVENT_GOAL_DONE, EVENT_GOAL_FAIL, EVENT_GOAL_PARTIAL,
+    EVENT_GOAL_START, EVENT_GOAL_STEP, EVENT_LSP_DIAGNOSTICS, EffortList, Error, ExtraRoot,
+    GitInfo, GoalInfo, LspDiagnostic, LspProblems, ModelList, Notification, PermissionRequest,
+    SessionInfo, SessionSummary, SlashCommand, TranscriptMessage, decode_extra_roots, decode_git,
+    decode_goal_event, decode_lsp_diagnostics, decode_rewind, extract_thinking,
+    has_extra_roots_field, has_git_field, reasoning_delta, token_delta,
 };
 use crate::slash::{
     SlashRoute, canonical_slash, slash_completions, slash_route, unknown_slash_message,
@@ -47,15 +49,9 @@ use crate::theme::{SPINNER, SPINNER_STATIC, TYPING, Theme, Tone};
 const PEER_PREVIEW: usize = 48;
 /// Display columns allowed for the argument half of a tool row label.
 const TOOL_ARG_COLS: usize = 56;
-/// Cells in the header context meter.
-const CTX_CELLS: usize = 5;
-/// Below this context percentage the footer stays quiet — the header gauge is
-/// enough, and a number that is always on screen stops being read.
+/// Below this context percentage the footer stays quiet — the header size
+/// chip is enough, and a number that is always on screen stops being read.
 const CTX_FOOTER_PCT: f64 = 60.0;
-/// Terminals narrower than this drop the header gauge before they drop the
-/// session identity: knowing *which* model you are talking to outranks knowing
-/// how full its window is.
-const GAUGE_MIN_COLS: u16 = 100;
 /// Extra transcript rows materialized above and below the viewport so a
 /// PageUp does not have to rebuild the document from scratch.
 const TRANSCRIPT_OVERSCAN: usize = 16;
@@ -90,6 +86,24 @@ fn human_tokens(n: u64) -> String {
     let k = n as f64 / 1000.0;
     if k < 100.0 {
         format!("{k:.1}k")
+    } else {
+        format!("{k:.0}k")
+    }
+}
+
+/// Header context size: `32k`, `3.2k`, `950`. Drops a trailing `.0`.
+fn compact_tokens(n: u64) -> String {
+    if n < 1000 {
+        return n.to_string();
+    }
+    let k = n as f64 / 1000.0;
+    if k < 100.0 {
+        let tenths = (k * 10.0).round() as u64;
+        if tenths % 10 == 0 {
+            format!("{}k", tenths / 10)
+        } else {
+            format!("{:.1}k", tenths as f64 / 10.0)
+        }
     } else {
         format!("{k:.0}k")
     }
@@ -329,13 +343,18 @@ enum IdentityChip {
     Model(String),
 }
 
-/// Right-side usage chips, least important first. Tokens sit immediately
-/// before the gauge; the gauge is the far-rightmost chip when shown.
-/// Safety never drops.
+/// Right-side chips in **drop order**: least important first.
+///
+/// Paint order after safety is git, extra-roots, goal, tokens, then the
+/// context size at the far right. Tokens peel first; context is the last
+/// optional chip to go. Safety never drops.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum MetricChip {
+enum RightChip {
     Tokens(String),
-    Gauge(String),
+    Git(String),
+    ExtraRoots(String),
+    Goal(String),
+    Context(String),
 }
 
 /// Painted lines for one transcript block, reused across the 50ms redraws.
@@ -465,8 +484,15 @@ pub struct App {
     pub animate: bool,
     /// Reasoning effort from `effort.list` / `effort.set`.
     pub effort: String,
-    /// Latest `context` result, for the gauge and /context.
+    /// Latest `context` result, for the used/window chip and /status.
     pub ctx: Option<ContextUsage>,
+    /// Host-provided git snapshot. Never computed locally.
+    pub git: Option<GitInfo>,
+    /// Host-provided extra jail roots. Never counted from CLI flags alone.
+    pub extra_roots: Vec<ExtraRoot>,
+    /// Active Goal from confirmed `graph.goal.*` events. Terminal states
+    /// clear on the next user prompt so a `done` chip cannot linger.
+    pub goal: Option<GoalInfo>,
     /// Methods the connected server advertises (empty = assume everything).
     pub caps: Vec<String>,
     /// Character index into `input`.
@@ -535,6 +561,9 @@ impl Default for App {
             animate: std::env::var_os("MOW_NO_ANIM").is_none(),
             effort: String::new(),
             ctx: None,
+            git: None,
+            extra_roots: Vec::new(),
+            goal: None,
             caps: Vec::new(),
             cursor: 0,
             tick: 0,
@@ -557,6 +586,8 @@ impl Default for App {
 impl App {
     pub fn new(session: SessionInfo) -> App {
         App {
+            git: session.git.clone(),
+            extra_roots: session.extra_roots.clone(),
             session,
             follow: true,
             ..App::default()
@@ -613,6 +644,21 @@ impl App {
         {
             self.session.session_id = session_id.to_string();
         }
+        self.apply_host_chrome(status);
+    }
+
+    /// Adopt optional host chrome from `status` or `session`.
+    ///
+    /// Keys are applied only when present so a current mow `status` (no
+    /// `git` / `extra_roots`) cannot wipe chips decoded from `session`.
+    /// The client never shells out to `git` or walks extra-root paths.
+    pub fn apply_host_chrome(&mut self, v: &Value) {
+        if has_git_field(v) {
+            self.git = decode_git(v);
+        }
+        if has_extra_roots_field(v) {
+            self.extra_roots = decode_extra_roots(v).unwrap_or_default();
+        }
     }
 
     /// Curated `/status` note: chips the operator already sees, not raw JSON.
@@ -633,18 +679,26 @@ impl App {
         if self.busy {
             bits.push("busy".into());
         }
-        let mut lines = vec![bits.join(" · ")];
+        if let Some(git) = self.git_chip() {
+            bits.push(format!("git {git}"));
+        }
+        if let Some(roots) = self.extra_roots_chip() {
+            bits.push(roots);
+        }
+        if let Some(goal) = self.goal_chip_text() {
+            bits.push(goal);
+        }
         let ctx = self.context_summary();
         if ctx != "context: unknown" {
-            lines.push(ctx);
+            bits.push(ctx);
         }
         if self.usage.total() > 0 || self.usage.peer_tokens > 0 {
-            lines.push(self.usage.chip());
+            bits.push(self.usage.chip());
         }
         if !self.session.session_id.is_empty() {
-            lines.push(format!("session {}", self.session.session_id));
+            bits.push(format!("session {}", self.session.session_id));
         }
-        lines.join("\n")
+        bits.join(" · ")
     }
 
     /// Show the model catalog overlay and keep the header chip in sync.
@@ -707,7 +761,7 @@ impl App {
         self.caps.is_empty() || self.caps.iter().any(|m| m == method)
     }
 
-    /// Store a `context` result for the gauge.
+    /// Store a `context` result for the used/window chip.
     pub fn apply_context(&mut self, usage: &ContextUsage) {
         self.ctx = Some(usage.clone());
     }
@@ -795,36 +849,97 @@ impl App {
         if self.theme.colored { "❯ " } else { "> " }
     }
 
-    /// Compact context meter for the header, e.g. `▰▰▰▱▱ 58%`.
+    /// Compact used/window size for the header, e.g. `32k/128k ctx`.
     ///
-    /// Returns `None` until the Engine reports a window, so the chip never
-    /// shows a fake zero.
+    /// When the host has not reported a window the chip is `32k ctx`.
+    /// Hidden until used tokens are known so the row never shows a fake
+    /// zero. Pressure colour uses [`Self::context_percent`] internally.
     pub fn context_chip(&self) -> Option<String> {
         let ctx = self.ctx.as_ref()?;
-        let pct = match (ctx.context_window, ctx.percent) {
-            (Some(_), Some(pct)) => pct,
-            (Some(window), None) if window > 0 => (ctx.tokens as f64 / window as f64) * 100.0,
-            _ => return None,
+        if ctx.tokens == 0 {
+            return None;
         }
-        .clamp(0.0, 100.0);
-        let filled = ((pct / 100.0) * CTX_CELLS as f64).round() as usize;
-        Some(format!(
-            "{}{} {:.0}%",
-            "▰".repeat(filled),
-            "▱".repeat(CTX_CELLS.saturating_sub(filled)),
-            pct
-        ))
+        let used = compact_tokens(ctx.tokens);
+        match ctx.context_window.filter(|w| *w > 0) {
+            Some(window) => Some(format!("{used}/{} ctx", compact_tokens(window))),
+            None => Some(format!("{used} ctx")),
+        }
     }
 
-    /// Severity of context pressure, so the meter warns before it truncates.
+    /// Internal fill ratio for pressure colour. Not painted on the header.
+    pub fn context_percent(&self) -> Option<f64> {
+        let ctx = self.ctx.as_ref()?;
+        match (ctx.context_window, ctx.percent) {
+            (_, Some(pct)) => Some(pct.clamp(0.0, 100.0)),
+            (Some(window), None) if window > 0 => {
+                Some(((ctx.tokens as f64 / window as f64) * 100.0).clamp(0.0, 100.0))
+            }
+            _ => None,
+        }
+    }
+
+    /// Severity of context pressure, so the size chip warns before it truncates.
     pub fn context_tone(&self) -> Tone {
-        let pct = self.ctx.as_ref().and_then(|c| c.percent).unwrap_or(0.0);
+        let pct = self.context_percent().unwrap_or(0.0);
         if pct >= 90.0 {
             Tone::Error
         } else if pct >= 75.0 {
             Tone::Warn
         } else {
             Tone::Muted
+        }
+    }
+
+    fn git_chip(&self) -> Option<String> {
+        let git = self.git.as_ref()?;
+        if git.branch.is_empty() {
+            return None;
+        }
+        if git.dirty {
+            Some(format!("{}*", git.branch))
+        } else {
+            Some(git.branch.clone())
+        }
+    }
+
+    fn extra_roots_chip(&self) -> Option<String> {
+        match self.extra_roots.len() {
+            0 => None,
+            1 => Some("+1 root".into()),
+            n => Some(format!("+{n} roots")),
+        }
+    }
+
+    fn goal_chip_text(&self) -> Option<String> {
+        let goal = self.goal.as_ref()?;
+        let id = clip_display(&goal.id, 12);
+        let detail = match goal.status.as_str() {
+            "blocked" => "blocked".to_string(),
+            "failed" => "failed".to_string(),
+            "done" => "done".to_string(),
+            _ if goal.max_steps > 0 => format!("{}/{}", goal.step, goal.max_steps),
+            _ => String::new(),
+        };
+        if detail.is_empty() {
+            Some(format!("goal {id}"))
+        } else {
+            Some(format!("goal {id} {detail}"))
+        }
+    }
+
+    fn goal_tone(&self) -> Tone {
+        match self.goal.as_ref().map(|g| g.status.as_str()) {
+            Some("blocked" | "failed") => Tone::Warn,
+            Some("done") => Tone::Ok,
+            _ => Tone::Muted,
+        }
+    }
+
+    /// Drop a completed/failed Goal chip when the operator continues.
+    /// Blocked stays — it is still the thing they need to see.
+    pub fn dismiss_terminal_goal(&mut self) {
+        if self.goal.as_ref().is_some_and(GoalInfo::is_terminal) {
+            self.goal = None;
         }
     }
 
@@ -848,20 +963,29 @@ impl App {
         chips
     }
 
-    /// Right-side usage chips in **drop order**: tokens first, then the gauge.
-    /// Tokens peel first even though they paint immediately before the gauge.
+    /// Right-side chips in **drop order**: least important first.
     ///
-    /// Below `GAUGE_MIN_COLS` the meter is not offered at all, so leftover
-    /// columns go to identity and safety rather than a bar.
-    fn metric_chips(&self, width: u16) -> Vec<MetricChip> {
+    /// Tokens peel first, then git, extra-roots, goal, and finally the
+    /// context size. There is no minimum-width gate: the compact
+    /// `32k/128k ctx` chip is offered whenever used tokens are known and
+    /// is dropped by this order when the row overflows. Identity peels
+    /// only after every optional right chip is gone. Safety never drops.
+    fn right_chips(&self) -> Vec<RightChip> {
         let mut chips = Vec::new();
         if self.usage.total() > 0 || self.usage.peer_tokens > 0 {
-            chips.push(MetricChip::Tokens(self.usage.chip()));
+            chips.push(RightChip::Tokens(self.usage.chip()));
         }
-        if width >= GAUGE_MIN_COLS
-            && let Some(ctx) = self.context_chip()
-        {
-            chips.push(MetricChip::Gauge(ctx));
+        if let Some(git) = self.git_chip() {
+            chips.push(RightChip::Git(git));
+        }
+        if let Some(roots) = self.extra_roots_chip() {
+            chips.push(RightChip::ExtraRoots(roots));
+        }
+        if let Some(goal) = self.goal_chip_text() {
+            chips.push(RightChip::Goal(goal));
+        }
+        if let Some(ctx) = self.context_chip() {
+            chips.push(RightChip::Context(ctx));
         }
         chips
     }
@@ -914,62 +1038,73 @@ impl App {
         spans
     }
 
-    fn header_token_spans(&self, metrics: &[MetricChip]) -> Vec<Span<'static>> {
-        metrics
-            .iter()
-            .find_map(|chip| match chip {
-                MetricChip::Tokens(text) => Some(vec![Span::styled(
-                    text.clone(),
-                    self.theme.note().patch(self.theme.header_bg()),
-                )]),
-                _ => None,
-            })
-            .unwrap_or_default()
+    fn header_right_chip_span(&self, chip: &RightChip) -> Span<'static> {
+        let bg = self.theme.header_bg();
+        match chip {
+            RightChip::Tokens(text) => Span::styled(text.clone(), self.theme.note().patch(bg)),
+            RightChip::Git(text) => {
+                let tone = if text.ends_with('*') {
+                    Tone::Warn
+                } else {
+                    Tone::Muted
+                };
+                Span::styled(text.clone(), self.theme.badge(tone).patch(bg))
+            }
+            RightChip::ExtraRoots(text) => {
+                Span::styled(text.clone(), self.theme.badge(Tone::Warn).patch(bg))
+            }
+            RightChip::Goal(text) => {
+                Span::styled(text.clone(), self.theme.badge(self.goal_tone()).patch(bg))
+            }
+            RightChip::Context(text) => Span::styled(
+                text.clone(),
+                self.theme.badge(self.context_tone()).patch(bg),
+            ),
+        }
     }
 
-    fn header_gauge_spans(&self, metrics: &[MetricChip]) -> Vec<Span<'static>> {
-        metrics
-            .iter()
-            .find_map(|chip| match chip {
-                MetricChip::Gauge(text) => Some(vec![Span::styled(
-                    text.clone(),
-                    self.theme
-                        .badge(self.context_tone())
-                        .patch(self.theme.header_bg()),
-                )]),
-                _ => None,
-            })
-            .unwrap_or_default()
+    /// Paint order after safety: git, extra-roots, goal, tokens, context.
+    fn header_right_spans(&self, chips: &[RightChip]) -> Vec<Span<'static>> {
+        const PAINT: &[fn(&RightChip) -> bool] = &[
+            |c| matches!(c, RightChip::Git(_)),
+            |c| matches!(c, RightChip::ExtraRoots(_)),
+            |c| matches!(c, RightChip::Goal(_)),
+            |c| matches!(c, RightChip::Tokens(_)),
+            |c| matches!(c, RightChip::Context(_)),
+        ];
+        let mut spans = Vec::new();
+        for pred in PAINT {
+            if let Some(chip) = chips.iter().find(|c| pred(c)) {
+                if !spans.is_empty() {
+                    spans.push(Span::styled("  ", self.theme.header_bg()));
+                }
+                spans.push(self.header_right_chip_span(chip));
+            }
+        }
+        spans
     }
 
-    /// Header as spans. Left is identity only. Token usage sits immediately
-    /// before the context gauge; the gauge is the far-rightmost chip
-    /// whenever it is shown. A ` · ` joins safety to the first metric and
-    /// is omitted when both metrics are hidden. Usage drops before
-    /// identity. Safety never drops. Session id is not painted here.
+    /// Header as spans. Left is identity only. Right is safety, then optional
+    /// git / extra-roots / goal / tokens, then the context size at the far
+    /// right when shown. A ` · ` joins safety to the first optional chip and
+    /// is omitted when none remain. Optional chips drop before identity.
+    /// Safety never drops. Session id is not painted here.
     pub fn header_line(&self, width: u16) -> Line<'static> {
         let safety = format!("{} · {}", self.capability_chip(), self.mode_chip());
         let mut identity = self.identity_chips();
-        let mut metrics = self.metric_chips(width);
+        let mut right = self.right_chips();
         let width = width as usize;
         let safety_w = Span::raw(safety.as_str()).width();
         let chip = self.theme.chip().patch(self.theme.header_bg());
         loop {
             let left = self.header_identity_spans(&identity);
-            let token_spans = self.header_token_spans(&metrics);
-            let gauge_spans = self.header_gauge_spans(&metrics);
+            let right_spans = self.header_right_spans(&right);
             let left_w: usize = left.iter().map(Span::width).sum();
-            let token_w: usize = token_spans.iter().map(Span::width).sum();
-            let gauge_w: usize = gauge_spans.iter().map(Span::width).sum();
-            let sep = if token_w > 0 || gauge_w > 0 {
-                " · "
-            } else {
-                ""
-            };
+            let metrics_w: usize = right_spans.iter().map(Span::width).sum();
+            let sep = if metrics_w > 0 { " · " } else { "" };
             let sep_w = Span::raw(sep).width();
-            let metric_gap = if token_w > 0 && gauge_w > 0 { 2 } else { 0 };
-            let right_w = safety_w + sep_w + token_w + metric_gap + gauge_w;
-            if left_w + right_w <= width || (identity.is_empty() && metrics.is_empty()) {
+            let right_w = safety_w + sep_w + metrics_w;
+            if left_w + right_w <= width || (identity.is_empty() && right.is_empty()) {
                 let pad = width.saturating_sub(left_w + right_w);
                 let mut spans = left;
                 spans.push(Span::styled(" ".repeat(pad), self.theme.header_bg()));
@@ -977,15 +1112,11 @@ impl App {
                 if !sep.is_empty() {
                     spans.push(Span::styled(sep, chip));
                 }
-                spans.extend(token_spans);
-                if metric_gap > 0 {
-                    spans.push(Span::styled("  ", self.theme.header_bg()));
-                }
-                spans.extend(gauge_spans);
+                spans.extend(right_spans);
                 return Line::from(spans);
             }
-            if !metrics.is_empty() {
-                metrics.remove(0);
+            if !right.is_empty() {
+                right.remove(0);
             } else if !identity.is_empty() {
                 identity.remove(0);
             }
@@ -1050,7 +1181,7 @@ impl App {
             left.push(Span::styled(clip_display(&self.status, 40), tone));
         }
         // Context pressure earns a footer slot only once it starts to matter:
-        // the header gauge covers the normal case, and a percentage that is
+        // the header size chip covers the normal case, and a percentage that is
         // always on screen stops being read.
         if let Some(ctx) = &self.ctx
             && let Some(pct) = ctx.percent
@@ -2048,6 +2179,12 @@ impl App {
                     self.ingest_lsp_problems(problems);
                 }
             }
+            EVENT_GOAL_START | EVENT_GOAL_STEP | EVENT_GOAL_DONE | EVENT_GOAL_FAIL
+            | EVENT_GOAL_PARTIAL | EVENT_GOAL_BLOCKED => {
+                if let Some(goal) = decode_goal_event(params) {
+                    self.goal = Some(goal);
+                }
+            }
             k if k.ends_with("tool.end") || k == "tool.end" => {
                 let tool_name = params
                     .get("tool")
@@ -2536,8 +2673,10 @@ impl App {
             ("/effort", "list efforts, or /effort high to set"),
             ("/clear", "clear transcript (engine history kept)"),
             ("/quit", "quit"),
-            ("/status /lsp", "session summary · diagnostics"),
-            ("/perm /compact", "ask/auto · compact history"),
+            ("/status", "session summary"),
+            ("/lsp", "recent diagnostics"),
+            ("/perm", "set ask / auto mode"),
+            ("/compact", "compact history"),
         ]
         .iter()
         .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
@@ -4524,7 +4663,7 @@ fn poll_turn(
             let ok = res.is_ok();
             app.finish_turn(res);
             *turn = None;
-            // Usage only moves at turn end; refresh the gauge without
+            // Usage only moves at turn end; refresh the context chip without
             // blocking the 50ms loop. A failure is not fatal to the UI.
             if app.supports("context")
                 && let Ok(rx) = client.request_context()
@@ -5462,6 +5601,7 @@ fn start_prompt(
     text: &str,
 ) -> Result<Receiver<Result<Value, Error>>, Error> {
     app.entries.push(Entry::user(text));
+    app.dismiss_terminal_goal();
     app.live.clear();
     app.reset_think_state();
     app.cancelled = false;
@@ -5875,29 +6015,34 @@ mod tests {
     }
 
     #[test]
-    fn narrow_header_drops_the_gauge_before_the_model() {
+    fn narrow_header_drops_context_before_the_model() {
         let mut app = App::new(SessionInfo {
             session_id: "abcdef0123456789".into(),
             workspace: "/very/long/workspace/path/that/eats/columns".into(),
             model: "gpt-5-mini".into(),
             wire: "openai-responses".into(),
+            ..Default::default()
         });
         app.apply_context(&usage(100_000, Some(200_000), Some(50.0)));
-        // Usage must be present: it is the chip that previously outlived the
-        // model, because the drop loop peels from the front.
+        // Usage must be present: it peels before context, which peels before
+        // the model.
         app.usage.input_tokens = 41_500;
         app.usage.output_tokens = 3_200;
 
-        for width in [48u16, 60, 70] {
-            let line = app.header_line(width);
-            let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
-            // Identity outranks both the meter and the token counter.
-            assert!(text.contains("gpt-5-mini"), "width {width}: {text}");
-            assert!(!text.contains('▰'), "width {width} kept the gauge: {text}");
-            // Safety chips never drop, at any width.
-            assert!(text.contains("read-only"), "width {width}: {text}");
-            assert!(text.contains("ask"), "width {width}: {text}");
-        }
+        // 48 is below identity+safety+context (~57). Tokens already peeled.
+        let text: String = app
+            .header_line(48)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains("gpt-5-mini"), "{text}");
+        assert!(
+            !text.contains(" ctx"),
+            "context peels before the model: {text}"
+        );
+        assert!(text.contains("read-only"), "{text}");
+        assert!(text.contains("ask"), "{text}");
     }
 
     #[test]
@@ -5925,7 +6070,7 @@ mod tests {
     fn footer_shows_context_percent_only_under_pressure() {
         let mut app = App::new(SessionInfo::default());
         assert!(!app.footer().contains("ctx "));
-        // Quiet while there is plenty of headroom: the header gauge covers it.
+        // Quiet while there is plenty of headroom: the header size chip covers it.
         app.apply_context(&usage(40_000, Some(200_000), Some(20.0)));
         assert!(!app.footer().contains("ctx "), "footer: {}", app.footer());
         // Once the window is filling up the footer speaks.
@@ -5955,6 +6100,7 @@ mod tests {
             workspace: "/w".into(),
             model: "gpt-5-mini".into(),
             wire: "openai-responses".into(),
+            ..Default::default()
         });
         app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         app.effort = "medium".into();
@@ -6137,6 +6283,7 @@ mod tests {
             workspace: "/w".into(),
             model: "gpt-5-mini".into(),
             wire: "openai-responses".into(),
+            ..Default::default()
         });
         app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         let mut terminal = Terminal::new(TestBackend::new(80, 14)).unwrap();
@@ -6206,6 +6353,7 @@ mod tests {
             workspace: "/w".into(),
             model: "gpt-5-mini".into(),
             wire: "openai-responses".into(),
+            ..Default::default()
         });
         app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         app.input.push_str("draft");
@@ -6337,6 +6485,7 @@ mod tests {
             workspace: "/very/long/workspace/path".into(),
             model: "claude-sonnet-4".into(),
             wire: "anthropic-messages".into(),
+            ..Default::default()
         });
         app.allow_write = true;
         app.allow_shell = true;
@@ -6390,6 +6539,7 @@ mod tests {
             workspace: "/w".into(),
             model: "gpt-5-mini".into(),
             wire: "openai-responses".into(),
+            ..Default::default()
         });
         app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         app.effort = "medium".into();
@@ -6433,6 +6583,7 @@ mod tests {
             workspace: "/very/long/workspace/path/that/eats/columns".into(),
             model: "gpt-5-mini".into(),
             wire: "openai-responses".into(),
+            ..Default::default()
         });
         app.effort = "medium".into();
         app.usage.input_tokens = 41_500;
@@ -6467,6 +6618,7 @@ mod tests {
             workspace: "/home/dev/src/mow".into(),
             model: "gpt-5-mini".into(),
             wire: "openai-responses".into(),
+            ..Default::default()
         });
         app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         app.effort = "medium".into();
@@ -6480,40 +6632,42 @@ mod tests {
         assert!(!wide.contains("/home/dev/src/mow"), "basename only: {wide}");
         assert!(wide.contains("gpt-5-mini (medium)"), "{wide}");
         assert!(wide.contains("44.7k tok"), "{wide}");
-        assert!(wide.contains('▰'), "{wide}");
+        assert!(wide.contains("41.5k/200k ctx"), "{wide}");
+        assert!(!wide.contains('▰'), "percentage gauge is gone: {wide}");
+        assert!(!wide.contains('%'), "header does not print percent: {wide}");
         assert!(!wide.contains("01J8ZK4M"), "session id stays out: {wide}");
-        // Identity left, safety, then tokens immediately before the gauge.
+        // Identity left, safety, then tokens immediately before context.
         let mowi = wide.find("mowi").expect("mowi");
-        let gauge = wide.find('▰').expect("gauge");
+        let ctx = wide.find("41.5k/200k ctx").expect("context");
         let tokens = wide.find("44.7k tok").expect("tokens");
         let safety = wide.find("read-only").expect("safety");
-        assert!(mowi < safety && safety < tokens && tokens < gauge, "{wide}");
+        assert!(mowi < safety && safety < tokens && tokens < ctx, "{wide}");
         assert!(
             wide.contains("ask · 44.7k tok"),
             "safety joins metrics with · : {wide}"
         );
         assert!(
-            wide.trim_end().ends_with('%'),
-            "gauge sits at the right edge: {wide}"
+            wide.trim_end().ends_with("41.5k/200k ctx"),
+            "context sits at the right edge: {wide}"
         );
 
         let mid = header_text(&app, 80);
         assert!(mid.contains("mow"), "{mid}");
         assert!(mid.contains("gpt-5-mini (medium)"), "{mid}");
-        assert!(!mid.contains('▰'), "gauge waits for a wide row: {mid}");
+        assert!(
+            mid.contains("41.5k/200k ctx"),
+            "compact context still fits at 80: {mid}"
+        );
+        let mid_ctx = mid.find("41.5k/200k ctx").expect("context");
         let mid_tokens = mid.find("44.7k tok").expect("tokens");
         let mid_safety = mid.find("read-only").expect("safety");
         assert!(
-            mid_safety < mid_tokens,
-            "tokens stay right of safety: {mid}"
+            mid_safety < mid_tokens && mid_tokens < mid_ctx,
+            "tokens stay right of safety and left of context: {mid}"
         );
         assert!(
-            mid.contains("ask · 44.7k tok"),
-            "safety joins tokens when the gauge is gated: {mid}"
-        );
-        assert!(
-            mid.trim_end().ends_with("44.7k tok"),
-            "tokens sit at the right edge when the gauge is gated: {mid}"
+            mid.trim_end().ends_with("41.5k/200k ctx"),
+            "context stays at the right edge at 80: {mid}"
         );
 
         let tight = header_text(&app, 40);
@@ -6568,6 +6722,7 @@ mod tests {
             workspace: "/w".into(),
             model: "gpt-5-mini".into(),
             wire: "openai-responses".into(),
+            ..Default::default()
         });
 
         let wide = footer_text(&app, 80);
@@ -7220,7 +7375,7 @@ mod tests {
     }
 
     #[test]
-    fn context_meter_paints_its_pressure_tone_in_the_header() {
+    fn context_chip_paints_its_pressure_tone_in_the_header() {
         let mut app = App::new(SessionInfo::default());
         app.ctx = Some(ContextUsage {
             tokens: 9_500,
@@ -7229,20 +7384,30 @@ mod tests {
             remaining: Some(500),
         });
         let line = app.header_line(120);
-        let meter = line
+        let chip = line
             .spans
             .iter()
-            .find(|s| s.content.contains("95%"))
-            .expect("meter missing from header");
-        // At 95% the meter must not look like ordinary chrome.
-        assert_eq!(meter.style.fg, app.theme.badge(Tone::Error).fg);
+            .find(|s| s.content.contains("ctx"))
+            .expect("context chip missing from header");
+        assert!(chip.content.contains("9.5k/10k ctx"), "{}", chip.content);
+        assert!(!chip.content.contains('%'), "{}", chip.content);
+        // At 95% the size chip must not look like ordinary chrome.
+        assert_eq!(chip.style.fg, app.theme.badge(Tone::Error).fg);
     }
 
     #[test]
-    fn context_meter_fills_and_escalates_tone() {
+    fn context_chip_sizes_and_escalates_tone() {
         let mut app = App::new(SessionInfo::default());
         // No context result yet: no chip, never a fake zero.
         assert!(app.context_chip().is_none());
+
+        app.ctx = Some(ContextUsage {
+            tokens: 0,
+            context_window: Some(10_000),
+            percent: Some(0.0),
+            remaining: Some(10_000),
+        });
+        assert!(app.context_chip().is_none(), "zero used stays hidden");
 
         app.ctx = Some(ContextUsage {
             tokens: 1_000,
@@ -7250,9 +7415,7 @@ mod tests {
             percent: Some(10.0),
             remaining: Some(9_000),
         });
-        let chip = app.context_chip().unwrap();
-        assert!(chip.contains("10%"), "{chip}");
-        assert!(chip.starts_with('▰'), "{chip}");
+        assert_eq!(app.context_chip().as_deref(), Some("1k/10k ctx"));
         assert_eq!(app.context_tone(), Tone::Muted);
 
         app.ctx = Some(ContextUsage {
@@ -7261,6 +7424,7 @@ mod tests {
             percent: Some(80.0),
             remaining: Some(2_000),
         });
+        assert_eq!(app.context_chip().as_deref(), Some("8k/10k ctx"));
         assert_eq!(app.context_tone(), Tone::Warn);
 
         app.ctx = Some(ContextUsage {
@@ -7270,12 +7434,24 @@ mod tests {
             remaining: Some(500),
         });
         assert_eq!(app.context_tone(), Tone::Error);
-        let full = app.context_chip().unwrap();
-        assert!(!full.contains('▱'), "95% should be nearly solid: {full}");
+        assert_eq!(app.context_chip().as_deref(), Some("9.5k/10k ctx"));
     }
 
     #[test]
-    fn context_meter_is_derived_when_percent_is_absent() {
+    fn context_chip_omits_window_when_unknown() {
+        let mut app = App::new(SessionInfo::default());
+        app.ctx = Some(ContextUsage {
+            tokens: 32_000,
+            context_window: None,
+            percent: None,
+            remaining: None,
+        });
+        assert_eq!(app.context_chip().as_deref(), Some("32k ctx"));
+        assert_eq!(app.context_tone(), Tone::Muted);
+    }
+
+    #[test]
+    fn context_percent_is_derived_when_host_omits_it() {
         let mut app = App::new(SessionInfo::default());
         app.ctx = Some(ContextUsage {
             tokens: 500,
@@ -7283,7 +7459,186 @@ mod tests {
             percent: None,
             remaining: None,
         });
-        assert!(app.context_chip().unwrap().contains("50%"));
+        assert_eq!(app.context_chip().as_deref(), Some("500/1k ctx"));
+        assert_eq!(app.context_percent(), Some(50.0));
+    }
+
+    fn goal_event(kind: &str, id: &str, status: &str, step: u64, max_steps: u64) -> Notification {
+        Notification {
+            method: "event".into(),
+            params: serde_json::json!({
+                "type": kind,
+                "goal": { "id": id, "status": status, "step": step, "max_steps": max_steps }
+            }),
+        }
+    }
+
+    #[test]
+    fn header_drop_order_peels_tokens_before_context() {
+        let mut app = App::new(SessionInfo {
+            workspace: "/home/dev/src/mow".into(),
+            model: "gpt-5-mini".into(),
+            ..Default::default()
+        });
+        app.effort = "medium".into();
+        app.usage.input_tokens = 41_500;
+        app.apply_context(&usage(32_000, Some(128_000), Some(25.0)));
+
+        let mut saw_ctx_without_tokens = false;
+        let mut min_ctx = u16::MAX;
+        let mut min_tokens = u16::MAX;
+        for width in 40..=120 {
+            let text = header_text(&app, width);
+            if text.contains("32k/128k ctx") {
+                min_ctx = min_ctx.min(width);
+            }
+            if text.contains("tok") {
+                min_tokens = min_tokens.min(width);
+            }
+            if text.contains("32k/128k ctx") && !text.contains("tok") {
+                saw_ctx_without_tokens = true;
+            }
+            assert!(text.contains("read-only"), "width {width}: {text}");
+            assert!(text.contains("ask"), "width {width}: {text}");
+        }
+        assert!(
+            min_ctx < min_tokens,
+            "context must survive narrower than tokens: ctx@{min_ctx} tok@{min_tokens}"
+        );
+        assert!(
+            saw_ctx_without_tokens,
+            "tokens peel first so a mid width keeps context alone"
+        );
+        assert!(header_text(&app, 40).contains("gpt-5-mini"));
+    }
+
+    #[test]
+    fn goal_chip_tracks_graph_events_and_clears_after_done() {
+        let mut app = App::new(SessionInfo::default());
+        assert!(app.goal_chip_text().is_none());
+        assert!(
+            !header_text(&app, 80).contains("goal "),
+            "no stale chip before a goal runs"
+        );
+
+        app.on_notification(&goal_event(
+            "graph.goal.start",
+            "fix-bugs",
+            "running",
+            0,
+            10,
+        ));
+        assert_eq!(app.goal_chip_text().as_deref(), Some("goal fix-bugs 0/10"));
+
+        app.on_notification(&goal_event("graph.goal.step", "fix-bugs", "running", 2, 10));
+        assert_eq!(app.goal_chip_text().as_deref(), Some("goal fix-bugs 2/10"));
+        assert!(header_text(&app, 100).contains("goal fix-bugs 2/10"));
+
+        app.on_notification(&goal_event(
+            "graph.goal.blocked",
+            "fix-bugs",
+            "blocked",
+            2,
+            10,
+        ));
+        assert_eq!(
+            app.goal_chip_text().as_deref(),
+            Some("goal fix-bugs blocked")
+        );
+
+        app.on_notification(&goal_event("graph.goal.fail", "fix-bugs", "failed", 2, 10));
+        assert_eq!(
+            app.goal_chip_text().as_deref(),
+            Some("goal fix-bugs failed")
+        );
+
+        app.on_notification(&goal_event("graph.goal.done", "fix-bugs", "done", 10, 10));
+        assert_eq!(app.goal_chip_text().as_deref(), Some("goal fix-bugs done"));
+        app.dismiss_terminal_goal();
+        assert!(
+            app.goal_chip_text().is_none(),
+            "done must not stay as a permanent chip"
+        );
+        assert!(!header_text(&app, 80).contains("goal "));
+    }
+
+    #[test]
+    fn goal_chip_ignores_unrelated_events() {
+        let mut app = App::new(SessionInfo::default());
+        app.on_notification(&Notification {
+            method: "event".into(),
+            params: serde_json::json!({
+                "type": "loop.token",
+                "goal": { "id": "nope", "status": "running" }
+            }),
+        });
+        assert!(app.goal.is_none());
+    }
+
+    #[test]
+    fn git_and_extra_roots_stay_hidden_without_host_fields() {
+        let mut app = App::new(SessionInfo::default());
+        app.apply_status(&serde_json::json!({
+            "allow_write": true, "allow_shell": false, "ask_mode": "ask"
+        }));
+        let text = header_text(&app, 120);
+        assert!(!text.contains("main"), "{text}");
+        assert!(!text.contains("root"), "{text}");
+        assert!(app.git.is_none());
+        assert!(app.extra_roots.is_empty());
+    }
+
+    #[test]
+    fn git_and_extra_roots_decode_from_status_when_present() {
+        let mut app = App::new(SessionInfo::default());
+        app.apply_status(&serde_json::json!({
+            "git": { "branch": "main", "dirty": true },
+            "extra_roots": [
+                { "path": "/opt/shared", "read_only": true },
+                { "path": "/data", "read_only": false }
+            ]
+        }));
+        assert_eq!(
+            app.git,
+            Some(GitInfo {
+                branch: "main".into(),
+                dirty: true
+            })
+        );
+        assert_eq!(app.extra_roots.len(), 2);
+        let wide = header_text(&app, 120);
+        assert!(wide.contains("main*"), "{wide}");
+        assert!(wide.contains("+2 roots"), "{wide}");
+        assert!(
+            wide.trim_end().ends_with("+2 roots") || wide.contains("main*"),
+            "{wide}"
+        );
+
+        // A later status without those keys must not wipe them.
+        app.apply_status(&serde_json::json!({
+            "allow_write": true, "ask_mode": "auto"
+        }));
+        assert!(app.git.is_some());
+        assert_eq!(app.extra_roots.len(), 2);
+
+        // An explicit empty payload clears the chips.
+        app.apply_status(&serde_json::json!({
+            "git": { "branch": "" },
+            "extra_roots": []
+        }));
+        assert!(app.git.is_none());
+        assert!(app.extra_roots.is_empty());
+        let cleared = header_text(&app, 120);
+        assert!(!cleared.contains("main"), "{cleared}");
+        assert!(!cleared.contains("root"), "{cleared}");
+    }
+
+    #[test]
+    fn compact_tokens_matches_header_examples() {
+        assert_eq!(compact_tokens(32_000), "32k");
+        assert_eq!(compact_tokens(128_000), "128k");
+        assert_eq!(compact_tokens(3_200), "3.2k");
+        assert_eq!(compact_tokens(950), "950");
     }
 
     #[test]

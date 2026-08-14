@@ -11,8 +11,8 @@ NO_COLOR=1 cargo run -- snapshot --scene help      # monochrome frame
 ```
 
 Scenes live in `src/snapshot.rs`: `chat`, `busy`, `diff`, `welcome`, `help`,
-`permission`, `tools`, `toolgroup`, `narrow`. Add one whenever a state is
-hard to reach by hand.
+`permission`, `tools`, `toolgroup`, `narrow`, `header`. Add one whenever a
+state is hard to reach by hand.
 
 The tool honours `NO_COLOR` through the same `Theme::detect()` the client
 uses, so the monochrome frame it prints is the frame users get.
@@ -33,15 +33,22 @@ that it shows a "terminal too small" card instead of a broken one.
 
 **Header — identity left, usage right, safety never drops.** The left cluster
 is only `mowi`, the workspace *basename*, and `model (effort)` with the
-effort word dimmed. Token usage sits immediately before the context
-gauge; the gauge is the far-rightmost chip whenever it is shown. A
-` · ` joins safety to the first metric and is omitted when both
-metrics are hidden. Both peel first (tokens, then gauge) so a tight
-row keeps identity. The gauge is not offered below `GAUGE_MIN_COLS`.
-Session id is never a header chip. The painted row has a one-column inset on
-each side so it shares a vertical rhythm with the composer and footer. Header
-and status sit on the terminal default background — they do not paint a
-second mantle fill over the document ground.
+effort word dimmed. After safety, optional chips paint as git, extra-root
+count, Goal, tokens, then the context size (`32k/128k ctx` or `32k ctx`)
+at the far right. Pressure colour still uses the internal percent
+(muted / warn ≥75% / error ≥90%); the header does not print `%` or a
+fill bar. A ` · ` joins safety to the first optional chip and is omitted
+when none remain. Drop order (first to go): tokens, git, extra-roots,
+Goal, context, then identity (workspace, effort, model). There is no
+minimum-width gate — the compact size chip is offered whenever used
+tokens are known and peels when the row overflows. Git / extra-roots
+appear only from host `status`/`session` fields. Goal appears only from
+`graph.goal.*` and does not stay after completion once the operator
+continues. Session id is never a header chip. The painted row has a
+one-column inset on each side so it shares a vertical rhythm with the
+composer and footer. Header and status sit on the terminal default
+background — they do not paint a second mantle fill over the document
+ground.
 
 **One live clock.** The status bar owns the spinner, elapsed time and
 typing pulse while a turn runs, each painted in its own role (`spinner` /

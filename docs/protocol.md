@@ -71,6 +71,12 @@ per message; stdin line 1 MiB.
 `busy`, `run_id`, `session_id`, `workspace`, `model`, `wire`,
 `allow_write`, `allow_shell`, `ask_mode`, `pending_perm`.
 
+Optional chrome fields (not emitted by current `mow rpc`; the client
+decodes them when present — see [Host chrome the client is ready to
+decode](#host-chrome-the-client-is-ready-to-decode)): `git`,
+`extra_roots` / `extra_root_count`. The same keys are accepted on
+`session`.
+
 ### `slash`
 
 `name` is the token without a required leading slash (`review` or `/review`).
@@ -123,8 +129,8 @@ Exact strings live in mow `Event*` consts (`mow.go`). Handle at least:
 | `harness.delegate.chunk` | peer live buffer (`agent`, `delta`) — **not** host answer |
 | `harness.delegate.progress` | peer phase (`thought`, `tool`, `prompt`) |
 | `harness.delegate.usage` | add to peer token chip |
-| `graph.goal.start` / `step` / `done` / `fail` | goal progress/state chip |
-| `graph.goal.partial` / `blocked` | partial result or human decision prompt |
+| `graph.goal.start` / `step` / `done` / `fail` | Goal chip: short id + `step/max` |
+| `graph.goal.partial` / `blocked` | Goal chip: `blocked`, or step/max while partial |
 | compact | refresh ctx% |
 | lsp diagnostics | optional diagnostics line |
 
@@ -141,8 +147,77 @@ JSON-RPC: `-32700` parse, `-32600` invalid, `-32601` unknown method,
 `-32603` internal (prompt transport / Engine error). Prompt errors may
 include `data: {text, session_id, run_id, stop_reason}`.
 
+### `graph.goal.*` payload
+
+Confirmed host event types: `graph.goal.start`, `graph.goal.step`,
+`graph.goal.done`, `graph.goal.fail`, `graph.goal.partial`,
+`graph.goal.blocked`. The frozen payload is:
+
+```json
+{
+  "type": "graph.goal.step",
+  "goal": {
+    "id": "fix-bugs",
+    "status": "running",
+    "step": 2,
+    "max_steps": 10
+  }
+}
+```
+
+The client paints `goal {short-id} {step}/{max}` while running/partial,
+or `blocked` / `failed` / `done`. Event type wins for terminal and
+blocked so a stale `status` cannot leave a running chip. `done` /
+`failed` clear on the next user prompt.
+
+## Host chrome the client is ready to decode
+
+mowi will not run `git` or walk extra-root paths on a paint frame.
+These chips appear only when `status` or `session` includes the fields
+below. Current `mow rpc` does not emit them; this is the contract for
+a later host change. Do not edit `../mow` from this client task.
+
+### `git` (object, optional)
+
+```json
+"git": { "branch": "main", "dirty": true }
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `branch` | string | Current branch. Empty / omitted hides the chip. |
+| `dirty` | bool | Uncommitted worktree. The chip paints `main*`. |
+
+Compute this on the host when building `status` / `session`. Refresh
+on those calls; do not require the UI to poll.
+
+### `extra_roots` (array, optional)
+
+```json
+"extra_roots": [
+  { "path": "/opt/shared", "read_only": true },
+  { "path": "/data", "read_only": false }
+]
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `path` | string | Jail root beyond the workspace, after Engine policy merge (CLI `--extra-root`, user config, workspace profile). |
+| `read_only` | bool | Defaults to `false`. |
+
+A string element `"/path"` is accepted as a read-write root. Alternate:
+`extra_root_count` (number) when the host only wants to expose the
+count. The chip is `+N roots` (`+1 root` in the singular) and is
+hidden when N is 0 or the field is absent.
+
+Absent keys leave previously decoded chips in place so a current mow
+`status` (no `git`) cannot wipe a `session` that did send them. An
+explicit empty `branch` or empty `extra_roots` array clears the chip.
+
 ## What is not on the wire (yet)
 
+- `git` / `extra_roots` on `status` and `session` — client decodes the
+  shapes above; host does not emit them yet
 - Model picker catalog — v1 can omit
 - Theme / keys — UI-local config
 - Binary diffs — events carry text; UI pretty-prints

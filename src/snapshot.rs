@@ -15,7 +15,7 @@ use ratatui::{
 use std::time::{Duration, UNIX_EPOCH};
 
 use crate::app::{App, Entry, draw};
-use crate::rpc::{ContextUsage, SessionInfo};
+use crate::rpc::{ContextUsage, ExtraRoot, GitInfo, GoalInfo, SessionInfo};
 use crate::theme::Theme;
 
 /// Fixed UTC `04:02` so snapshot frames do not change every run.
@@ -27,7 +27,7 @@ fn snapshot_user(text: impl Into<String>) -> Entry {
 }
 
 /// Every scene the snapshot tool can paint.
-pub const SCENES: [&str; 9] = [
+pub const SCENES: [&str; 10] = [
     "chat",
     "busy",
     "diff",
@@ -37,6 +37,7 @@ pub const SCENES: [&str; 9] = [
     "tools",
     "toolgroup",
     "narrow",
+    "header",
 ];
 
 fn demo_session() -> SessionInfo {
@@ -45,6 +46,7 @@ fn demo_session() -> SessionInfo {
         workspace: "/home/dev/src/mow".into(),
         model: "gpt-5-mini".into(),
         wire: "openai-responses".into(),
+        ..Default::default()
     }
 }
 
@@ -192,6 +194,38 @@ pub fn scene_with_theme(name: &str, theme: Theme) -> App {
             app.entries
                 .push(Entry::Assistant("All green: 102 tests passing.".into()));
         }
+        "header" => {
+            app.git = Some(GitInfo {
+                branch: "main".into(),
+                dirty: true,
+            });
+            app.extra_roots = vec![
+                ExtraRoot {
+                    path: "/opt/shared".into(),
+                    read_only: true,
+                },
+                ExtraRoot {
+                    path: "/data".into(),
+                    read_only: false,
+                },
+            ];
+            app.goal = Some(GoalInfo {
+                id: "fix-bugs".into(),
+                status: "running".into(),
+                step: 2,
+                max_steps: 10,
+            });
+            app.apply_context(&ContextUsage {
+                tokens: 32_000,
+                context_window: Some(128_000),
+                remaining: Some(96_000),
+                percent: Some(25.0),
+            });
+            app.entries.push(snapshot_user("continue the goal"));
+            app.entries.push(Entry::Assistant(
+                "Working the remaining nodes in the current Goal.".into(),
+            ));
+        }
         _ => {
             app.entries
                 .push(snapshot_user("summarise the architecture doc"));
@@ -302,6 +336,30 @@ mod tests {
             let out = render(name, 100, 30);
             assert!(!out.is_empty(), "scene {name} painted nothing");
         }
+    }
+
+    #[test]
+    fn header_scene_shows_compact_context_and_conditional_chips() {
+        let out = paint_plain("header", 120, 24);
+        let header = out.lines().next().expect("header");
+        assert!(header.contains("32k/128k ctx"), "{header}");
+        assert!(!header.contains('%'), "no printed percent: {header}");
+        assert!(!header.contains('▰'), "no gauge bar: {header}");
+        assert!(header.contains("main*"), "{header}");
+        assert!(header.contains("+2 roots"), "{header}");
+        assert!(header.contains("goal fix-bugs 2/10"), "{header}");
+        assert!(
+            header.trim_end().ends_with("32k/128k ctx"),
+            "context is far-right: {header}"
+        );
+        assert!(header.contains("write+shell"), "{header}");
+        assert!(header.contains("ask"), "{header}");
+
+        let chat = paint_plain("chat", 100, 24);
+        let chat_header = chat.lines().next().expect("chat header");
+        assert!(chat_header.contains("41.5k/200k ctx"), "{chat_header}");
+        assert!(!chat_header.contains("goal "), "{chat_header}");
+        assert!(!chat_header.contains("main"), "{chat_header}");
     }
 
     #[test]
