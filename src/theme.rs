@@ -41,9 +41,9 @@ pub mod mocha {
     pub const MANTLE: Color = Color::Rgb(0x18, 0x18, 0x25);
     pub const CRUST: Color = Color::Rgb(0x11, 0x11, 0x1b);
 
-    /// Diff bands: the accent hue mixed down into `base` so text stays legible.
-    pub const ADD_BAND: Color = Color::Rgb(0x33, 0x41, 0x38);
-    pub const DEL_BAND: Color = Color::Rgb(0x4d, 0x32, 0x40);
+    /// Diff bands: deeper accent hue mixed into `base` so +/− rows pop more.
+    pub const ADD_BAND: Color = Color::Rgb(0x26, 0x4f, 0x3d);
+    pub const DEL_BAND: Color = Color::Rgb(0x5e, 0x2d, 0x3a);
 }
 
 /// Semantic surface for a status/severity badge.

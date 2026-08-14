@@ -8,7 +8,7 @@ operator experience**, not a subset that forgets permissions or resume.
 | Region | Behavior |
 |---|---|
 | Header | Workspace, model, session, safety chips (write/shell, ask/auto). Narrow terminals drop vanity first; safety never drops. Token chip = host + peer (`⇄`). |
-| Transcript | User blocks (soft fill), assistant markdown, one compact tool line per turn. Edits = inline review cards (−/+). |
+| Transcript | User blocks (soft fill), assistant markdown, one compact tool line per call — a turn's calls collapse into a single `⚙ N tool calls` row (`t` on empty input expands, Esc collapses). Edits = inline review cards (−/+). |
 | Activity band | Only while busy: spinner, verb (“searching · grep · loop.go”), elapsed. |
 | Input | Enter sends; busy queues. `/steer` redirects the running turn. |
 | Welcome | Splash, dismisses on any key. |
@@ -19,15 +19,20 @@ operator experience**, not a subset that forgets permissions or resume.
 | Key | Action |
 |---|---|
 | Enter | send (queue if busy) |
-| ctrl+j | newline (input grows 1–6 rows) |
+| ctrl+j | newline (input grows 1–10 rows) |
 | ctrl+u / ctrl+d | scroll transcript |
-| Esc | dismiss overlay, else cancel turn, else ignore |
+| pgup / pgdn | scroll transcript (larger steps) |
+| Esc | dismiss overlay, else collapse tool calls, else cancel turn, else ignore |
 | ctrl+l | clear transcript (UI-local; Engine history remains) |
 | shift+tab | ask ↔ auto (`perm.set`) |
 | ctrl+p | expand the last peer buffer in an overlay |
 | ctrl+/ or `?` on empty | help overlay (local keys + `slash.list`) |
 | ctrl+c | quit (cancel first if busy) |
 | Arrow-up on empty | edit last prompt |
+| home / end | cursor to start / end of input |
+| delete | delete forward |
+| `t` on empty | expand / collapse the last tool group |
+| paste | bracketed paste at the cursor, multi-line safe |
 | any key | dismiss the welcome splash |
 
 All bindings remappable later (`extensions.tui.keys` in Go). v1 hard-codes

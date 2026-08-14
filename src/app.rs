@@ -72,6 +72,13 @@ pub enum Entry {
         name: String,
         duration_ms: Option<u64>,
     },
+    /// One turn's worth of tool calls, collapsed to a single summary line
+    /// unless expanded (`t` on empty input). A long agent turn that runs
+    /// `bash`/`write`/`read` a dozen times is one row, not a flood.
+    Tools {
+        tools: Vec<(String, Option<u64>)>,
+        expanded: bool,
+    },
 }
 
 /// Host and delegated token usage for the header chip.
@@ -235,6 +242,11 @@ pub struct App {
     pub search_hits: Vec<usize>,
     pub search_cursor: usize,
     pub last_copy: String,
+    /// Tool calls of the turn currently running, grouped so a busy turn does
+    /// not paint one transcript row per `bash`/`write`/`read` call. Committed
+    /// to `entries` as `Entry::Tools` when the turn's loop ends (or the turn
+    /// finishes), then cleared.
+    pub live_tools: Vec<(String, Option<u64>)>,
     /// Ask mode (`perm.set`): true = ask before power tools.
     pub ask_mode: bool,
     pub allow_write: bool,
@@ -285,6 +297,7 @@ impl Default for App {
             search_hits: Vec::new(),
             search_cursor: 0,
             last_copy: String::new(),
+            live_tools: Vec::new(),
             ask_mode: true,
             allow_write: false,
             allow_shell: false,
@@ -585,7 +598,7 @@ impl App {
             }
         };
 
-        // The activity band above the transcript owns the live turn readout
+        // The activity band above the composer owns the live turn readout
         // (spinner, elapsed, current tool). Repeating it here would give the
         // operator two clocks that tick out of step, so the footer carries
         // only the coarse state word.
@@ -726,6 +739,42 @@ impl App {
                     None => spans.push(Span::styled("  running", self.theme.timing())),
                 }
                 wrap_styled_line(Line::from(spans), width)
+            }
+            Entry::Tools { tools, expanded } => {
+                // Collapsed (the default): one summary row so a busy turn
+                // stays readable. Expanded: a header plus one row per call,
+                // same visual language as a plain Tool entry.
+                if tools.len() <= 1 || *expanded {
+                    let mut out = wrap_styled_line(
+                        Line::styled(format!("⚙ {} tool calls", tools.len()), self.theme.tool()),
+                        width,
+                    );
+                    for (name, duration_ms) in tools {
+                        let (verb, rest) = tool_label(name);
+                        let mut spans = vec![
+                            Span::styled("✓ ", self.theme.badge(Tone::Ok).patch(self.theme.base())),
+                            Span::styled(verb, self.theme.tool()),
+                        ];
+                        if !rest.is_empty() {
+                            spans.push(Span::styled(format!(" {rest}"), self.theme.note()));
+                        }
+                        if let Some(ms) = duration_ms {
+                            spans.push(Span::styled(
+                                format!("  {:.1}s", *ms as f64 / 1000.0),
+                                self.theme.timing(),
+                            ));
+                        }
+                        out.extend(wrap_styled_line(Line::from(spans), width));
+                    }
+                    out
+                } else {
+                    let total_ms: u64 = tools.iter().filter_map(|(_, d)| *d).sum();
+                    let mut text = format!("⚙ {} tool calls", tools.len());
+                    if total_ms > 0 {
+                        text.push_str(&format!(" · {:.1}s", total_ms as f64 / 1000.0));
+                    }
+                    wrap_styled_line(Line::styled(text, self.theme.note()), width)
+                }
             }
         }
     }
@@ -888,6 +937,34 @@ impl App {
                 let cols = verb.width() + rest.width() + suffix + 3;
                 cols.div_ceil(width.max(1))
             }
+            Entry::Tools { tools, expanded } => {
+                if tools.len() <= 1 || *expanded {
+                    // Header row plus one label row per call; each label is
+                    // bounded by TOOL_ARG_COLS and carries the same chrome as
+                    // a plain Tool entry (glyph + verb + rest + timing).
+                    1 + tools
+                        .iter()
+                        .map(|(name, duration_ms)| {
+                            let (verb, rest) = tool_label(name);
+                            let cols = verb.width()
+                                + rest.width()
+                                + 3
+                                + usize::from(duration_ms.is_some()) * 8;
+                            cols.div_ceil(width.max(1))
+                        })
+                        .sum::<usize>()
+                } else {
+                    // The collapsed summary is one line; count it exactly like
+                    // the painter lays it out so the estimate never reports
+                    // fewer rows than the group paints.
+                    let total_ms: u64 = tools.iter().filter_map(|(_, d)| *d).sum();
+                    let mut text = format!("⚙ {} tool calls", tools.len());
+                    if total_ms > 0 {
+                        text.push_str(&format!(" · {:.1}s", total_ms as f64 / 1000.0));
+                    }
+                    wrapped(&text, width)
+                }
+            }
         }) + 1
     }
 
@@ -1038,12 +1115,18 @@ impl App {
                 self.busy = true;
                 self.status = "running".into();
                 self.activity_started = Some(Instant::now());
+                // A fresh loop owns a fresh tool group (a no-op if the
+                // previous turn already committed its group at run.end).
+                self.live_tools.clear();
             }
             "loop.run.end" | "run.end" => {
                 self.busy = false;
                 self.status.clear();
                 self.activity_started = None;
                 self.finish_peers();
+                // Commit the turn's tool calls as one entry. Idempotent: the
+                // group is consumed, so a later finish_turn has nothing left.
+                self.commit_tool_group();
             }
             k if k.ends_with("tool.start") || k == "tool.start" => {
                 if let Some(name) = params
@@ -1052,10 +1135,7 @@ impl App {
                     .and_then(|v| v.as_str())
                 {
                     self.status = format!("tool · {name}");
-                    self.entries.push(Entry::Tool {
-                        name: name.to_string(),
-                        duration_ms: None,
-                    });
+                    self.live_tools.push((name.to_string(), None));
                 }
             }
             k if k.ends_with("tool.end") || k == "tool.end" => {
@@ -1063,18 +1143,7 @@ impl App {
                     .get("tool")
                     .or_else(|| params.get("name"))
                     .and_then(Value::as_str);
-                if let Some(Entry::Tool { duration_ms, .. }) =
-                    self.entries
-                        .iter_mut()
-                        .rev()
-                        .find(|entry| match (entry, tool_name) {
-                            (Entry::Tool { name, .. }, Some(end_name)) => name == end_name,
-                            (Entry::Tool { .. }, None) => true,
-                            _ => false,
-                        })
-                {
-                    *duration_ms = params.get("duration_ms").and_then(Value::as_u64);
-                }
+                self.note_tool_end(tool_name, params.get("duration_ms").and_then(Value::as_u64));
                 if tool_name == Some("acp_delegate") {
                     self.finish_peers();
                 }
@@ -1116,6 +1185,75 @@ impl App {
         }
     }
 
+    /// Record a tool's end: stamp duration onto the matching open call, or the
+    /// most recent still-running one when the engine omits the name.
+    fn note_tool_end(&mut self, name: Option<&str>, duration: Option<u64>) {
+        if let Some(entry) = self.live_tools.iter_mut().rev().find(|(n, d)| match name {
+            Some(end_name) => n == end_name,
+            None => d.is_none(),
+        }) {
+            entry.1 = duration;
+        }
+    }
+
+    /// Fold the current turn's tool calls into one transcript entry.
+    /// Consumes `live_tools`, so calling it twice is a safe no-op — it runs at
+    /// `run.end` and again defensively at `finish_turn` for engines that skip
+    /// the end notification.
+    fn commit_tool_group(&mut self) {
+        if self.live_tools.is_empty() {
+            return;
+        }
+        if self.live_tools.len() == 1 {
+            // A single call stays a plain row: a summary of one tool is a
+            // worse transcript, not a better one.
+            let (name, duration_ms) = self.live_tools.pop().unwrap();
+            self.entries.push(Entry::Tool { name, duration_ms });
+        } else {
+            let tools = std::mem::take(&mut self.live_tools);
+            self.entries.push(Entry::Tools {
+                tools,
+                expanded: false,
+            });
+        }
+        if self.follow {
+            self.scroll = u16::MAX;
+        }
+    }
+
+    /// `t` on empty input: expand/collapse the most recent tool group.
+    /// Returns false when there is nothing to toggle, so the key can fall
+    /// through to typing.
+    pub fn toggle_tool_group(&mut self) -> bool {
+        let Some(group) = self.entries.iter_mut().rev().find_map(|entry| match entry {
+            Entry::Tools { expanded, .. } => Some(expanded),
+            _ => None,
+        }) else {
+            return false;
+        };
+        *group = !*group;
+        if self.follow {
+            self.scroll = u16::MAX;
+        }
+        true
+    }
+
+    /// Esc: collapse an expanded tool group before falling through to the
+    /// destructive cancel. Returns true when one was collapsed.
+    fn collapse_tool_group(&mut self) -> bool {
+        let Some(expanded_ref) = self.entries.iter_mut().rev().find_map(|entry| match entry {
+            Entry::Tools { expanded, .. } if *expanded => Some(expanded),
+            _ => None,
+        }) else {
+            return false;
+        };
+        *expanded_ref = false;
+        if self.follow {
+            self.scroll = u16::MAX;
+        }
+        true
+    }
+
     fn finish_peers(&mut self) {
         self.peer_focus = None;
         for (agent, _) in self.peers.drain() {
@@ -1130,6 +1268,9 @@ impl App {
     pub fn finish_turn(&mut self, result: Result<Value, Error>) {
         self.busy = false;
         self.activity_started = None;
+        // Fallback commit: engines that never emit run.end still get their
+        // tool group. No-op when run.end already committed it.
+        self.commit_tool_group();
         match result {
             Ok(v) => {
                 self.usage.input_tokens +=
@@ -1233,6 +1374,34 @@ impl App {
         }
     }
 
+    fn delete_char(&mut self) {
+        let start = self.cursor_byte();
+        let ch_len = self.input[start..]
+            .chars()
+            .next()
+            .map(char::len_utf8)
+            .unwrap_or(0);
+        if ch_len > 0 {
+            self.input.replace_range(start..start + ch_len, "");
+        }
+    }
+
+    fn cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn cursor_end(&mut self) {
+        self.cursor = self.input.chars().count();
+    }
+
+    /// Insert text (bracketed paste) at the cursor. Multi-line paste lands as
+    /// real newlines — the composer is already multi-line.
+    pub fn insert_text(&mut self, text: &str) {
+        let byte = self.cursor_byte();
+        self.input.insert_str(byte, text);
+        self.cursor += text.chars().count();
+    }
+
     fn cursor_byte(&self) -> usize {
         self.input
             .chars()
@@ -1334,6 +1503,9 @@ impl App {
             ("ctrl+l", "clear transcript (engine history kept)"),
             ("shift+tab", "ask ↔ auto"),
             ("ctrl+p", "expand peer output"),
+            ("t (empty input)", "expand / collapse tool calls"),
+            ("home / end", "cursor to start / end"),
+            ("pgup / pgdn", "scroll transcript"),
             ("ctrl+/ or ?", "this help"),
             ("esc", "dismiss overlay, else cancel turn"),
             ("ctrl+c", "quit (cancel first if busy)"),
@@ -1619,6 +1791,11 @@ fn entry_text(entry: &Entry) -> String {
     match entry {
         Entry::User(text) | Entry::Assistant(text) | Entry::Note(text) => text.clone(),
         Entry::Tool { name, .. } => name.clone(),
+        Entry::Tools { tools, .. } => tools
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
     }
 }
 
@@ -1800,12 +1977,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 
     frame.render_widget(Block::new().style(app.theme.base()), area);
 
-    // header · hairline · [activity] · transcript · input · footer
+    // header · hairline · transcript · [activity] · input · footer
     let mut rows = vec![Constraint::Length(1), Constraint::Length(1)];
+    rows.push(Constraint::Fill(1));
     if app.busy {
         rows.push(Constraint::Length(1));
     }
-    rows.push(Constraint::Fill(1));
     // The composer block eats 2 columns of border and 2 of padding; size the
     // textarea against that inner width so wrapped text grows the box.
     let input_cols = area.width.saturating_sub(4);
@@ -1816,10 +1993,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         .constraints(rows)
         .split(area);
     let rest = &areas[2..];
-    let (activity, transcript_area, input_area, footer_area) = if app.busy {
-        (Some(rest[0]), rest[1], rest[2], rest[3])
+    let (transcript_area, activity, input_area, footer_area) = if app.busy {
+        (rest[0], Some(rest[1]), rest[2], rest[3])
     } else {
-        (None, rest[0], rest[1], rest[2])
+        (rest[0], None, rest[1], rest[2])
     };
 
     paint_filled_header(frame, app, areas[0]);
@@ -1872,13 +2049,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     // The scrim covers the document only: header safety chips, the composer
     // and the footer decision bar all stay sharp, because those are what the
     // operator reads and types into while a modal is up. `doc` is the
-    // activity band plus the transcript.
+    // transcript plus the activity band (when present), ending at the composer.
     let doc = Rect {
         x: area.x,
-        y: areas[0].height + areas[1].height,
+        y: transcript_area.y,
         width: area.width,
-        height: (transcript_area.y + transcript_area.height)
-            .saturating_sub(areas[0].height + areas[1].height),
+        height: input_area.y.saturating_sub(transcript_area.y),
     };
     if app.welcome {
         draw_scrim(frame, app, doc);
@@ -2609,6 +2785,21 @@ pub fn run<B: Backend>(
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     handle_key(key, client, app, &mut turn, &mut slash_rx)?;
                 }
+                // Bracketed paste lands at the input cursor, multi-line safe.
+                Event::Paste(text) => {
+                    // A stray paste must never answer a permission prompt.
+                    if app.pending_perm.is_none() {
+                        if app.welcome {
+                            app.welcome = false;
+                        }
+                        app.insert_text(&text);
+                    }
+                }
+                Event::Resize(..) if !app.follow => {
+                    // Layout recomputes on the next draw; just clamp scroll so
+                    // a shrink cannot strand the viewport past the end.
+                    app.scroll = app.scroll.min(max_scroll(app));
+                }
                 _ => {}
             }
         }
@@ -2686,6 +2877,9 @@ fn handle_key(
         KeyCode::Char('?') if app.input.is_empty() => app.overlay = Overlay::help(),
         KeyCode::Esc => {
             if app.dismiss_overlay() {
+            } else if app.collapse_tool_group() {
+                // Esc is a view op first: collapse an expanded tool group
+                // before it ever reaches the destructive cancel.
             } else if app.busy || turn.is_some() {
                 client.cancel()?;
                 app.status = "cancelling".into();
@@ -2720,6 +2914,14 @@ fn handle_key(
             }
         }
         KeyCode::Backspace => app.backspace_char(),
+        KeyCode::Delete => app.delete_char(),
+        KeyCode::Home => app.cursor_home(),
+        KeyCode::End => app.cursor_end(),
+        KeyCode::PageUp => leave_follow(app, 5),
+        KeyCode::PageDown => scroll_down(app, 5),
+        // `t` on empty input toggles the last tool group; with nothing to
+        // toggle the key falls through and types like any other character.
+        KeyCode::Char('t') if app.input.is_empty() && app.toggle_tool_group() => {}
         KeyCode::Tab => {
             if app.input.starts_with('/') {
                 app.complete_slash();
@@ -3895,7 +4097,9 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer();
-        let add_bg = Color::Rgb(51, 65, 56);
+        // Reference the palette constant, not a literal: the band color is a
+        // theme concern and this test should survive a flavor tweak.
+        let add_bg = crate::theme::mocha::ADD_BAND;
         let mut found = None;
         for y in 0..16u16 {
             let row: String = (0..60).map(|x| buf[(x, y)].symbol().to_string()).collect();
@@ -3988,24 +4192,29 @@ mod tests {
     #[test]
     fn tool_events_add_and_complete_tool_line() {
         let mut app = App::new(SessionInfo::default());
+        // Tool events accumulate in the live group while the loop runs; the
+        // transcript entry is only committed when the loop (or turn) ends.
         app.on_notification(&Notification {
             method: "event".into(),
             params: serde_json::json!({
                 "type": "loop.tool.start", "tool": "grep"
             }),
         });
-        assert_eq!(
-            app.entries,
-            vec![Entry::Tool {
-                name: "grep".into(),
-                duration_ms: None
-            }]
-        );
+        assert_eq!(app.live_tools, vec![("grep".to_string(), None)]);
+        assert!(app.entries.is_empty(), "not committed mid-turn");
         assert_eq!(app.status, "tool · grep");
         app.on_notification(&Notification {
             method: "event".into(),
             params: serde_json::json!({
                 "type": "loop.tool.end", "duration_ms": 400
+            }),
+        });
+        assert_eq!(app.live_tools, vec![("grep".to_string(), Some(400))]);
+        // A single call keeps the plain one-row shape it always had.
+        app.on_notification(&Notification {
+            method: "event".into(),
+            params: serde_json::json!({
+                "type": "loop.run.end"
             }),
         });
         assert_eq!(
@@ -4015,6 +4224,164 @@ mod tests {
                 duration_ms: Some(400)
             }]
         );
+        assert!(app.live_tools.is_empty(), "group consumed on commit");
+    }
+
+    #[test]
+    fn multi_tool_turn_commits_one_collapsed_group() {
+        let mut app = App::new(SessionInfo::default());
+        app.on_notification(&Notification {
+            method: "event".into(),
+            params: serde_json::json!({"type": "loop.run.start"}),
+        });
+        for (tool, ms) in [
+            ("read src/app.rs", 120),
+            ("grep estimated_entry_lines", 40),
+            ("bash cargo test", 940),
+        ] {
+            app.on_notification(&Notification {
+                method: "event".into(),
+                params: serde_json::json!({"type": "loop.tool.start", "tool": tool}),
+            });
+            app.on_notification(&Notification {
+                method: "event".into(),
+                params: serde_json::json!({"type": "loop.tool.end", "tool": tool, "duration_ms": ms}),
+            });
+        }
+        assert!(app.entries.is_empty(), "nothing committed mid-turn");
+        app.on_notification(&Notification {
+            method: "event".into(),
+            params: serde_json::json!({"type": "loop.run.end"}),
+        });
+        assert_eq!(
+            app.entries,
+            vec![Entry::Tools {
+                tools: vec![
+                    ("read src/app.rs".into(), Some(120)),
+                    ("grep estimated_entry_lines".into(), Some(40)),
+                    ("bash cargo test".into(), Some(940)),
+                ],
+                expanded: false,
+            }]
+        );
+        // A second commit (the finish_turn fallback) is a safe no-op: the
+        // error note is the only new entry, never a duplicate tool group.
+        app.finish_turn(Err(crate::rpc::Error::Closed));
+        let groups = app
+            .entries
+            .iter()
+            .filter(|e| matches!(e, Entry::Tools { .. }))
+            .count();
+        assert_eq!(groups, 1, "group committed exactly once");
+    }
+
+    #[test]
+    fn tool_group_collapsed_paints_one_row_expanded_paints_all() {
+        let mut app = App::new(SessionInfo::default());
+        app.theme = Theme { colored: true };
+        app.entries.push(Entry::User("run the suite".into()));
+        app.entries.push(Entry::Tools {
+            tools: vec![
+                ("read src/app.rs".into(), Some(120)),
+                ("grep estimated_entry_lines".into(), Some(40)),
+                ("bash cargo test".into(), Some(940)),
+            ],
+            expanded: false,
+        });
+        let out = render(&mut app, 80, 20);
+        let collapsed_rows: Vec<&str> =
+            out.lines().filter(|l| l.contains("3 tool calls")).collect();
+        assert_eq!(collapsed_rows.len(), 1, "collapsed group is one row");
+        assert!(!out.contains("grep estimated_entry_lines"), "{out}");
+
+        assert!(app.toggle_tool_group(), "t toggles the group");
+        let out = render(&mut app, 80, 20);
+        assert!(out.contains("grep estimated_entry_lines"), "{out}");
+        let tool_rows = out
+            .lines()
+            .filter(|l| l.contains("read src/app.rs") || l.contains("bash cargo test"))
+            .count();
+        assert_eq!(tool_rows, 2, "expanded group paints every call");
+
+        assert!(app.toggle_tool_group(), "t collapses again");
+        let out = render(&mut app, 80, 20);
+        assert!(!out.contains("grep estimated_entry_lines"), "{out}");
+    }
+
+    #[test]
+    fn tool_group_toggle_has_nothing_to_do_without_a_group() {
+        let mut app = App::new(SessionInfo::default());
+        assert!(!app.toggle_tool_group(), "no group: key falls through");
+        assert!(!app.collapse_tool_group(), "no group to collapse");
+        app.entries.push(Entry::Tools {
+            tools: vec![("a".into(), Some(1)), ("b".into(), Some(2))],
+            expanded: true,
+        });
+        assert!(app.collapse_tool_group(), "esc collapses the open group");
+        assert!(!app.collapse_tool_group(), "second esc has nothing left");
+    }
+
+    #[test]
+    fn tools_estimate_matches_painted_height() {
+        // The scrollbar extent derives from the estimate; a collapsed group
+        // must claim exactly the row it paints, an expanded group header+rows.
+        let mut app = App::new(SessionInfo::default());
+        app.theme = Theme { colored: true };
+        app.last_view_w = 40;
+        let collapsed = Entry::Tools {
+            tools: vec![
+                (
+                    "bash echo ----; cat AGENTS.md; ls -la; git log --oneline".into(),
+                    Some(90),
+                ),
+                ("write docs/roadmap.md".into(), Some(60)),
+                ("read src/render.rs".into(), Some(30)),
+            ],
+            expanded: false,
+        };
+        let mut expanded = collapsed.clone();
+        if let Entry::Tools { expanded: e, .. } = &mut expanded {
+            *e = true;
+        }
+        for entry in [collapsed, expanded] {
+            let painted = app.entry_lines(&entry).len();
+            let estimated = app.estimated_entry_lines(&entry) - 1; // minus separator
+            assert!(
+                estimated >= painted,
+                "under-estimated {entry:?}: estimated {estimated}, painted {painted}"
+            );
+        }
+    }
+
+    #[test]
+    fn paste_inserts_at_cursor_and_moves_it() {
+        let mut app = App::new(SessionInfo::default());
+        app.set_input("ab".into());
+        app.move_cursor(-1); // between 'a' and 'b'
+        app.insert_text("XY\nZ");
+        assert_eq!(app.input, "aXY\nZb");
+        assert_eq!(app.cursor, 5, "cursor after the pasted text");
+        // Paste at the end, like a terminal paste lands after a completed line.
+        app.cursor_end();
+        app.insert_text(" tail");
+        assert_eq!(app.input, "aXY\nZb tail");
+    }
+
+    #[test]
+    fn home_end_and_delete_edit_like_a_text_field() {
+        let mut app = App::new(SessionInfo::default());
+        app.set_input("hello".into());
+        app.cursor_home();
+        assert_eq!(app.cursor, 0);
+        app.delete_char(); // 'h' is before the cursor now
+        assert_eq!(app.input, "ello");
+        app.cursor_end();
+        assert_eq!(app.cursor, 4);
+        app.delete_char(); // nothing after the end
+        assert_eq!(app.input, "ello");
+        app.move_cursor(-1);
+        app.delete_char();
+        assert_eq!(app.input, "ell");
     }
 
     #[test]

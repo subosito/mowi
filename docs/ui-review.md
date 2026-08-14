@@ -11,7 +11,8 @@ NO_COLOR=1 cargo run -- snapshot --scene help      # monochrome frame
 ```
 
 Scenes live in `src/snapshot.rs`: `chat`, `busy`, `diff`, `welcome`, `help`,
-`permission`, `narrow`. Add one whenever a state is hard to reach by hand.
+`permission`, `tools`, `narrow`. Add one whenever a state is hard to reach by
+hand.
 
 The tool honours `NO_COLOR` through the same `Theme::detect()` the client
 uses, so the monochrome frame it prints is the frame users get.
@@ -37,7 +38,7 @@ lose: tokens → session id → workspace → effort → model. The context gaug
 suppressed below `GAUGE_MIN_COLS` entirely — knowing *which* model you are
 talking to outranks knowing how full its window is.
 
-**One live clock.** The activity band above the transcript owns the spinner,
+**One live clock.** The activity band above the composer owns the spinner,
 elapsed time and typing pulse. The footer carries only `busy` / `idle`. Two
 clocks tick out of step and both stop being believed.
 
@@ -79,6 +80,17 @@ is the Go `label.go` rule: never mid-string-truncate a shell blob into noise.
 The full command is in the engine log; the transcript exists to show *that*
 something ran. Pinned by `tool_labels_collapse_shell_chains` and the
 `shellblob` snapshot scene.
+
+**Tool calls group per turn, not per call.** `tool.start`/`tool.end` events
+accumulate in `live_tools` while the loop runs (the activity band owns the
+live "tool · name" readout); `run.end` (or the turn's end, whichever comes
+first — commit is idempotent) folds them into one `Entry::Tools`. A single
+call stays the plain one-row entry it always was; two or more collapse to
+`⚙ N tool calls · total`, and `t` on empty input expands them into a header
+plus one row per call (Esc collapses again). The estimate counts the
+collapsed line exactly as painted and, when expanded, header + every call, so
+the scrollbar extent never drifts. Pinned by
+`tools_estimate_matches_painted_height` and the `tools` snapshot scene.
 
 ## Colour
 

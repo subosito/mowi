@@ -17,13 +17,14 @@ use crate::rpc::{ContextUsage, SessionInfo};
 use crate::theme::Theme;
 
 /// Every scene the snapshot tool can paint.
-pub const SCENES: [&str; 7] = [
+pub const SCENES: [&str; 8] = [
     "chat",
     "busy",
     "diff",
     "welcome",
     "help",
     "permission",
+    "tools",
     "narrow",
 ];
 
@@ -126,6 +127,30 @@ pub fn scene(name: &str) -> App {
             });
             app.entries.push(Entry::Assistant(
                 "It is the Ratatui client for the mow harness.".into(),
+            ));
+        }
+        // Tool-grouping scene: one turn's four tool calls collapse to a
+        // single row; an expanded group below shows the drill-down state.
+        "tools" => {
+            app.entries.push(Entry::User("fix the flaky test".into()));
+            app.entries.push(Entry::Tools {
+                tools: vec![
+                    ("read src/app.rs".into(), Some(120)),
+                    ("grep estimated_entry_lines".into(), Some(40)),
+                    ("read src/render.rs".into(), Some(210)),
+                    ("bash cargo test".into(), Some(940)),
+                ],
+                expanded: false,
+            });
+            app.entries.push(Entry::Tools {
+                tools: vec![
+                    ("write src/app.rs".into(), Some(60)),
+                    ("bash cargo test".into(), Some(510)),
+                ],
+                expanded: true,
+            });
+            app.entries.push(Entry::Assistant(
+                "Grouped the tool calls so a busy turn reads like a summary.".into(),
             ));
         }
         "narrow" => {
