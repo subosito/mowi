@@ -4,7 +4,7 @@
 //! responses plus notifications from its stdout. Stderr is Engine logging and
 //! is never parsed.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::{self, BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -221,16 +221,19 @@ pub fn parse_message(line: &str) -> Option<Message> {
     Some(Message::Notify(Notification { method, params }))
 }
 
-/// `version` result.
+/// `version` / `capabilities` result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VersionInfo {
     pub name: String,
     pub version: String,
     pub rpc: String,
-    /// Methods this server advertises (empty when it predates `capabilities`).
+    /// Methods this server advertises. Empty means "not advertised" — the
+    /// client must not infer a full stock build.
     pub methods: Vec<String>,
     /// Subset answered while a prompt is in flight.
     pub control_methods: Vec<String>,
+    /// Boolean features a method name cannot express (`ephemeral_prompt`, …).
+    pub features: BTreeMap<String, bool>,
 }
 
 /// Pull a `[String]` field, tolerating absence and non-string members.
@@ -244,6 +247,49 @@ fn string_list(v: &Value, key: &str) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Pull `features` object values that look boolean.
+pub fn decode_features(v: &Value) -> BTreeMap<String, bool> {
+    let mut out = BTreeMap::new();
+    if let Some(obj) = v.get("features").and_then(Value::as_object) {
+        for (key, val) in obj {
+            let flag = match val {
+                Value::Bool(flag) => *flag,
+                Value::String(text) => matches!(text.as_str(), "true" | "1" | "yes"),
+                Value::Number(n) => n.as_i64().is_some_and(|n| n != 0),
+                _ => continue,
+            };
+            out.insert(key.clone(), flag);
+        }
+    }
+    if let Some(rows) = v.pointer("/optional/features").and_then(Value::as_array) {
+        for row in rows {
+            if row.get("linked").and_then(Value::as_bool).unwrap_or(true)
+                && let Some(id) = row.get("id").and_then(Value::as_str)
+            {
+                out.insert(id.to_string(), true);
+            }
+        }
+    }
+    out
+}
+
+/// Merge a `capabilities` result onto a `version` snapshot.
+pub fn merge_capabilities(mut version: VersionInfo, v: &Value) -> VersionInfo {
+    let methods = string_list(v, "methods");
+    if !methods.is_empty() {
+        version.methods = methods;
+    }
+    let control = string_list(v, "control_methods");
+    if !control.is_empty() {
+        version.control_methods = control;
+    }
+    let features = decode_features(v);
+    if !features.is_empty() {
+        version.features = features;
+    }
+    version
 }
 
 /// Validate a `version` result. The protocol is additive: a server newer than
@@ -277,6 +323,7 @@ pub fn check_version(v: &Value) -> Result<VersionInfo, Error> {
         rpc: rpc.to_string(),
         methods: string_list(v, "methods"),
         control_methods: string_list(v, "control_methods"),
+        features: decode_features(v),
     })
 }
 
@@ -287,8 +334,6 @@ pub struct SessionInfo {
     pub workspace: String,
     pub model: String,
     pub wire: String,
-    /// Present only when the host sent `git` on `session`.
-    pub git: Option<GitInfo>,
     /// Present only when the host sent `extra_roots` / `extra_root_count`.
     pub extra_roots: Vec<ExtraRoot>,
 }
@@ -301,7 +346,6 @@ impl SessionInfo {
             workspace: s("workspace"),
             model: s("model"),
             wire: s("wire"),
-            git: decode_git(v),
             extra_roots: decode_extra_roots(v).unwrap_or_default(),
         }
     }
@@ -346,6 +390,121 @@ pub fn reasoning_delta(params: &Value) -> Option<&str> {
         .get("delta")
         .and_then(|d| d.as_str())
         .filter(|d| !d.is_empty())
+}
+
+/// Tool name on `harness.tool.start` / `harness.tool.end` (also bare `tool.*`).
+///
+/// Confirmed mow `Event` field: `tool`. Older hosts may send `name`.
+pub fn tool_name(params: &Value) -> Option<&str> {
+    params
+        .get("tool")
+        .or_else(|| params.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+}
+
+/// Raw tool args object/string from a tool start/end event.
+pub fn tool_args(params: &Value) -> Option<&Value> {
+    params.get("args")
+}
+
+/// Tool result body on `harness.tool.end` (may already be truncated by the host).
+pub fn tool_result(params: &Value) -> Option<&str> {
+    params
+        .get("result")
+        .and_then(Value::as_str)
+        .filter(|result| !result.is_empty())
+}
+
+/// `denied` on `harness.tool.end`.
+pub fn tool_denied(params: &Value) -> bool {
+    params
+        .get("denied")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// `error` on `harness.tool.end`. Empty string is treated as absent.
+pub fn tool_error(params: &Value) -> Option<&str> {
+    params
+        .get("error")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|error| !error.is_empty())
+}
+
+/// Display label `verb detail` from a tool event, matching mow `FormatToolProgress`.
+///
+/// A name that already carries its argument (`read src/app.rs`) is left alone
+/// so tests and older hosts that inline the path keep working.
+pub fn tool_progress_label(tool: &str, args: Option<&Value>) -> String {
+    let tool = tool.trim();
+    if tool.is_empty() {
+        return String::new();
+    }
+    if tool.contains(char::is_whitespace) {
+        return tool.to_string();
+    }
+    let detail = args
+        .map(|args| tool_progress_detail(tool, args))
+        .unwrap_or_default();
+    if detail.is_empty() {
+        tool.to_string()
+    } else {
+        format!("{tool} {detail}")
+    }
+}
+
+fn tool_progress_detail(tool: &str, args: &Value) -> String {
+    let get = |key: &str| -> String {
+        match args {
+            Value::Object(map) => map
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string(),
+            Value::String(raw) => raw.trim().to_string(),
+            _ => String::new(),
+        }
+    };
+    match tool.to_ascii_lowercase().as_str() {
+        "read" | "write" | "edit" | "delete" => clip_runes(&get("path"), 72),
+        "glob" => clip_runes(&get("pattern"), 72),
+        "grep" => {
+            let pat = clip_runes(&get("pattern"), 40);
+            if pat.is_empty() {
+                return String::new();
+            }
+            let path = get("path");
+            if !path.is_empty() && path != "." {
+                format!("{pat} in {}", clip_runes(&path, 40))
+            } else {
+                pat
+            }
+        }
+        "bash" => clip_runes(&get("command"), 64),
+        _ => ["path", "pattern", "command", "query", "name", "file", "url"]
+            .into_iter()
+            .map(get)
+            .find(|value| !value.is_empty())
+            .map(|value| clip_runes(&value, 64))
+            .unwrap_or_default(),
+    }
+}
+
+fn clip_runes(s: &str, max: usize) -> String {
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if max == 0 || s.chars().count() <= max {
+        return s;
+    }
+    if max < 2 {
+        return s.chars().take(max).collect();
+    }
+    let mut out: String = s.chars().take(max - 1).collect();
+    out.push('…');
+    out
 }
 
 fn event_type(params: &Value) -> &str {
@@ -481,14 +640,6 @@ pub const EVENT_GOAL_FAIL: &str = "graph.goal.fail";
 pub const EVENT_GOAL_PARTIAL: &str = "graph.goal.partial";
 pub const EVENT_GOAL_BLOCKED: &str = "graph.goal.blocked";
 
-/// Git worktree snapshot from `status` / `session`. Absent until the host
-/// sends `git`; the client never runs `git` itself.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct GitInfo {
-    pub branch: String,
-    pub dirty: bool,
-}
-
 /// One extra jail root from `status` / `session`. The header chip is a
 /// count; paths stay on the host side.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -510,33 +661,6 @@ impl GoalInfo {
     pub fn is_terminal(&self) -> bool {
         matches!(self.status.as_str(), "done" | "failed")
     }
-}
-
-/// True when `v` includes a `git` key (including null / empty). Used so a
-/// later `status` without the field does not wipe a previously decoded chip.
-pub fn has_git_field(v: &Value) -> bool {
-    v.get("git").is_some()
-}
-
-/// Decode `git: { branch, dirty }` from `status` or `session`. Empty /
-/// missing branch yields `None` (hide the chip).
-pub fn decode_git(v: &Value) -> Option<GitInfo> {
-    let git = v.get("git")?;
-    if git.is_null() {
-        return None;
-    }
-    let branch = git
-        .get("branch")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    if branch.is_empty() {
-        return None;
-    }
-    Some(GitInfo {
-        branch: branch.to_string(),
-        dirty: git.get("dirty").and_then(Value::as_bool).unwrap_or(false),
-    })
 }
 
 /// True when `v` includes `extra_roots` or `extra_root_count`.
@@ -886,9 +1010,18 @@ impl Client {
     }
 
     /// version → session → status. Refuses a non-v3 server.
+    ///
+    /// When `version` omits `methods`, try `capabilities` once. An empty
+    /// list after that means the host did not advertise a surface — do not
+    /// infer a stock build.
     pub fn handshake(&mut self, timeout: Duration) -> Result<(VersionInfo, SessionInfo), Error> {
         let v = self.call("version", None, timeout)?;
-        let version = check_version(&v)?;
+        let mut version = check_version(&v)?;
+        if version.methods.is_empty()
+            && let Ok(caps) = self.call("capabilities", None, timeout)
+        {
+            version = merge_capabilities(version, &caps);
+        }
         let s = self.call("session", None, timeout)?;
         let session = SessionInfo::from_value(&s);
         let _ = self.call("status", None, timeout)?;
@@ -1404,6 +1537,20 @@ mod tests {
     }
 
     #[test]
+    fn optional_linked_features_join_capability_flags() {
+        let flags = decode_features(&serde_json::json!({
+            "features": {"streaming_events": true},
+            "optional": {"features": [
+                {"id": "goal", "linked": true, "events": ["graph.goal.start"]},
+                {"id": "lsp", "linked": false}
+            ]}
+        }));
+        assert_eq!(flags.get("streaming_events"), Some(&true));
+        assert_eq!(flags.get("goal"), Some(&true));
+        assert_eq!(flags.get("lsp"), None);
+    }
+
+    #[test]
     fn parses_notification() {
         let line =
             r#"{"jsonrpc":"2.0","method":"event","params":{"type":"loop.token","delta":"hi"}}"#;
@@ -1444,19 +1591,21 @@ mod tests {
         let ok = serde_json::json!({"name":"mow","version":"0.1.0","rpc":"3"});
         let info = check_version(&ok).unwrap();
         assert_eq!(info.rpc, "3");
-        // No capability list (older server): App::supports treats this as
-        // "assume everything" rather than hiding features it cannot prove
-        // absent.
+        // No capability list (older server): do not infer a stock method set.
         assert!(info.methods.is_empty());
+        assert!(info.features.is_empty());
 
         let modern = serde_json::json!({
             "name":"mow","version":"0.1.0","rpc":"4",
             "methods":["prompt","context","compact"],
             "control_methods":["context"],
+            "features":{"ephemeral_prompt":true,"batch":false},
         });
         let info = check_version(&modern).unwrap();
         assert_eq!(info.methods, vec!["prompt", "context", "compact"]);
         assert_eq!(info.control_methods, vec!["context".to_string()]);
+        assert_eq!(info.features.get("ephemeral_prompt"), Some(&true));
+        assert_eq!(info.features.get("batch"), Some(&false));
 
         // Additive protocol: a newer server is fine, an older one is not.
         let newer = serde_json::json!({"name":"mow","version":"0.1.0","rpc":"4"});
@@ -1471,6 +1620,28 @@ mod tests {
 
         let missing = serde_json::json!({"name":"mow"});
         assert!(matches!(check_version(&missing), Err(Error::Protocol(_))));
+    }
+
+    #[test]
+    fn merge_capabilities_fills_an_empty_version_surface() {
+        let version = check_version(&serde_json::json!({
+            "name": "mow",
+            "version": "0.1.0",
+            "rpc": "3"
+        }))
+        .unwrap();
+        assert!(version.methods.is_empty());
+        let merged = merge_capabilities(
+            version,
+            &serde_json::json!({
+                "methods": ["prompt", "slash.list"],
+                "control_methods": ["status"],
+                "features": {"ephemeral_prompt": true}
+            }),
+        );
+        assert_eq!(merged.methods, vec!["prompt", "slash.list"]);
+        assert_eq!(merged.control_methods, vec!["status".to_string()]);
+        assert_eq!(merged.features.get("ephemeral_prompt"), Some(&true));
     }
 
     #[test]
@@ -1492,6 +1663,70 @@ mod tests {
             reasoning_delta(&serde_json::json!({"type":"loop.token","delta":"hi"})),
             None
         );
+    }
+
+    #[test]
+    fn harness_tool_events_match_mow_event_shape() {
+        // Frozen fields from mow `internal/engine/event.go` Event.
+        let start = serde_json::json!({
+            "type": "harness.tool.start",
+            "run_id": "run-1",
+            "tool": "write",
+            "tool_call_id": "call-1",
+            "args": {"path": "src/app.rs", "content": "fn main() {}"}
+        });
+        assert_eq!(tool_name(&start), Some("write"));
+        assert_eq!(
+            tool_progress_label("write", tool_args(&start)),
+            "write src/app.rs"
+        );
+        assert_eq!(
+            tool_progress_label("read src/app.rs", tool_args(&start)),
+            "read src/app.rs"
+        );
+        assert_eq!(
+            tool_progress_label(
+                "bash",
+                Some(&serde_json::json!({"command": "cargo test --all"}))
+            ),
+            "bash cargo test --all"
+        );
+        assert_eq!(
+            tool_progress_label(
+                "grep",
+                Some(&serde_json::json!({"pattern": "live_tools", "path": "src"}))
+            ),
+            "grep live_tools in src"
+        );
+        assert_eq!(
+            tool_progress_label("delete", Some(&serde_json::json!({"path": "tmp/out"}))),
+            "delete tmp/out"
+        );
+
+        let end = serde_json::json!({
+            "type": "harness.tool.end",
+            "tool": "write",
+            "args": {"path": "src/app.rs"},
+            "result": "edited src/app.rs\n--- src/app.rs\n+++ src/app.rs\n@@ -1 +1 @@\n-old\n+new\n",
+            "denied": false,
+            "error": "",
+            "duration_ms": 12
+        });
+        assert_eq!(tool_name(&end), Some("write"));
+        assert!(tool_result(&end).unwrap().contains("@@ -1 +1 @@"));
+        assert!(!tool_denied(&end));
+        assert_eq!(tool_error(&end), None);
+
+        let denied = serde_json::json!({
+            "type": "harness.tool.end",
+            "tool": "bash",
+            "args": {"command": "rm -rf /"},
+            "denied": true,
+            "error": "policy: write disabled",
+            "duration_ms": 4
+        });
+        assert!(tool_denied(&denied));
+        assert_eq!(tool_error(&denied), Some("policy: write disabled"));
     }
 
     #[test]
@@ -1570,12 +1805,11 @@ mod tests {
         }));
         assert_eq!(s.short_id(), "01234567");
         assert_eq!(s.model, "gpt-5-mini");
-        assert!(s.git.is_none());
         assert!(s.extra_roots.is_empty());
     }
 
     #[test]
-    fn session_decodes_git_and_extra_roots_when_present() {
+    fn session_ignores_rpc_git_and_decodes_extra_roots() {
         let s = SessionInfo::from_value(&serde_json::json!({
             "session_id": "s1",
             "workspace": "/w",
@@ -1586,13 +1820,6 @@ mod tests {
                 "/data"
             ]
         }));
-        assert_eq!(
-            s.git,
-            Some(GitInfo {
-                branch: "main".into(),
-                dirty: true
-            })
-        );
         assert_eq!(
             s.extra_roots,
             vec![
@@ -1606,22 +1833,6 @@ mod tests {
                 },
             ]
         );
-    }
-
-    #[test]
-    fn decode_git_requires_a_branch() {
-        assert!(decode_git(&serde_json::json!({})).is_none());
-        assert!(decode_git(&serde_json::json!({"git": null})).is_none());
-        assert!(decode_git(&serde_json::json!({"git": {"branch": "  "}})).is_none());
-        assert_eq!(
-            decode_git(&serde_json::json!({"git": {"branch": "feat"}})),
-            Some(GitInfo {
-                branch: "feat".into(),
-                dirty: false
-            })
-        );
-        assert!(has_git_field(&serde_json::json!({"git": null})));
-        assert!(!has_git_field(&serde_json::json!({"busy": true})));
     }
 
     #[test]

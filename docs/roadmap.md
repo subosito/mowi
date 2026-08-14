@@ -38,7 +38,7 @@ parity. Do not block v0 on diffs.
 ## Phase 3 — polish ✓
 
 - Queued prompts while busy
-- Native terminal selection (no mouse capture)
+- Wheel transcript scrolling (Shift+drag keeps terminal-native selection)
 - `/search`, `/copy`, `/retry`, `/edit`
 - Remappable keys / `extensions.tui` if we choose to read mow config
 - PTY cell smoke (optional)
@@ -49,13 +49,15 @@ Ratatui widgets carry the chrome; the transcript stays the product.
 
 - **Header chips** built as spans: left identity is `mowi` / workspace
   basename / `model (effort)`; after safety, optional git / extra-root /
-  Goal chips, then the token chip (`⇄` peer), then the context size
+  status-bar Goal states, then the token chip (`⇄` peer), then the context size
   (`32k/128k ctx` or `32k ctx`) at the far right. A ` · ` joins safety
   to the first optional chip and is omitted when none remain. Drop
   order: tokens, git, extra-roots, Goal, context, then identity.
-  Safety never drops. Git and extra-roots decode from host
+  Safety never drops. Git is a cached local workspace probe (startup +
+  debounce; never per frame). Extra-roots decode from host
   `status`/`session` only. Goal is driven by `graph.goal.*` and clears
-  after completion on the next prompt. Session id is never a header or
+  after completion on the next prompt. Help / completion hide
+  unadvertised optional commands instead of inferring a stock build. Session id is never a header or
   status-bar chip; the help overlay titles the full id. `status` seeds
   capability chips at handshake.
 - **Min size 40×10** — below that a centered `Clear` + bordered warning Block

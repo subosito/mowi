@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use crossterm::{
-    event::{DisableBracketedPaste, EnableBracketedPaste},
+    event::{DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -260,8 +260,8 @@ fn tui(cli: &Cli) -> Result<(), rpc::Error> {
         App::new(session)
     };
     app.theme = Theme::new(cli.theme);
-    // Feature-detect once from the handshake instead of probing for -32601.
-    app.set_capabilities(&version.methods);
+    // Feature-detect from the advertised surface. Empty methods stay empty.
+    app.apply_host_surface(&version);
     app.ask_mode = !cli.auto;
     app.allow_write = cli.allow_write;
     app.allow_shell = cli.allow_shell;
@@ -270,21 +270,29 @@ fn tui(cli: &Cli) -> Result<(), rpc::Error> {
     }
     // Splash only for a fresh session (no transcript seed).
     app.welcome = app.entries.is_empty();
-    app.slash_commands = client.slash_list(HANDSHAKE_TIMEOUT)?;
-    if let Ok(list) = client.effort_list(HANDSHAKE_TIMEOUT) {
+    if app.supports("slash.list") {
+        app.slash_commands = client.slash_list(HANDSHAKE_TIMEOUT)?;
+    }
+    if app.supports("effort.list")
+        && let Ok(list) = client.effort_list(HANDSHAKE_TIMEOUT)
+    {
         app.effort = list.current;
     }
 
     enable_raw_mode().map_err(rpc::Error::Io)?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen).map_err(rpc::Error::Io)?;
-    execute!(stdout, EnableBracketedPaste).map_err(rpc::Error::Io)?;
+    execute!(stdout, EnableBracketedPaste, EnableMouseCapture).map_err(rpc::Error::Io)?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout)).map_err(rpc::Error::Io)?;
 
     let res = app::run(&mut terminal, &mut client, &mut app);
 
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), DisableBracketedPaste);
+    let _ = execute!(
+        terminal.backend_mut(),
+        DisableMouseCapture,
+        DisableBracketedPaste
+    );
     let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
     let _ = terminal.show_cursor();
     client.shutdown();

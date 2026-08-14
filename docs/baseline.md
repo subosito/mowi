@@ -7,8 +7,8 @@ operator experience**, not a subset that forgets permissions or resume.
 
 | Region | Behavior |
 |---|---|
-| Header | Left: `mowi`, workspace basename, `model (effort)`. Right: safety chips (write/shell, ask/auto), then optional git / extra-root / Goal chips, then the token chip, then the context size (`32k/128k ctx`, or `32k ctx` if the window is unknown) at the far right. A ` · ` joins safety to the first optional chip and is omitted when none remain. Drop order (first to go): tokens, git, extra-roots, Goal, context size, then identity (workspace, effort, model). Safety never drops. Git and extra-root chips appear only when `status`/`session` sent those fields — the client never runs `git` or walks roots. The Goal chip is driven only by confirmed `graph.goal.*` events and clears after `done`/`failed` on the next user prompt. Session id is never a header or status-bar chip; the help overlay titles the full id. |
-| Transcript | User blocks (soft fill), assistant markdown, one compact tool line per call — a turn's calls collapse into a counted row (`⚙ bash ×2 · grep`) that shortens by whole tokens on a narrow pane (Esc collapses an expanded group). Edits = inline review cards (−/+). |
+| Header | Left: `mowi`, workspace basename, `model (effort)`. Right: safety chips (write/shell, ask/auto), then optional git / extra-root / status-bar Goal states, then the token chip, then the context size (`32k/128k ctx`, or `32k ctx` if the window is unknown) at the far right. A ` · ` joins safety to the first optional chip and is omitted when none remain. Drop order (first to go): tokens, extra-roots, context size, then identity (workspace, effort, model). Safety never drops. The git chip is a cached local probe of the RPC workspace (startup + debounce after mutating tools / turn end; never per frame; hidden outside a worktree). Extra-root chips appear only when `status`/`session` sent those fields. The status-bar Goal state is driven only by confirmed `graph.goal.*` events and clears after `done`/`failed` on the next user prompt. Session id is never a header or status-bar chip; the help overlay titles the full id. |
+| Transcript | User blocks (soft fill), assistant markdown, one compact tool line per call — a turn's calls collapse into a counted row (`⚙ bash ×2 · grep`) that shortens by whole tokens on a narrow pane (Esc collapses an expanded group). While busy, a bounded live progress section shows streaming answer tokens, the current/recent tool (verb + path), and write/edit diffs as review cards; it folds into the tool group at turn end. Edits = inline review cards (−/+). |
 | Status bar | Idle: `● idle`. Busy: spinner, elapsed, verb (and typing pulse while tokens land) on this row — no separate activity band. Hints flush right and degrade before state does. |
 | Input | Sits on the document ground with a horizontal inset and no box. Enter sends; busy queues. `/steer` redirects the running turn. |
 | Welcome | Splash, dismisses on any key. Short panes drop the tagline/effort first so access and `type to begin` still fit. |
@@ -20,7 +20,7 @@ operator experience**, not a subset that forgets permissions or resume.
 |---|---|
 | Enter | send (queue if busy) |
 | ctrl+j | newline (input grows 1–10 rows) |
-| ↑ / ↓, pgup / pgdn | scroll transcript (never rewrites the prompt) |
+| ↑ / ↓ | browse prompt history |
 | Esc | dismiss overlay, else collapse tool calls, else cancel turn, else ignore |
 | ctrl+l | clear transcript (UI-local; Engine history remains) |
 | shift+tab | ask ↔ auto (`perm.set`) |
@@ -35,8 +35,7 @@ operator experience**, not a subset that forgets permissions or resume.
 
 All bindings remappable later (`extensions.tui.keys` in Go). v1 hard-codes
 defaults. Quit is `/quit` / `/exit` / `/q` or ctrl+c — a lone `q` on empty
-input does not quit. The terminal keeps native select/copy; mowi does not
-capture the mouse.
+input does not quit. Mowi captures wheel events for transcript scrolling; hold Shift while dragging for terminal-native selection/copy.
 
 ## Commands (typed)
 
@@ -55,11 +54,19 @@ Host-side (this crate, or slash if registered):
 | `/effort` | UI-local: `effort.list` overlay (enter to set), or `/effort high` → `effort.set` |
 | `/review` `/sec` `/goal` … | RPC `slash` — only if `slash.list` has them |
 
+Commands fall into three classes. Core local names (`/help`, `/quit`,
+`/clear`, `/search`, `/copy`, `/status`) are always offered. RPC-method-gated
+names (`/model`, `/effort`, `/steer`, `/compact`, `/skills`, `/lsp`, …)
+appear in Help / completion only when `version` / `capabilities` advertised
+the backing method, feature, or event. Pack-discovered names stay dynamic
+via `slash.list` — `/goal` is never hardcoded. An empty method list does
+not infer a stock build. A typed gated command that is not offered is
+`/{name} is not available on this host`, not a generic unknown list.
+
 Local commands are routed by name before the RPC fallback, so `/quit`,
 `/model`, `/effort`, and friends can never be sent to the host as an unknown
-slash command. RPC `slash` is used only for names in the cached `slash.list`
-(today: `review`, `sec`). Anything else is a local error listing available
-commands.
+slash command. RPC `slash` is used only for names in the cached `slash.list`.
+Anything else is a local error listing *offered* commands.
 
 Exclusive slash: refuse while `status.busy`.
 
@@ -115,11 +122,9 @@ when the rows share enough affix to make a word-level edit meaningful.
 Follow-bottom until the user scrolls up; rebuild visible window on scroll
 (Go bug: placeholders stayed blank). Do not GC unreadied seed.
 
-Transcript scroll is **↑ / ↓** and **PgUp / PgDn**. Those keys never recall or
+Transcript scroll is **PgUp / PgDn** (plus wheel events when delivered). **↑ / ↓** browse prompt history. Those keys never recall or
 rewrite the composer. Last-prompt recall is `/edit` only. `ctrl+u` / `ctrl+d`
-are unbound (they do not scroll and they do not type). The client does not
-capture the mouse (native select/copy); if a wheel event still arrives it
-scrolls the transcript only.
+are unbound (they do not scroll and they do not type). The client captures mouse wheel events for transcript-only scrolling. Hold Shift while dragging for terminal-native selection/copy.
 
 ## Theme / a11y
 

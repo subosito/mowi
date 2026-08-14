@@ -257,6 +257,9 @@ impl Tone {
 
 /// Braille spinner — one cell wide, no layout jitter.
 pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Tool activity uses a mechanical rotating arc, distinct from model work.
+pub const TOOL_SPINNER: [&str; 4] = ["◜", "◝", "◞", "◟"];
+pub const TOOL_SPINNER_STATIC: &str = "◆";
 
 /// Frame used when animation is off (`MOW_NO_ANIM=1`, or a non-TTY capture).
 /// Deliberately not `SPINNER[0]`: a braille frame reads as a stalled spinner,

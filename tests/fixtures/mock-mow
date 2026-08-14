@@ -14,8 +14,20 @@ for line in sys.stdin:
     elif m=='perm.set': result={'ok':True,'ask_mode':req.get('params',{}).get('mode')=='ask'}
     elif m=='cancel': result={'ok':True}
     elif m=='prompt':
-        text='\n'.join(f'fixture transcript line {n:02}' for n in range(1,41))
-        print(json.dumps({'jsonrpc':'2.0','method':'event','params':{'type':'loop.token','delta':text}}),flush=True)
-        result={'text':text,'session_id':'pty-session','run_id':'fixture-run','stop_reason':'stop','usage':{'input_tokens':4,'output_tokens':40}}
+        def ev(params):
+            print(json.dumps({'jsonrpc':'2.0','method':'event','params':params}),flush=True)
+        ev({'type':'loop.run.start','run_id':'fixture-run'})
+        ev({'type':'loop.token','delta':'Looking at the guard.\n'})
+        time.sleep(0.5)
+        ev({'type':'harness.tool.start','tool':'read','tool_call_id':'c1','args':{'path':'src/app.rs'}})
+        time.sleep(0.08)
+        ev({'type':'harness.tool.end','tool':'read','tool_call_id':'c1','args':{'path':'src/app.rs'},'duration_ms':12})
+        ev({'type':'harness.tool.start','tool':'write','tool_call_id':'c2','args':{'path':'src/app.rs'}})
+        time.sleep(0.08)
+        ev({'type':'harness.tool.end','tool':'write','tool_call_id':'c2','args':{'path':'src/app.rs'},'duration_ms':20,'result':'edited src/app.rs\n--- src/app.rs\n+++ src/app.rs\n@@ -1 +1 @@\n-old\n+new\n'})
+        ev({'type':'loop.token','delta':'Updated the exclusive slice.\n'})
+        ev({'type':'loop.turn','text':'Updated the exclusive slice.','has_tool_calls':False})
+        ev({'type':'loop.run.end','run_id':'fixture-run','text':'Updated the exclusive slice.'})
+        result={'text':'Updated the exclusive slice.','session_id':'pty-session','run_id':'fixture-run','stop_reason':'stop','usage':{'input_tokens':4,'output_tokens':8}}
     else: result={}
     if i is not None: print(json.dumps({'jsonrpc':'2.0','id':i,'result':result}),flush=True)

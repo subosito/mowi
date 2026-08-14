@@ -19,12 +19,16 @@ Stderr is Engine logs — do not parse it.
 ## Handshake
 
 1. `{"id":1,"method":"version"}` → `rpc` must be `"3"` or newer (additive protocol).
+   `methods`, `control_methods`, and `features` gate Help / completion /
+   startup calls. An empty `methods` list means "not advertised" — do not
+   infer a stock build. If `methods` is empty, try `capabilities` once.
 2. `{"id":2,"method":"session"}` → workspace, model, session_id.
 3. `{"id":3,"method":"status"}` → busy, allow_write, allow_shell, ask_mode.
 4. If the UI wants ask mode: `perm.set` `{mode:"ask"}` (default server is
    fail-open auto).
 5. `transcript` to seed history on `--session` / `--continue` (messages may include additive RFC 3339 `ts`).
-6. `slash.list` for `/help`.
+6. `slash.list` for `/help` — only when advertised. Pack names (`/goal`,
+   `/review`, `/sec`, …) stay dynamic from that list.
 
 ## Methods
 
@@ -45,7 +49,8 @@ Stderr is Engine logs — do not parse it.
 | `model.set` | yes | `{id}` | `{ok, model}` |
 | `effort.list` | yes | — | `{efforts:[{id,current}], current, default}` |
 | `effort.set` | yes | `{id}` | `{ok, effort}` |
-| `version` | yes | — | `{name, version, rpc, package}` |
+| `version` | yes | — | `{name, version, rpc, package, methods?, control_methods?, features?}` |
+| `capabilities` | yes | — | same surface as `version` when the handshake omitted `methods` |
 | `ping` | yes | — | `"pong"` |
 
 Control methods are answered concurrently with an in-flight `prompt`.
@@ -72,10 +77,10 @@ per message; stdin line 1 MiB.
 `allow_write`, `allow_shell`, `ask_mode`, `pending_perm`.
 
 Optional chrome fields (not emitted by current `mow rpc`; the client
-decodes them when present — see [Host chrome the client is ready to
-decode](#host-chrome-the-client-is-ready-to-decode)): `git`,
+decodes them when present — see [Host chrome](#host-chrome)):
 `extra_roots` / `extra_root_count`. The same keys are accepted on
-`session`.
+`session`. RPC `git` metadata is ignored; the client probes the
+workspace itself.
 
 ### `slash`
 
@@ -122,15 +127,16 @@ Exact strings live in mow `Event*` consts (`mow.go`). Handle at least:
 
 | Type (typical) | UI |
 |---|---|
-| token / `loop.token` | append live answer (`delta`) |
-| reasoning / thinking | activity / collapsible thought |
-| `tool.start` / `tool.end` | status-bar verb + tool line (`duration_ms` on end) |
+| token / `loop.token` | append live answer (`delta`) in the transcript while busy |
+| reasoning / thinking | activity / collapsible thought (body never painted) |
+| `loop.turn` | fallback live answer when token deltas were omitted |
+| `harness.tool.start` / `harness.tool.end` | status-bar verb + bounded in-transcript progress (`args` → path/command; `result` diffs for write/edit; `error`/`denied` immediately). Folds into the turn's tool group at `run.end` |
 | `run.start` / `run.end` | busy; usage on end |
 | `harness.delegate.chunk` | peer live buffer (`agent`, `delta`) — **not** host answer |
 | `harness.delegate.progress` | peer phase (`thought`, `tool`, `prompt`) |
 | `harness.delegate.usage` | add to peer token chip |
-| `graph.goal.start` / `step` / `done` / `fail` | Goal chip: short id + `step/max` |
-| `graph.goal.partial` / `blocked` | Goal chip: `blocked`, or step/max while partial |
+| `graph.goal.start` / `step` / `done` / `fail` | status-bar Goal state: short id + `step/max` |
+| `graph.goal.partial` / `blocked` | status-bar Goal state: `blocked`, or step/max while partial |
 | compact | refresh ctx% |
 | lsp diagnostics | optional diagnostics line |
 
@@ -170,26 +176,25 @@ or `blocked` / `failed` / `done`. Event type wins for terminal and
 blocked so a stale `status` cannot leave a running chip. `done` /
 `failed` clear on the next user prompt.
 
-## Host chrome the client is ready to decode
+## Host chrome
 
-mowi will not run `git` or walk extra-root paths on a paint frame.
-These chips appear only when `status` or `session` includes the fields
-below. Current `mow rpc` does not emit them; this is the contract for
-a later host change. Do not edit `../mow` from this client task.
+mowi will not walk extra-root paths on a paint frame, and it will not
+consume RPC `git` metadata. Current `mow rpc` does not emit extra-root
+fields; this is the contract for a later host change. Do not edit
+`../mow` from this client task.
 
-### `git` (object, optional)
+### Git (client-owned)
 
-```json
-"git": { "branch": "main", "dirty": true }
-```
+The header git chip is a cached local probe of the RPC `workspace`
+path (`git rev-parse --abbrev-ref HEAD` + `git status --porcelain`).
+Rules:
 
-| Field | Type | Meaning |
-|---|---|---|
-| `branch` | string | Current branch. Empty / omitted hides the chip. |
-| `dirty` | bool | Uncommitted worktree. The chip paints `main*`. |
-
-Compute this on the host when building `status` / `session`. Refresh
-on those calls; do not require the UI to poll.
+- Probe on startup and after a mutating tool (`write` / `edit` /
+  `bash` / `apply_patch` / `str_replace`) or turn end.
+- Debounce (~800 ms). Never probe on a paint frame.
+- Cap each child at ~250 ms; a hung index must not stall the UI.
+- Hide the chip outside a Git worktree, or when `workspace` is empty.
+- Paint `main` or `main*` when dirty.
 
 ### `extra_roots` (array, optional)
 
@@ -210,14 +215,14 @@ A string element `"/path"` is accepted as a read-write root. Alternate:
 count. The chip is `+N roots` (`+1 root` in the singular) and is
 hidden when N is 0 or the field is absent.
 
-Absent keys leave previously decoded chips in place so a current mow
-`status` (no `git`) cannot wipe a `session` that did send them. An
-explicit empty `branch` or empty `extra_roots` array clears the chip.
+Absent keys leave previously decoded extra-root chips in place so a
+current mow `status` cannot wipe a `session` that did send them. An
+explicit empty `extra_roots` array clears the chip.
 
 ## What is not on the wire (yet)
 
-- `git` / `extra_roots` on `status` and `session` — client decodes the
-  shapes above; host does not emit them yet
+- `extra_roots` on `status` and `session` — client decodes the shapes
+  above; host does not emit them yet. Git is client-owned.
 - Model picker catalog — v1 can omit
 - Theme / keys — UI-local config
 - Binary diffs — events carry text; UI pretty-prints

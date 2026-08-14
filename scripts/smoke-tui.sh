@@ -22,6 +22,24 @@ run_smoke() {
     shell-use wait exit --session "$session" --timeout 10000 >/dev/null
 }
 
+run_progress_smoke() {
+    local session="mowi-smoke-progress-$$"
+    shell-use run --session "$session" --cols 100 --rows 30 \
+        --env NO_COLOR=1 --env MOW_NO_ANIM=1 --env MOW_BIN="$PWD/tests/fixtures/mock-mow" \
+        "$PWD/target/debug/mowi" --theme catppuccin-mocha >/dev/null
+    shell-use wait text --session "$session" --regex 'fixture-model' --timeout 10000 >/dev/null
+    shell-use press --session "$session" Escape
+    shell-use type --session "$session" 'please edit the guard'
+    shell-use press --session "$session" Enter
+    # Live tokens, then the write/edit diff card, then the folded answer.
+    shell-use wait text --session "$session" --regex 'Looking at the guard' --timeout 10000 >/dev/null
+    shell-use wait text --session "$session" --regex 'src/app.rs' --timeout 10000 >/dev/null
+    shell-use wait text --session "$session" --regex 'Updated the exclusive slice' --timeout 10000 >/dev/null
+    shell-use press --session "$session" Ctrl+C
+    shell-use wait exit --session "$session" --timeout 10000 >/dev/null
+}
+
 for theme in catppuccin-mocha catppuccin-latte gruvbox-dark monokai; do
     run_smoke "$theme"
 done
+run_progress_smoke

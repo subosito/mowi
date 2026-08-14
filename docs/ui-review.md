@@ -11,8 +11,8 @@ NO_COLOR=1 cargo run -- snapshot --scene help      # monochrome frame
 ```
 
 Scenes live in `src/snapshot.rs`: `chat`, `busy`, `diff`, `welcome`, `help`,
-`permission`, `tools`, `toolgroup`, `narrow`, `header`. Add one whenever a
-state is hard to reach by hand.
+`permission`, `tools`, `toolgroup`, `narrow`, `header`, `progress`. Add one
+whenever a state is hard to reach by hand.
 
 The tool honours `NO_COLOR` through the same `Theme::detect()` the client
 uses, so the monochrome frame it prints is the frame users get.
@@ -41,10 +41,11 @@ fill bar. A ` · ` joins safety to the first optional chip and is omitted
 when none remain. Drop order (first to go): tokens, git, extra-roots,
 Goal, context, then identity (workspace, effort, model). There is no
 minimum-width gate — the compact size chip is offered whenever used
-tokens are known and peels when the row overflows. Git / extra-roots
-appear only from host `status`/`session` fields. Goal appears only from
-`graph.goal.*` and does not stay after completion once the operator
-continues. Session id is never a header chip. The painted row has a
+tokens are known and peels when the row overflows. The git chip is a cached local
+probe of the RPC workspace (never per frame, hidden outside a worktree).
+Extra-roots appear only from host `status`/`session` fields. Goal appears
+only from `graph.goal.*` and does not stay after completion once the
+operator continues. Session id is never a header chip. The painted row has a
 one-column inset on each side so it shares a vertical rhythm with the
 composer and footer. Header and status sit on the terminal default
 background — they do not paint a second mantle fill over the document
@@ -129,19 +130,22 @@ The full command is in the engine log; the transcript exists to show *that*
 something ran. Pinned by `tool_labels_collapse_shell_chains` and the
 `shellblob` snapshot scene.
 
-**Tool calls group per turn, not per call.** `tool.start`/`tool.end` events
-accumulate in `live_tools` while the loop runs (the status bar owns the
-live "tool · name" readout); `run.end` (or the turn's end, whichever comes
-first — commit is idempotent) folds them into one `Entry::Tools`. A single
-call stays the plain one-row entry it always was; two or more collapse to
-`⚙ bash ×2 · grep · total`. The counts follow first-seen verb order from
-`tool_label` and drop to `bash ×2 · grep · …` then verbs-only when the pane
-is too narrow — never a mid-token cut. Esc collapses an expanded group. A
-plain `t` always types into the composer — it is never a tool-group
-shortcut. The estimate counts the collapsed line exactly as painted and,
-when expanded, header + every call, so the scrollbar extent never drifts.
-Pinned by `tool_group_summary_*`, `tools_estimate_matches_painted_height`,
-and the `tools` / `toolgroup` snapshot scenes.
+**Tool calls group per turn, not per call.** `harness.tool.start`/`end`
+events accumulate in `live_tools` while the loop runs. The status bar still
+owns the phase verb; the transcript also paints a bounded live progress
+section (tally + last few rows + the latest write/edit diff cards from
+`result`). `run.end` (or the turn's end — fold is idempotent) commits the
+group and persists those diffs once. A single call stays the plain one-row
+entry it always was; two or more collapse to `⚙ bash ×2 · grep · total`.
+The counts follow first-seen verb order from `tool_label` and drop to
+`bash ×2 · grep · …` then verbs-only when the pane is too narrow — never a
+mid-token cut. Esc collapses an expanded group. A plain `t` always types
+into the composer — it is never a tool-group shortcut. The estimate counts
+the collapsed line exactly as painted and, when expanded, header + every
+call, so the scrollbar extent never drifts. Pinned by `tool_group_summary_*`,
+`live_progress_paints_tokens_tools_and_diffs_then_folds_once`,
+`tools_estimate_matches_painted_height`, and the `tools` / `toolgroup` /
+`progress` snapshot scenes.
 
 ## Colour
 

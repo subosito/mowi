@@ -15,7 +15,7 @@ use ratatui::{
 use std::time::{Duration, UNIX_EPOCH};
 
 use crate::app::{App, Entry, draw};
-use crate::rpc::{ContextUsage, ExtraRoot, GitInfo, GoalInfo, SessionInfo};
+use crate::rpc::{ContextUsage, ExtraRoot, GoalInfo, SessionInfo};
 use crate::theme::Theme;
 
 /// Fixed UTC `04:02` so snapshot frames do not change every run.
@@ -27,7 +27,7 @@ fn snapshot_user(text: impl Into<String>) -> Entry {
 }
 
 /// Every scene the snapshot tool can paint.
-pub const SCENES: [&str; 10] = [
+pub const SCENES: [&str; 11] = [
     "chat",
     "busy",
     "diff",
@@ -38,6 +38,7 @@ pub const SCENES: [&str; 10] = [
     "toolgroup",
     "narrow",
     "header",
+    "progress",
 ];
 
 fn demo_session() -> SessionInfo {
@@ -120,6 +121,27 @@ pub fn scene_with_theme(name: &str, theme: Theme) -> App {
             app.live
                 .push_str("Looking at the wrapper now. The current implementation");
         }
+        "progress" => {
+            app.entries
+                .push(snapshot_user("fix the off-by-one in the guard"));
+            app.busy = true;
+            app.status = "shaping · write · src/app.rs".into();
+            app.live
+                .push_str("The exclusive slice used `<=`. Updating the guard.");
+            app.live_tools = vec![
+                ("read src/app.rs".into(), Some(80)),
+                ("write src/app.rs".into(), Some(20)),
+            ];
+            app.live_diffs.push(
+                "edited src/app.rs\n--- src/app.rs\n+++ src/app.rs\n@@ -212,7 +212,7 @@\n \
+                 fn clip(text: &str, max: usize) -> String {\n\
+                 -    if text.len() <= max {\n\
+                 +    if text.len() < max {\n\
+                      return text.to_string();\n \
+                 }"
+                .into(),
+            );
+        }
         "diff" => {
             app.entries.push(snapshot_user("fix the off-by-one"));
             app.entries.push(Entry::Assistant(
@@ -195,10 +217,6 @@ pub fn scene_with_theme(name: &str, theme: Theme) -> App {
                 .push(Entry::Assistant("All green: 102 tests passing.".into()));
         }
         "header" => {
-            app.git = Some(GitInfo {
-                branch: "main".into(),
-                dirty: true,
-            });
             app.extra_roots = vec![
                 ExtraRoot {
                     path: "/opt/shared".into(),
@@ -345,9 +363,12 @@ mod tests {
         assert!(header.contains("32k/128k ctx"), "{header}");
         assert!(!header.contains('%'), "no printed percent: {header}");
         assert!(!header.contains('▰'), "no gauge bar: {header}");
-        assert!(header.contains("main*"), "{header}");
         assert!(header.contains("+2 roots"), "{header}");
-        assert!(header.contains("goal fix-bugs 2/10"), "{header}");
+        assert!(
+            !header.contains("goal fix-bugs"),
+            "goal belongs in status: {header}"
+        );
+        assert!(out.contains("goal fix-bugs 2/10"), "{out}");
         assert!(
             header.trim_end().ends_with("32k/128k ctx"),
             "context is far-right: {header}"
@@ -360,6 +381,21 @@ mod tests {
         assert!(chat_header.contains("41.5k/200k ctx"), "{chat_header}");
         assert!(!chat_header.contains("goal "), "{chat_header}");
         assert!(!chat_header.contains("main"), "{chat_header}");
+    }
+
+    #[test]
+    fn progress_scene_paints_live_tokens_tools_and_diff() {
+        let out = paint_plain("progress", 100, 30);
+        assert!(
+            out.contains("exclusive slice") || out.contains("Updating the guard"),
+            "{out}"
+        );
+        assert!(out.contains("write") && out.contains("src/app.rs"), "{out}");
+        assert!(
+            out.contains("─ src/app.rs") || out.contains("+    if text.len() < max"),
+            "live diff card:\n{out}"
+        );
+        assert!(out.contains("read"), "{out}");
     }
 
     #[test]

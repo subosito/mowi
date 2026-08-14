@@ -16,8 +16,10 @@ mowi does:
 - paint a document (header, transcript, input, overlays)
 - send `prompt` / `cancel` / `steer` / `slash` / `perm.set` / `perm.decide`
 - render `event` and `perm.ask` notifications
-- decode optional host chrome (`git`, `extra_roots`) when `status` /
-  `session` send it — never by running `git` or walking roots per frame
+- probe Git branch/dirty locally from the RPC workspace (startup + debounce
+  after mutating tools / turn end; never per frame; hide outside a worktree)
+- decode optional `extra_roots` when `status` / `session` send them — never
+  by walking roots per frame, and never by consuming RPC `git` metadata
 
 ## Processes
 
@@ -75,7 +77,11 @@ connect, `perm.set` mirrors ask/auto so the UI and Engine agree.
 ## Packs
 
 Slash commands exist only if the **mow binary** blank-imported the pack.
-`slash.list` is the source of truth. This crate must not hard-code `/review`.
+`slash.list` is the source of truth for pack-discovered names (`/review`,
+`/sec`, `/goal`, …). This crate must not hard-code them or infer a stock
+build from an empty `version.methods` list. Help, completion, and
+behavior are gated by advertised `methods` / `control_methods` /
+`features` plus the cached `slash.list`.
 
 ## Improved vs Go mowi
 
