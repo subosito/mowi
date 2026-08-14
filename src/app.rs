@@ -1065,7 +1065,7 @@ impl App {
             let hint_w = Span::raw(hint.as_str()).width();
             let pad = width.saturating_sub(left_w + hint_w);
             spans.push(Span::styled(" ".repeat(pad), self.theme.chrome()));
-            spans.push(Span::styled(hint, self.theme.note()));
+            spans.extend(styled_key_hint(&hint, self.theme));
         }
         Line::from(spans)
     }
@@ -2631,6 +2631,24 @@ fn workspace_basename(path: &str) -> String {
 }
 
 /// Truncate to `max` display columns, appending `…` when clipped.
+/// Paint key names with accent while action words recede.
+fn styled_key_hint(hint: &str, theme: Theme) -> Vec<Span<'static>> {
+    const KEYS: &[&str] = &["enter", "esc", "↑↓", "?", "pgup", "pgdn"];
+    hint.split_inclusive(' ')
+        .map(|part| {
+            let token = part.trim_end();
+            let style = if KEYS.contains(&token) {
+                theme.chip()
+            } else if token == "·" {
+                theme.chrome()
+            } else {
+                theme.note()
+            };
+            Span::styled(part.to_string(), style)
+        })
+        .collect()
+}
+
 fn clip_display(text: &str, max: usize) -> String {
     if text.width() <= max {
         return text.to_string();
@@ -6736,6 +6754,25 @@ mod tests {
         );
         let filled_rows = short.lines().filter(|line| line.contains('│')).count();
         assert!(filled_rows <= 5, "peer card stayed too tall:\n{short}");
+    }
+
+    #[test]
+    fn footer_styles_keys_apart_from_actions() {
+        let app = App::new(SessionInfo::default());
+        let line = app.footer_line(100);
+        let enter = line
+            .spans
+            .iter()
+            .find(|span| span.content.trim() == "enter")
+            .expect("enter key span");
+        let send = line
+            .spans
+            .iter()
+            .find(|span| span.content.trim() == "send")
+            .expect("send action span");
+        assert_eq!(enter.style, app.theme.chip());
+        assert_eq!(send.style, app.theme.note());
+        assert_ne!(enter.style, send.style);
     }
 
     #[test]
