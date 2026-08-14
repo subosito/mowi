@@ -74,12 +74,12 @@ struct Cli {
     #[arg(long = "skill", action = clap::ArgAction::Append)]
     skill: Vec<String>,
 
-    /// Ask before power tools (engine flag; overrides `$MOW_PERMISSION_MODE`
+    /// Ask before power tools (RPC mode; overrides `$MOW_PERMISSION_MODE`
     /// and `extensions.mowi`).
     #[arg(long)]
     ask: bool,
 
-    /// Run power tools without asking (engine flag; overrides
+    /// Run power tools without asking (RPC mode; overrides
     /// `$MOW_PERMISSION_MODE` and `extensions.mowi`).
     #[arg(long)]
     auto: bool,
@@ -146,12 +146,10 @@ impl Cli {
             out.push("--skill".into());
             out.push(skill.clone());
         }
-        if self.ask {
-            out.push("--ask".into());
-        }
-        if self.auto {
-            out.push("--auto".into());
-        }
+        // Permission mode is a UI/RPC concern. `mow rpc` intentionally has no
+        // --ask/--auto engine flags; after the handshake we apply the resolved
+        // mode through `perm.set`. Passing these flags makes the child exit
+        // before its first response and surfaces as "mow rpc connection closed".
         for spec in &self.extra_root {
             out.push("--extra-root".into());
             out.push(spec.clone());
@@ -426,8 +424,7 @@ mod tests {
                 "--skill",
                 "review",
                 "--skill",
-                "format",
-                "--ask"
+                "format"
             ]
         );
         assert_eq!(cli.mow_bin, "mow");
