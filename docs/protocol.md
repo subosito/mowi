@@ -23,7 +23,7 @@ Stderr is Engine logs — do not parse it.
 3. `{"id":3,"method":"status"}` → busy, allow_write, allow_shell, ask_mode.
 4. If the UI wants ask mode: `perm.set` `{mode:"ask"}` (default server is
    fail-open auto).
-5. `transcript` to seed history on `--session` / `--continue`.
+5. `transcript` to seed history on `--session` / `--continue` (messages may include additive RFC 3339 `ts`).
 6. `slash.list` for `/help`.
 
 ## Methods

@@ -25,6 +25,7 @@ use ratatui::{Terminal, backend::CrosstermBackend};
 
 use app::App;
 use rpc::Client;
+use theme::{Theme, ThemeName};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -38,6 +39,10 @@ struct Cli {
     /// mow binary to spawn (`mow rpc …`).
     #[arg(long, env = "MOW_BIN", default_value = "mow")]
     mow_bin: String,
+
+    /// UI theme name.
+    #[arg(long, env = "MOW_THEME", default_value = "catppuccin-mocha")]
+    theme: ThemeName,
 
     /// Resume a session id (engine flag).
     #[arg(long)]
@@ -187,7 +192,7 @@ fn main() -> ExitCode {
         height,
     }) = &cli.command
     {
-        print_snapshots(scene, *width, *height);
+        print_snapshots(scene, *width, *height, Theme::new(cli.theme));
         return ExitCode::SUCCESS;
     }
     let ping_only = cli.no_tui || matches!(cli.command, Some(Command::Ping));
@@ -202,7 +207,7 @@ fn main() -> ExitCode {
 }
 
 /// Print one scene, or every scene with a caption, as ANSI blocks.
-fn print_snapshots(scene: &str, width: u16, height: u16) {
+fn print_snapshots(scene: &str, width: u16, height: u16, theme: Theme) {
     let mut out = io::stdout();
     let scenes: Vec<&str> = if scene == "all" {
         snapshot::SCENES.to_vec()
@@ -211,7 +216,11 @@ fn print_snapshots(scene: &str, width: u16, height: u16) {
     };
     for name in scenes {
         let _ = writeln!(out, "\n=== {name} ({width}x{height}) ===");
-        let _ = write!(out, "{}", snapshot::render(name, width, height));
+        let _ = write!(
+            out,
+            "{}",
+            snapshot::render_with_theme(name, width, height, theme)
+        );
     }
 }
 
@@ -250,6 +259,7 @@ fn tui(cli: &Cli) -> Result<(), rpc::Error> {
     } else {
         App::new(session)
     };
+    app.theme = Theme::new(cli.theme);
     // Feature-detect once from the handshake instead of probing for -32601.
     app.set_capabilities(&version.methods);
     app.ask_mode = !cli.auto;
@@ -289,6 +299,20 @@ mod tests {
     #[test]
     fn cli_verifies() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn theme_flag_accepts_full_names() {
+        let cli = Cli::parse_from(["mowi", "--theme", "gruvbox-dark"]);
+        assert_eq!(cli.theme, ThemeName::GruvboxDark);
+    }
+
+    #[test]
+    fn unknown_theme_error_lists_available_names() {
+        let err = Cli::try_parse_from(["mowi", "--theme", "solarized"]).unwrap_err();
+        for name in ThemeName::ALL {
+            assert!(err.to_string().contains(name), "{err}");
+        }
     }
 
     #[test]

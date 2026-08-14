@@ -75,6 +75,8 @@ pub struct SessionSummary {
 pub struct TranscriptMessage {
     pub role: String,
     pub content: String,
+    /// RFC 3339 timestamp when the host/session format has one.
+    pub timestamp: Option<String>,
 }
 
 /// One model from `model.list`.
@@ -1186,6 +1188,10 @@ pub fn decode_transcript(value: &Value) -> Result<Vec<TranscriptMessage>, Error>
             Ok(TranscriptMessage {
                 role: string_field(row, "role")?,
                 content: string_field(row, "content")?,
+                timestamp: row
+                    .get("ts")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
             })
         })
         .collect()

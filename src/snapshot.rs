@@ -27,7 +27,7 @@ fn snapshot_user(text: impl Into<String>) -> Entry {
 }
 
 /// Every scene the snapshot tool can paint.
-pub const SCENES: [&str; 8] = [
+pub const SCENES: [&str; 9] = [
     "chat",
     "busy",
     "diff",
@@ -35,6 +35,7 @@ pub const SCENES: [&str; 8] = [
     "help",
     "permission",
     "tools",
+    "toolgroup",
     "narrow",
 ];
 
@@ -73,8 +74,14 @@ fn demo_app() -> App {
 /// `NO_COLOR` is honoured here exactly as the real client honours it, so the
 /// design tool can actually show the monochrome frame instead of always
 /// painting the truecolor one.
+#[allow(dead_code)]
 pub fn scene(name: &str) -> App {
+    scene_with_theme(name, Theme::detect())
+}
+
+pub fn scene_with_theme(name: &str, theme: Theme) -> App {
     let mut app = demo_app();
+    app.theme = theme;
     match name {
         "welcome" => {
             app.welcome = true;
@@ -139,7 +146,8 @@ pub fn scene(name: &str) -> App {
             ));
         }
         // Tool-grouping scene: one turn's four tool calls collapse to a
-        // single row; an expanded group below shows the drill-down state.
+        // counted summary (`read ×2 · grep · bash`); an expanded group
+        // below shows the drill-down state.
         "tools" => {
             app.entries.push(snapshot_user("fix the flaky test"));
             app.entries.push(Entry::Tools {
@@ -160,6 +168,23 @@ pub fn scene(name: &str) -> App {
             });
             app.entries.push(Entry::Assistant(
                 "Grouped the tool calls so a busy turn reads like a summary.".into(),
+            ));
+        }
+        // Compact counts only: pins `bash ×2` on the collapsed row so a
+        // paint fixture can catch a regression back to `N tool calls`.
+        "toolgroup" => {
+            app.entries.push(snapshot_user("run the checks"));
+            app.entries.push(Entry::Tools {
+                tools: vec![
+                    ("bash cargo test".into(), Some(940)),
+                    ("grep flaky".into(), Some(40)),
+                    ("bash cargo clippy".into(), Some(510)),
+                    ("read src/app.rs".into(), Some(120)),
+                ],
+                expanded: false,
+            });
+            app.entries.push(Entry::Assistant(
+                "Collapsed counts stay readable at a glance.".into(),
             ));
         }
         "narrow" => {
@@ -192,7 +217,11 @@ pub fn scene(name: &str) -> App {
 
 /// Render `scene` at `width`x`height` and return it as an ANSI string.
 pub fn render(name: &str, width: u16, height: u16) -> String {
-    let mut app = scene(name);
+    render_with_theme(name, width, height, Theme::detect())
+}
+
+pub fn render_with_theme(name: &str, width: u16, height: u16, theme: Theme) -> String {
+    let mut app = scene_with_theme(name, theme);
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test backend");
     terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
     ansi(terminal.backend().buffer())
@@ -251,11 +280,77 @@ fn ansi(buffer: &Buffer) -> String {
 mod tests {
     use super::*;
 
+    fn paint_plain(name: &str, width: u16, height: u16) -> String {
+        let mut app = scene(name);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test backend");
+        terminal.draw(|frame| draw(frame, &mut app)).expect("draw");
+        let buf = terminal.backend().buffer();
+        let area = buf.area();
+        (area.y..area.bottom())
+            .map(|y| {
+                (area.x..area.right())
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn every_scene_paints_without_panicking() {
         for name in SCENES {
             let out = render(name, 100, 30);
             assert!(!out.is_empty(), "scene {name} painted nothing");
+        }
+    }
+
+    #[test]
+    fn toolgroup_scene_paints_compact_counts() {
+        let out = paint_plain("toolgroup", 100, 30);
+        assert!(out.contains("bash ×2 · grep · read"), "{out}");
+        assert!(
+            out.contains("1.6s"),
+            "total elapsed belongs on the row:\n{out}"
+        );
+        assert!(
+            !out.contains("tool calls"),
+            "collapsed row must not say N tool calls:\n{out}"
+        );
+        assert_eq!(
+            out.lines().filter(|l| l.contains("bash ×2")).count(),
+            1,
+            "collapsed group is one row:\n{out}"
+        );
+
+        let tools = paint_plain("tools", 100, 30);
+        assert!(tools.contains("read ×2 · grep · bash"), "{tools}");
+        assert!(
+            tools.contains("2 tool calls"),
+            "expanded group keeps the header:\n{tools}"
+        );
+    }
+
+    #[test]
+    fn toolgroup_scene_stays_token_safe_when_narrow() {
+        for width in [40u16, 48, 60] {
+            let out = paint_plain("toolgroup", width, 20);
+            assert!(out.contains("bash"), "w={width}: {out}");
+            assert!(!out.contains("tool calls"), "w={width}: {out}");
+            let row = out
+                .lines()
+                .find(|l| l.contains("bash"))
+                .unwrap_or("")
+                .trim();
+            assert!(
+                !row.contains("bas ") && !row.contains("gre ") && !row.contains("rea "),
+                "w={width} mid-token cut: {row}"
+            );
+            if row.contains('×') {
+                assert!(
+                    row.contains(" ×") || row.contains("×2") || row.contains("×3"),
+                    "w={width} × must stay on a count: {row}"
+                );
+            }
         }
     }
 }

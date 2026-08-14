@@ -8,7 +8,7 @@ operator experience**, not a subset that forgets permissions or resume.
 | Region | Behavior |
 |---|---|
 | Header | Left: `mowi`, workspace basename, `model (effort)`. Right: safety chips (write/shell, ask/auto), then ` · ` and the token chip, then the context gauge at the far right when it fits. The ` · ` before metrics is omitted when both are hidden. Usage peels before identity; safety never drops. Session id is never a header or status-bar chip; the help overlay titles the full id. |
-| Transcript | User blocks (soft fill), assistant markdown, one compact tool line per call — a turn's calls collapse into a single `⚙ N tool calls` row (Esc collapses an expanded group). Edits = inline review cards (−/+). |
+| Transcript | User blocks (soft fill), assistant markdown, one compact tool line per call — a turn's calls collapse into a counted row (`⚙ bash ×2 · grep`) that shortens by whole tokens on a narrow pane (Esc collapses an expanded group). Edits = inline review cards (−/+). |
 | Status bar | Idle: `● idle`. Busy: spinner, elapsed, verb (and typing pulse while tokens land) on this row — no separate activity band. Hints flush right and degrade before state does. |
 | Input | Sits on the document ground with a horizontal inset and no box. Enter sends; busy queues. `/steer` redirects the running turn. |
 | Welcome | Splash, dismisses on any key. Short panes drop the tagline/effort first so access and `type to begin` still fit. |
@@ -123,7 +123,10 @@ scrolls the transcript only.
 
 ## Theme / a11y
 
-- Default theme name: catppuccin-mocha (chroma-compatible idea)
+- Default theme name: catppuccin-mocha; selectable names are
+  catppuccin-mocha, catppuccin-latte, gruvbox-dark, and monokai
+- Select with `--theme NAME` or `MOW_THEME=NAME`; unknown names list all
+  available themes
 - `NO_COLOR=1` — glyphs still distinct (◇ ⚙ ✕ ▲)
 - `MOW_NO_ANIM=1` — still spinner; elapsed still ticks
 - Native terminal selection/copy (no mouse capture; scroll with ↑↓ / pgup/pgdn)

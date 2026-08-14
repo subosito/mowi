@@ -1,9 +1,11 @@
-//! Catppuccin Mocha palette and the semantic roles the UI paints with.
+//! Named palettes and the semantic roles the UI paints with.
 //!
 //! Rule: widgets never name raw colors. They ask for a *role* (`header`,
 //! `spinner`, `badge_ok`, ...) so a future flavor swap is one table away.
 
 use ratatui::style::{Color, Modifier, Style};
+use std::fmt;
+use std::str::FromStr;
 
 /// Raw Catppuccin Mocha ramp. https://catppuccin.com/palette
 ///
@@ -46,6 +48,182 @@ pub mod mocha {
     pub const DEL_BAND: Color = Color::Rgb(0x5e, 0x2d, 0x3a);
 }
 
+/// Full theme identifiers accepted by the CLI and `MOW_THEME`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeName {
+    CatppuccinMocha,
+    CatppuccinLatte,
+    GruvboxDark,
+    Monokai,
+}
+
+impl ThemeName {
+    pub const ALL: [&'static str; 4] = [
+        "catppuccin-mocha",
+        "catppuccin-latte",
+        "gruvbox-dark",
+        "monokai",
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CatppuccinMocha => "catppuccin-mocha",
+            Self::CatppuccinLatte => "catppuccin-latte",
+            Self::GruvboxDark => "gruvbox-dark",
+            Self::Monokai => "monokai",
+        }
+    }
+
+    pub const fn palette(self) -> Palette {
+        match self {
+            Self::CatppuccinMocha => Palette::mocha(),
+            Self::CatppuccinLatte => Palette::latte(),
+            Self::GruvboxDark => Palette::gruvbox(),
+            Self::Monokai => Palette::monokai(),
+        }
+    }
+}
+
+impl fmt::Display for ThemeName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ThemeName {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "catppuccin-mocha" => Ok(Self::CatppuccinMocha),
+            "catppuccin-latte" => Ok(Self::CatppuccinLatte),
+            "gruvbox-dark" => Ok(Self::GruvboxDark),
+            "monokai" => Ok(Self::Monokai),
+            other => Err(format!(
+                "unknown theme {other:?}; available themes: {}",
+                Self::ALL.join(", ")
+            )),
+        }
+    }
+}
+
+/// Colors consumed by semantic theme methods.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Palette {
+    pub text: Color,
+    pub muted: Color,
+    pub overlay: Color,
+    pub surface: Color,
+    pub surface_deep: Color,
+    pub base: Color,
+    pub mantle: Color,
+    pub crust: Color,
+    pub accent: Color,
+    pub rail: Color,
+    pub blue: Color,
+    pub cyan: Color,
+    pub peach: Color,
+    pub yellow: Color,
+    pub green: Color,
+    pub red: Color,
+    pub add_band: Color,
+    pub del_band: Color,
+}
+
+impl Palette {
+    pub const fn mocha() -> Self {
+        Self {
+            text: mocha::TEXT,
+            muted: mocha::SUBTEXT0,
+            overlay: mocha::SURFACE1,
+            surface: mocha::SURFACE0,
+            surface_deep: mocha::SURFACE2,
+            base: mocha::BASE,
+            mantle: mocha::MANTLE,
+            crust: mocha::CRUST,
+            accent: mocha::MAUVE,
+            rail: mocha::LAVENDER,
+            blue: mocha::BLUE,
+            cyan: mocha::TEAL,
+            peach: mocha::PEACH,
+            yellow: mocha::YELLOW,
+            green: mocha::GREEN,
+            red: mocha::RED,
+            add_band: mocha::ADD_BAND,
+            del_band: mocha::DEL_BAND,
+        }
+    }
+
+    pub const fn latte() -> Self {
+        Self {
+            text: Color::Rgb(0x4c, 0x4f, 0x69),
+            muted: Color::Rgb(0x6c, 0x6f, 0x85),
+            overlay: Color::Rgb(0xcc, 0xd0, 0xda),
+            surface: Color::Rgb(0xe6, 0xe9, 0xef),
+            surface_deep: Color::Rgb(0xbc, 0xc0, 0xcc),
+            base: Color::Rgb(0xef, 0xf1, 0xf5),
+            mantle: Color::Rgb(0xe6, 0xe9, 0xef),
+            crust: Color::Rgb(0xdc, 0xde, 0xe4),
+            accent: Color::Rgb(0x88, 0x39, 0x9b),
+            rail: Color::Rgb(0x72, 0x62, 0xc6),
+            blue: Color::Rgb(0x1e, 0x66, 0xf5),
+            cyan: Color::Rgb(0x17, 0x93, 0xa5),
+            peach: Color::Rgb(0xfe, 0x64, 0x0b),
+            yellow: Color::Rgb(0xdf, 0x8e, 0x1d),
+            green: Color::Rgb(0x40, 0xa0, 0x2b),
+            red: Color::Rgb(0xd2, 0x0f, 0x39),
+            add_band: Color::Rgb(0xd8, 0xed, 0xd2),
+            del_band: Color::Rgb(0xf5, 0xd5, 0xdc),
+        }
+    }
+
+    pub const fn gruvbox() -> Self {
+        Self {
+            text: Color::Rgb(0xeb, 0xdb, 0xb2),
+            muted: Color::Rgb(0xa8, 0x99, 0x84),
+            overlay: Color::Rgb(0x50, 0x49, 0x45),
+            surface: Color::Rgb(0x3c, 0x38, 0x36),
+            surface_deep: Color::Rgb(0x66, 0x5c, 0x54),
+            base: Color::Rgb(0x28, 0x28, 0x28),
+            mantle: Color::Rgb(0x1d, 0x20, 0x21),
+            crust: Color::Rgb(0x14, 0x14, 0x14),
+            accent: Color::Rgb(0xd7, 0x99, 0x21),
+            rail: Color::Rgb(0xd7, 0x99, 0x21),
+            blue: Color::Rgb(0x83, 0xa5, 0x98),
+            cyan: Color::Rgb(0x8e, 0xc0, 0x7c),
+            peach: Color::Rgb(0xfe, 0x80, 0x19),
+            yellow: Color::Rgb(0xfa, 0xbd, 0x2f),
+            green: Color::Rgb(0xb8, 0xbb, 0x26),
+            red: Color::Rgb(0xfb, 0x49, 0x34),
+            add_band: Color::Rgb(0x3b, 0x4a, 0x2d),
+            del_band: Color::Rgb(0x52, 0x2f, 0x2b),
+        }
+    }
+
+    pub const fn monokai() -> Self {
+        Self {
+            text: Color::Rgb(0xf8, 0xf8, 0xf2),
+            muted: Color::Rgb(0x75, 0x71, 0x5e),
+            overlay: Color::Rgb(0x49, 0x46, 0x3e),
+            surface: Color::Rgb(0x3e, 0x3d, 0x32),
+            surface_deep: Color::Rgb(0x66, 0x65, 0x5f),
+            base: Color::Rgb(0x27, 0x28, 0x22),
+            mantle: Color::Rgb(0x1e, 0x1f, 0x1c),
+            crust: Color::Rgb(0x15, 0x16, 0x13),
+            accent: Color::Rgb(0xae, 0x81, 0xff),
+            rail: Color::Rgb(0x66, 0xd9, 0xef),
+            blue: Color::Rgb(0x66, 0xd9, 0xef),
+            cyan: Color::Rgb(0xa6, 0xe2, 0x2e),
+            peach: Color::Rgb(0xfd, 0x97, 0x1f),
+            yellow: Color::Rgb(0xe6, 0xdb, 0x74),
+            green: Color::Rgb(0xa6, 0xe2, 0x2e),
+            red: Color::Rgb(0xf9, 0x26, 0x72),
+            add_band: Color::Rgb(0x35, 0x4a, 0x2a),
+            del_band: Color::Rgb(0x55, 0x2c, 0x3a),
+        }
+    }
+}
+
 /// Semantic surface for a status/severity badge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // full tone set; markdown/overlay work lands the rest
@@ -65,14 +243,14 @@ pub enum Tone {
 }
 
 impl Tone {
-    fn color(self) -> Color {
+    fn color(self, palette: Palette) -> Color {
         match self {
-            Tone::Muted => mocha::OVERLAY1,
-            Tone::Active => mocha::BLUE,
-            Tone::Ok => mocha::GREEN,
-            Tone::Warn => mocha::YELLOW,
-            Tone::Error => mocha::RED,
-            Tone::Peer => mocha::MAUVE,
+            Tone::Muted => palette.muted,
+            Tone::Active => palette.blue,
+            Tone::Ok => palette.green,
+            Tone::Warn => palette.yellow,
+            Tone::Error => palette.red,
+            Tone::Peer => palette.accent,
         }
     }
 }
@@ -90,15 +268,51 @@ pub const TYPING: [&str; 4] = ["·  ", "·· ", "···", " ··"];
 
 #[derive(Debug, Clone, Copy)]
 pub struct Theme {
+    pub name: ThemeName,
     pub colored: bool,
+    pub palette: Palette,
 }
 
 #[allow(dead_code)] // semantic roles are staged ahead of their UI consumers
 impl Theme {
-    pub fn detect() -> Self {
+    pub fn new(name: ThemeName) -> Self {
         Self {
+            name,
             colored: std::env::var_os("NO_COLOR").is_none(),
+            palette: name.palette(),
         }
+    }
+
+    pub fn colored(name: ThemeName) -> Self {
+        Self {
+            name,
+            colored: true,
+            palette: name.palette(),
+        }
+    }
+
+    pub fn plain(name: ThemeName) -> Self {
+        Self {
+            name,
+            colored: false,
+            palette: name.palette(),
+        }
+    }
+
+    pub const fn name(self) -> ThemeName {
+        self.name
+    }
+
+    pub fn detect() -> Self {
+        let name = std::env::var("MOW_THEME")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(ThemeName::CatppuccinMocha);
+        Self::new(name)
+    }
+
+    pub fn from_name(name: &str) -> Result<Self, String> {
+        Ok(Self::new(name.parse()?))
     }
 
     /// `fg` only when color is enabled; otherwise fall back to modifiers so the
@@ -125,7 +339,7 @@ impl Theme {
     /// terminal-black.
     pub fn base(self) -> Style {
         if self.colored {
-            Style::default().bg(mocha::BASE).fg(mocha::TEXT)
+            Style::default().bg(self.palette.base).fg(self.palette.text)
         } else {
             Style::default()
         }
@@ -134,7 +348,7 @@ impl Theme {
     /// Header / sunk chrome (`mantle`). Not used for the header/status rails —
     /// those sit on the terminal default so a second fill cannot misalign.
     pub fn mantle(self) -> Style {
-        self.bg(mocha::MANTLE)
+        self.bg(self.palette.mantle)
     }
 
     /// Terminal default ground (`Color::Reset`). Clears a previous document
@@ -145,17 +359,17 @@ impl Theme {
 
     /// Deepest ground, for the modal scrim (`crust`).
     pub fn crust(self) -> Style {
-        self.bg(mocha::CRUST)
+        self.bg(self.palette.crust)
     }
 
     /// Raised chrome: user bands (`surface0`).
     pub fn surface(self) -> Style {
-        self.bg(mocha::SURFACE0)
+        self.bg(self.palette.surface)
     }
 
     /// Overlay fill (`surface1`).
     pub fn overlay(self) -> Style {
-        self.bg(mocha::SURFACE1)
+        self.bg(self.palette.overlay)
     }
 
     pub fn header_bg(self) -> Style {
@@ -166,7 +380,7 @@ impl Theme {
     /// fill here is what read as a misaligned top/bottom panel.
     pub fn footer_bg(self) -> Style {
         if self.colored {
-            Style::default().bg(Color::Reset).fg(mocha::SUBTEXT0)
+            Style::default().bg(Color::Reset).fg(self.palette.muted)
         } else {
             self.terminal()
         }
@@ -176,7 +390,9 @@ impl Theme {
     /// the overlay reads as "in front of" rather than "instead of".
     pub fn scrim(self) -> Style {
         if self.colored {
-            Style::default().bg(mocha::CRUST).fg(mocha::SURFACE1)
+            Style::default()
+                .bg(self.palette.crust)
+                .fg(self.palette.overlay)
         } else {
             Style::default().add_modifier(Modifier::DIM)
         }
@@ -189,7 +405,9 @@ impl Theme {
     /// The accent rail down the left edge of a user message.
     pub fn user_rail(self) -> Style {
         if self.colored {
-            Style::default().fg(mocha::LAVENDER).bg(mocha::SURFACE0)
+            Style::default()
+                .fg(self.palette.rail)
+                .bg(self.palette.surface)
         } else {
             Style::default()
         }
@@ -199,8 +417,8 @@ impl Theme {
     pub fn selected(self) -> Style {
         if self.colored {
             Style::default()
-                .bg(mocha::SURFACE2)
-                .fg(mocha::TEXT)
+                .bg(self.palette.surface_deep)
+                .fg(self.palette.text)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().add_modifier(Modifier::REVERSED)
@@ -210,13 +428,13 @@ impl Theme {
     // ---- text ----------------------------------------------------------
 
     pub fn text(self) -> Style {
-        self.fg(mocha::TEXT)
+        self.fg(self.palette.text)
     }
 
     pub fn header(self) -> Style {
         if self.colored {
             Style::default()
-                .fg(mocha::MAUVE)
+                .fg(self.palette.accent)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
@@ -227,7 +445,9 @@ impl Theme {
     /// chrome and read as a leftover composer artifact on the band.
     pub fn user(self) -> Style {
         if self.colored {
-            Style::default().fg(mocha::PEACH).patch(self.user_bg())
+            Style::default()
+                .fg(self.palette.peach)
+                .patch(self.user_bg())
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         }
@@ -239,7 +459,7 @@ impl Theme {
 
     pub fn note(self) -> Style {
         if self.colored {
-            Style::default().fg(mocha::SUBTEXT0)
+            Style::default().fg(self.palette.muted)
         } else {
             Style::default().add_modifier(Modifier::DIM)
         }
@@ -248,7 +468,7 @@ impl Theme {
     /// Quiet chrome: block borders, rules, hints.
     pub fn chrome(self) -> Style {
         if self.colored {
-            Style::default().fg(mocha::SURFACE2)
+            Style::default().fg(self.palette.surface_deep)
         } else {
             Style::default().add_modifier(Modifier::DIM)
         }
@@ -257,7 +477,7 @@ impl Theme {
     /// Border of the focused surface (active overlay).
     pub fn chrome_focus(self) -> Style {
         if self.colored {
-            Style::default().fg(mocha::LAVENDER)
+            Style::default().fg(self.palette.accent)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         }
@@ -266,7 +486,7 @@ impl Theme {
     /// Accent used for overlay titles and the welcome splash.
     pub fn accent(self) -> Style {
         if self.colored {
-            Style::default().fg(mocha::MAUVE)
+            Style::default().fg(self.palette.accent)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         }
@@ -277,8 +497,8 @@ impl Theme {
     pub fn overlay_title(self) -> Style {
         if self.colored {
             Style::default()
-                .fg(mocha::MAUVE)
-                .bg(mocha::SURFACE1)
+                .fg(self.palette.accent)
+                .bg(self.palette.overlay)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
@@ -288,7 +508,9 @@ impl Theme {
     /// Something needs a decision or the frame cannot be drawn.
     pub fn warn(self) -> Style {
         if self.colored {
-            Style::default().fg(mocha::RED).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(self.palette.red)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         }
@@ -299,7 +521,7 @@ impl Theme {
     /// Safety chips (capabilities, ask/auto) — always legible.
     pub fn chip(self) -> Style {
         if self.colored {
-            Style::default().fg(mocha::YELLOW)
+            Style::default().fg(self.palette.yellow)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         }
@@ -309,7 +531,7 @@ impl Theme {
     pub fn badge(self, tone: Tone) -> Style {
         if self.colored {
             Style::default()
-                .fg(tone.color())
+                .fg(tone.color(self.palette))
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
@@ -320,8 +542,8 @@ impl Theme {
     pub fn badge_solid(self, tone: Tone) -> Style {
         if self.colored {
             Style::default()
-                .fg(mocha::CRUST)
-                .bg(tone.color())
+                .fg(self.palette.crust)
+                .bg(tone.color(self.palette))
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().add_modifier(Modifier::REVERSED)
@@ -331,7 +553,9 @@ impl Theme {
     /// The animated braille spinner while a turn is in flight.
     pub fn spinner(self) -> Style {
         if self.colored {
-            Style::default().fg(mocha::SKY).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(self.palette.blue)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         }
@@ -340,7 +564,7 @@ impl Theme {
     /// Streaming-token "typing" pulse.
     pub fn typing(self) -> Style {
         if self.colored {
-            Style::default().fg(mocha::TEAL)
+            Style::default().fg(self.palette.cyan)
         } else {
             Style::default().add_modifier(Modifier::DIM)
         }
@@ -349,7 +573,7 @@ impl Theme {
     /// Delegated ACP peer work.
     pub fn peer(self) -> Style {
         if self.colored {
-            Style::default().fg(mocha::MAUVE)
+            Style::default().fg(self.palette.accent)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         }
@@ -358,7 +582,7 @@ impl Theme {
     /// A tool call row in the transcript.
     pub fn tool(self) -> Style {
         if self.colored {
-            Style::default().fg(mocha::SAPPHIRE)
+            Style::default().fg(self.palette.blue)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         }
@@ -367,7 +591,7 @@ impl Theme {
     /// Elapsed / duration text next to a tool or task.
     pub fn timing(self) -> Style {
         if self.colored {
-            Style::default().fg(mocha::OVERLAY1)
+            Style::default().fg(self.palette.muted)
         } else {
             Style::default().add_modifier(Modifier::DIM)
         }
@@ -376,7 +600,9 @@ impl Theme {
     /// Search match highlight.
     pub fn match_hit(self) -> Style {
         if self.colored {
-            Style::default().fg(mocha::CRUST).bg(mocha::YELLOW)
+            Style::default()
+                .fg(self.palette.crust)
+                .bg(self.palette.yellow)
         } else {
             Style::default().add_modifier(Modifier::REVERSED)
         }
@@ -387,10 +613,10 @@ impl Theme {
     /// `# heading` rows, by depth (1-based; deeper levels cool down).
     pub fn md_heading(self, level: u8) -> Style {
         let color = match level {
-            1 => mocha::MAUVE,
-            2 => mocha::BLUE,
-            3 => mocha::SAPPHIRE,
-            _ => mocha::TEAL,
+            1 => self.palette.accent,
+            2 => self.palette.blue,
+            3 => self.palette.blue,
+            _ => self.palette.cyan,
         };
         if self.colored {
             Style::default().fg(color).add_modifier(Modifier::BOLD)
@@ -417,7 +643,9 @@ impl Theme {
     /// `` `inline code` `` — tinted ground so it reads as a chip.
     pub fn md_code(self) -> Style {
         if self.colored {
-            Style::default().fg(mocha::PEACH).bg(mocha::SURFACE0)
+            Style::default()
+                .fg(self.palette.peach)
+                .bg(self.palette.surface)
         } else {
             Style::default().add_modifier(Modifier::REVERSED)
         }
@@ -426,7 +654,9 @@ impl Theme {
     /// Fenced block body.
     pub fn md_code_block(self) -> Style {
         if self.colored {
-            Style::default().fg(mocha::TEXT).bg(mocha::MANTLE)
+            Style::default()
+                .fg(self.palette.text)
+                .bg(self.palette.mantle)
         } else {
             Style::default()
         }
@@ -435,7 +665,9 @@ impl Theme {
     /// The language tag on a fence.
     pub fn md_code_lang(self) -> Style {
         if self.colored {
-            Style::default().fg(mocha::OVERLAY1).bg(mocha::MANTLE)
+            Style::default()
+                .fg(self.palette.muted)
+                .bg(self.palette.mantle)
         } else {
             Style::default().add_modifier(Modifier::DIM)
         }
@@ -443,14 +675,14 @@ impl Theme {
 
     /// List bullets / ordered markers.
     pub fn md_bullet(self) -> Style {
-        self.fg(mocha::LAVENDER)
+        self.fg(self.palette.accent)
     }
 
     /// Blockquote bar and text.
     pub fn md_quote(self) -> Style {
         if self.colored {
             Style::default()
-                .fg(mocha::SUBTEXT0)
+                .fg(self.palette.muted)
                 .add_modifier(Modifier::ITALIC)
         } else {
             Style::default().add_modifier(Modifier::DIM)
@@ -461,7 +693,7 @@ impl Theme {
     pub fn md_link(self) -> Style {
         if self.colored {
             Style::default()
-                .fg(mocha::SAPPHIRE)
+                .fg(self.palette.blue)
                 .add_modifier(Modifier::UNDERLINED)
         } else {
             Style::default().add_modifier(Modifier::UNDERLINED)
@@ -477,7 +709,7 @@ impl Theme {
     pub fn md_table_head(self) -> Style {
         if self.colored {
             Style::default()
-                .fg(mocha::LAVENDER)
+                .fg(self.palette.accent)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
@@ -488,7 +720,9 @@ impl Theme {
 
     pub fn add(self) -> Style {
         if self.colored {
-            Style::default().fg(mocha::GREEN).bg(mocha::ADD_BAND)
+            Style::default()
+                .fg(self.palette.green)
+                .bg(self.palette.add_band)
         } else {
             Style::default()
         }
@@ -496,20 +730,22 @@ impl Theme {
 
     pub fn del(self) -> Style {
         if self.colored {
-            Style::default().fg(mocha::RED).bg(mocha::DEL_BAND)
+            Style::default()
+                .fg(self.palette.red)
+                .bg(self.palette.del_band)
         } else {
             Style::default()
         }
     }
 
     pub fn context(self) -> Style {
-        self.fg(mocha::SUBTEXT0)
+        self.fg(self.palette.muted)
     }
 
     /// Diff meta rows: `@@` hunk headers and `---` / `+++` file headers.
     pub fn diff_meta(self) -> Style {
         if self.colored {
-            Style::default().fg(mocha::OVERLAY1)
+            Style::default().fg(self.palette.muted)
         } else {
             Style::default().add_modifier(Modifier::DIM)
         }
@@ -528,7 +764,9 @@ impl Theme {
     /// Word-diff chip inside an added line: inverted against the band.
     pub fn add_chip(self) -> Style {
         if self.colored {
-            Style::default().fg(mocha::BASE).bg(mocha::GREEN)
+            Style::default()
+                .fg(self.palette.base)
+                .bg(self.palette.green)
         } else {
             Style::default().add_modifier(Modifier::REVERSED)
         }
@@ -537,7 +775,7 @@ impl Theme {
     /// Word-diff chip inside a removed line: inverted against the band.
     pub fn del_chip(self) -> Style {
         if self.colored {
-            Style::default().fg(mocha::BASE).bg(mocha::RED)
+            Style::default().fg(self.palette.base).bg(self.palette.red)
         } else {
             Style::default().add_modifier(Modifier::REVERSED)
         }
@@ -550,7 +788,7 @@ mod tests {
 
     #[test]
     fn no_color_theme_never_emits_color() {
-        let t = Theme { colored: false };
+        let t = Theme::plain(ThemeName::CatppuccinMocha);
         let styles = [
             t.base(),
             t.header(),
@@ -576,18 +814,18 @@ mod tests {
 
     #[test]
     fn colored_theme_grounds_the_frame() {
-        let t = Theme { colored: true };
-        assert_eq!(t.base().bg, Some(mocha::BASE));
+        let t = Theme::colored(ThemeName::CatppuccinMocha);
+        assert_eq!(t.base().bg, Some(t.palette.base));
         assert_eq!(t.header_bg().bg, Some(Color::Reset));
         assert_eq!(t.footer_bg().bg, Some(Color::Reset));
         assert_eq!(t.header().bg, None);
-        assert_eq!(t.user().fg, Some(mocha::PEACH));
-        assert_ne!(t.user().fg, Some(mocha::BLUE));
+        assert_eq!(t.user().fg, Some(t.palette.peach));
+        assert_ne!(t.user().fg, Some(t.palette.blue));
     }
 
     #[test]
     fn tones_are_distinct() {
-        let t = Theme { colored: true };
+        let t = Theme::colored(ThemeName::CatppuccinMocha);
         let ok = t.badge(Tone::Ok).fg;
         let err = t.badge(Tone::Error).fg;
         let peer = t.badge(Tone::Peer).fg;
@@ -600,6 +838,29 @@ mod tests {
     fn spinner_frames_are_single_width() {
         for frame in SPINNER {
             assert_eq!(frame.chars().count(), 1);
+        }
+    }
+
+    #[test]
+    fn all_named_themes_have_complete_distinct_palettes() {
+        let themes: Vec<_> = ThemeName::ALL
+            .iter()
+            .map(|name| Theme::colored(name.parse().unwrap()))
+            .collect();
+        assert_eq!(themes.len(), 4);
+        assert!(themes.iter().all(|theme| theme.base().bg.is_some()));
+        assert!(
+            themes
+                .windows(2)
+                .all(|pair| pair[0].palette != pair[1].palette)
+        );
+    }
+
+    #[test]
+    fn unknown_theme_lists_available_names() {
+        let error = Theme::from_name("solarized").unwrap_err();
+        for name in ThemeName::ALL {
+            assert!(error.contains(name), "{error}");
         }
     }
 }

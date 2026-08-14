@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+import json, sys, time
+for line in sys.stdin:
+    try: req=json.loads(line)
+    except Exception: continue
+    i=req.get('id'); m=req.get('method')
+    if m=='version': result={'name':'mow','version':'test','rpc':'4','methods':['prompt','cancel','status','session','transcript','slash.list','perm.set','effort.list','context'],'control_methods':['cancel','status','session','transcript','slash.list','perm.set','effort.list','context'],'features':{}}
+    elif m=='session': result={'session_id':'pty-session','workspace':'/tmp/fixture-workspace','model':'fixture-model','wire':'fixture'}
+    elif m=='status': result={'busy':False,'allow_write':False,'allow_shell':False,'ask_mode':True,'session_id':'pty-session','workspace':'/tmp/fixture-workspace','model':'fixture-model'}
+    elif m=='transcript': result={'messages':[{'role':'user','content':'resumed prompt','ts':'2026-08-14T04:02:00Z'},{'role':'assistant','content':'resumed answer'}]}
+    elif m=='slash.list': result={'commands':[]}
+    elif m=='effort.list': result={'efforts':[],'current':'none','default':'none'}
+    elif m=='context': result={'tokens':123,'context_window':1000,'percent':12.3}
+    elif m=='perm.set': result={'ok':True,'ask_mode':req.get('params',{}).get('mode')=='ask'}
+    elif m=='cancel': result={'ok':True}
+    elif m=='prompt':
+        text='\n'.join(f'fixture transcript line {n:02}' for n in range(1,41))
+        print(json.dumps({'jsonrpc':'2.0','method':'event','params':{'type':'loop.token','delta':text}}),flush=True)
+        result={'text':text,'session_id':'pty-session','run_id':'fixture-run','stop_reason':'stop','usage':{'input_tokens':4,'output_tokens':40}}
+    else: result={}
+    if i is not None: print(json.dumps({'jsonrpc':'2.0','id':i,'result':result}),flush=True)

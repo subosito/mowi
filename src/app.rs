@@ -62,6 +62,12 @@ const TRANSCRIPT_OVERSCAN: usize = 16;
 /// Cached painted entries kept around the viewport. Enough for a burst of
 /// scroll keys without retaining a whole resumed session.
 const TRANSCRIPT_CACHE_ENTRIES: usize = 48;
+/// Bound retained UI source for multi-day sessions. The Engine remains the
+/// source of truth and `/transcript` can reload history on demand.
+const TRANSCRIPT_ENTRY_CEILING: usize = 4_000;
+const TRANSCRIPT_TRIM_TARGET: usize = 3_500;
+const EARLIER_ENTRIES_NOTE: &str =
+    "… earlier transcript omitted from memory · /transcript reloads history";
 /// Bound work per event-loop turn so a continuously streaming RPC cannot
 /// starve input and painting. Remaining notifications are handled next turn.
 const NOTIFICATION_BATCH: usize = 256;
@@ -106,8 +112,9 @@ pub enum Entry {
         duration_ms: Option<u64>,
     },
     /// One turn's worth of tool calls, collapsed to a single summary line
-    /// unless expanded. A long agent turn that runs `bash`/`write`/`read` a
-    /// dozen times is one row, not a flood. Esc collapses an expanded group.
+    /// (`bash ×2 · grep`) unless expanded. A long agent turn that runs
+    /// `bash`/`write`/`read` a dozen times is one row, not a flood. Esc
+    /// collapses an expanded group.
     Tools {
         tools: Vec<(String, Option<u64>)>,
         expanded: bool,
@@ -127,6 +134,33 @@ impl Entry {
 
 /// UTC `HH:MM` for a recorded user prompt. UTC keeps the stamp timezone-stable
 /// without a datetime crate; resumed entries omit it entirely.
+fn parse_rfc3339_system_time(value: &str) -> Option<SystemTime> {
+    // Host emits UTC RFC3339. Convert civil days without another time crate;
+    // malformed/legacy timestamps simply remain untimed.
+    let v = value.strip_suffix('Z')?;
+    let (date, clock) = v.split_once('T')?;
+    let mut d = date.split('-').map(|n| n.parse::<i64>().ok());
+    let (y, m, day) = (d.next()??, d.next()??, d.next()??);
+    let mut t = clock.split(':');
+    let h = t.next()?.parse::<i64>().ok()?;
+    let min = t.next()?.parse::<i64>().ok()?;
+    let sec = t.next()?.split('.').next()?.parse::<i64>().ok()?;
+    if !(1..=12).contains(&m) || !(1..=31).contains(&day) || h > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+    let y0 = y - i64::from(m <= 2);
+    let era = if y0 >= 0 { y0 } else { y0 - 399 } / 400;
+    let yoe = y0 - era * 400;
+    let mp = m + if m > 2 { -3 } else { 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    let seconds = days
+        .checked_mul(86400)?
+        .checked_add(h * 3600 + min * 60 + sec)?;
+    (seconds >= 0).then(|| UNIX_EPOCH + Duration::from_secs(seconds as u64))
+}
+
 fn format_user_stamp(at: SystemTime) -> String {
     let secs = at.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     let mins = (secs / 60) % (24 * 60);
@@ -516,7 +550,10 @@ impl App {
             .map(|message| match message.role.as_str() {
                 "user" => Entry::User {
                     text: message.content,
-                    at: None,
+                    at: message
+                        .timestamp
+                        .as_deref()
+                        .and_then(parse_rfc3339_system_time),
                 },
                 "assistant" => Entry::Assistant(message.content),
                 _ => Entry::Note(format!("{}: {}", message.role, message.content)),
@@ -1122,9 +1159,9 @@ impl App {
                 wrap_styled_line(Line::from(spans), width)
             }
             Entry::Tools { tools, expanded } => {
-                // Collapsed (the default): one summary row so a busy turn
-                // stays readable. Expanded: a header plus one row per call,
-                // same visual language as a plain Tool entry.
+                // Collapsed (the default): one counted row (`bash ×2 · grep`)
+                // so a busy turn stays readable. Expanded: a header plus one
+                // row per call, same visual language as a plain Tool entry.
                 if tools.len() <= 1 || *expanded {
                     let mut out = wrap_styled_line(
                         Line::styled(format!("⚙ {} tool calls", tools.len()), self.theme.tool()),
@@ -1149,11 +1186,7 @@ impl App {
                     }
                     out
                 } else {
-                    let total_ms: u64 = tools.iter().filter_map(|(_, d)| *d).sum();
-                    let mut text = format!("⚙ {} tool calls", tools.len());
-                    if total_ms > 0 {
-                        text.push_str(&format!(" · {:.1}s", total_ms as f64 / 1000.0));
-                    }
+                    let text = collapsed_tool_group_text(tools, width);
                     wrap_styled_line(Line::styled(text, self.theme.note()), width)
                 }
             }
@@ -1516,14 +1549,10 @@ impl App {
                         })
                         .sum::<usize>()
                 } else {
-                    // The collapsed summary is one line; count it exactly like
-                    // the painter lays it out so the estimate never reports
-                    // fewer rows than the group paints.
-                    let total_ms: u64 = tools.iter().filter_map(|(_, d)| *d).sum();
-                    let mut text = format!("⚙ {} tool calls", tools.len());
-                    if total_ms > 0 {
-                        text.push_str(&format!(" · {:.1}s", total_ms as f64 / 1000.0));
-                    }
+                    // The collapsed summary is fitted to `width` (whole tokens
+                    // only). Count the same string the painter emits so the
+                    // estimate never reports fewer rows than the group paints.
+                    let text = collapsed_tool_group_text(tools, width);
                     estimated_wrapped_lines(&text, width)
                 }
             }
@@ -1533,6 +1562,27 @@ impl App {
     /// Live text is a real document block. Counting it as one row made
     /// follow/scroll math treat a multi-thousand-line stream as a single
     /// line, so every frame rematerialized the whole buffer.
+    fn enforce_transcript_memory_ceiling(&mut self) {
+        if self.entries.len() <= TRANSCRIPT_ENTRY_CEILING {
+            return;
+        }
+        let keep = TRANSCRIPT_TRIM_TARGET.min(self.entries.len());
+        let drop_n = self.entries.len().saturating_sub(keep);
+        self.entries.drain(..drop_n);
+        if !matches!(self.entries.first(), Some(Entry::Note(note)) if note == EARLIER_ENTRIES_NOTE)
+        {
+            self.entries
+                .insert(0, Entry::Note(EARLIER_ENTRIES_NOTE.into()));
+        }
+        self.transcript_cache.borrow_mut().clear();
+        self.height_cache.borrow_mut().clear();
+        if !self.follow {
+            self.scroll = self
+                .scroll
+                .saturating_sub(drop_n.min(u16::MAX as usize) as u16);
+        }
+    }
+
     fn estimated_live_lines(&self) -> usize {
         self.ensure_heights().1
     }
@@ -2408,7 +2458,10 @@ impl App {
             .map(|message| match message.role.as_str() {
                 "user" => Entry::User {
                     text: message.content,
-                    at: None,
+                    at: message
+                        .timestamp
+                        .as_deref()
+                        .and_then(parse_rfc3339_system_time),
                 },
                 "assistant" => Entry::Assistant(message.content),
                 _ => Entry::Note(format!("{}: {}", message.role, message.content)),
@@ -2687,6 +2740,140 @@ fn tool_label(name: &str) -> (String, String) {
         head
     };
     (verb, rest)
+}
+
+/// Collapsed tool-group counts in first-seen verb order: `bash ×2 · grep`.
+///
+/// A verb that appears once stays bare (`grep`, never `grep ×1`). The verb is
+/// the same first token `tool_label` already uses, so a shell chain still
+/// counts as `bash` rather than as its script.
+fn tool_group_counts(tools: &[(String, Option<u64>)]) -> Vec<(String, usize)> {
+    let mut counts = Vec::new();
+    for (name, _) in tools {
+        let verb = tool_label(name).0;
+        if verb.is_empty() {
+            continue;
+        }
+        if let Some((_, n)) = counts.iter_mut().find(|(v, _)| *v == verb) {
+            *n += 1;
+        } else {
+            counts.push((verb, 1));
+        }
+    }
+    counts
+}
+
+fn tool_group_item(verb: &str, count: usize, with_count: bool) -> String {
+    if with_count && count > 1 {
+        format!("{verb} ×{count}")
+    } else {
+        verb.to_string()
+    }
+}
+
+fn join_tool_group_items(items: &[(String, usize)], with_counts: bool) -> String {
+    items
+        .iter()
+        .map(|(verb, count)| tool_group_item(verb, *count, with_counts))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// Pack whole tokens from the left. If anything is omitted, the tail is `…`
+/// — never a mid-verb or mid-`×N` cut.
+fn pack_tool_group_items(
+    items: &[(String, usize)],
+    max: usize,
+    with_counts: bool,
+) -> Option<String> {
+    if max == 0 || items.is_empty() {
+        return None;
+    }
+    let mut included: Vec<String> = Vec::new();
+    for (i, (verb, count)) in items.iter().enumerate() {
+        let mut trial = included.clone();
+        trial.push(tool_group_item(verb, *count, with_counts));
+        let rest = i + 1 < items.len();
+        let text = if rest {
+            format!("{} · …", trial.join(" · "))
+        } else {
+            trial.join(" · ")
+        };
+        if text.width() <= max {
+            included = trial;
+        } else {
+            break;
+        }
+    }
+    if included.is_empty() {
+        return None;
+    }
+    if included.len() < items.len() {
+        Some(format!("{} · …", included.join(" · ")))
+    } else {
+        Some(included.join(" · "))
+    }
+}
+
+/// Ordered counts with no width budget: `bash ×2 · grep`.
+fn tool_group_summary(tools: &[(String, Option<u64>)]) -> String {
+    join_tool_group_items(&tool_group_counts(tools), true)
+}
+
+/// Same counts, fitted to `max` display columns without mid-token cuts.
+///
+/// Full counted form first; if that overruns, keep left-hand counts and
+/// drop the tail to `…` (`bash ×2 · grep · …`). If even one counted token
+/// plus the ellipsis is too wide, fall back to verbs only.
+fn tool_group_summary_for_width(tools: &[(String, Option<u64>)], max: usize) -> String {
+    let items = tool_group_counts(tools);
+    if items.is_empty() {
+        return String::new();
+    }
+    let counted = join_tool_group_items(&items, true);
+    if counted.width() <= max {
+        return counted;
+    }
+    if let Some(packed) = pack_tool_group_items(&items, max, true) {
+        return packed;
+    }
+    let verbs = join_tool_group_items(&items, false);
+    if verbs.width() <= max {
+        return verbs;
+    }
+    pack_tool_group_items(&items, max, false).unwrap_or_else(|| {
+        if "…".width() <= max {
+            "…".to_string()
+        } else {
+            String::new()
+        }
+    })
+}
+
+/// Collapsed group row: gear, width-fitted counts, optional total elapsed.
+///
+/// Timing stays when it fits beside a real summary. If the duration suffix
+/// would leave only an ellipsis, drop the clock so a verb can survive.
+fn collapsed_tool_group_text(tools: &[(String, Option<u64>)], width: usize) -> String {
+    let total_ms: u64 = tools.iter().filter_map(|(_, d)| *d).sum();
+    let prefix = "⚙ ";
+    let suffix = if total_ms > 0 {
+        format!(" · {:.1}s", total_ms as f64 / 1000.0)
+    } else {
+        String::new()
+    };
+    let prefix_w = prefix.width();
+    let budget = width.saturating_sub(prefix_w + suffix.width());
+    let summary = tool_group_summary_for_width(tools, budget);
+    if !summary.is_empty() && summary != "…" {
+        return format!("{prefix}{summary}{suffix}");
+    }
+    let summary = tool_group_summary_for_width(tools, width.saturating_sub(prefix_w));
+    if summary.is_empty() {
+        format!("{prefix}…")
+    } else {
+        format!("{prefix}{summary}")
+    }
 }
 
 /// Broad activity phase from Go `toolActivityState`, used on the live status bar.
@@ -3148,6 +3335,7 @@ const HELP_MAX_HEIGHT: u16 = 24;
 const HELP_ACTION_FLOOR: u16 = 18;
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
+    app.enforce_transcript_memory_ceiling();
     app.tick = frame.count() as u64;
     let area = frame.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
@@ -5001,6 +5189,7 @@ fn start_prompt(
 mod tests {
     use super::*;
     use crate::rpc::ModelInfo;
+    use crate::theme::ThemeName;
 
     fn usage(tokens: u64, window: Option<u64>, pct: Option<f64>) -> ContextUsage {
         ContextUsage {
@@ -5113,6 +5302,102 @@ mod tests {
         assert!(rest.is_empty());
     }
 
+    fn summary_tools(names: &[&str]) -> Vec<(String, Option<u64>)> {
+        names
+            .iter()
+            .map(|name| ((*name).to_string(), None))
+            .collect()
+    }
+
+    fn assert_summary_tokens(summary: &str, verbs: &[&str]) {
+        for part in summary.split(" · ") {
+            if part == "…" {
+                continue;
+            }
+            if let Some((verb, rest)) = part.split_once(" ×") {
+                assert!(
+                    verbs.iter().any(|v| *v == verb),
+                    "unknown verb {verb:?} in {summary:?}"
+                );
+                assert!(
+                    rest.chars().all(|c| c.is_ascii_digit()) && rest != "1" && !rest.is_empty(),
+                    "count must be a whole integer > 1, got {rest:?} in {summary:?}"
+                );
+            } else {
+                assert!(
+                    verbs.iter().any(|v| *v == part),
+                    "mid-token or unknown part {part:?} in {summary:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tool_group_summary_counts_by_tool_in_first_seen_order() {
+        let tools = summary_tools(&[
+            "bash cargo test",
+            "read src/app.rs",
+            "grep estimated_entry_lines",
+            "bash cargo clippy",
+            "read src/render.rs",
+        ]);
+        assert_eq!(tool_group_summary(&tools), "bash ×2 · read ×2 · grep");
+        assert!(tool_group_summary(&tools).contains('×'));
+    }
+
+    #[test]
+    fn tool_group_summary_single_tool_has_no_count() {
+        let tools = summary_tools(&["bash cargo test"]);
+        assert_eq!(tool_group_summary(&tools), "bash");
+        assert!(
+            !tool_group_summary(&tools).contains('×'),
+            "a lone verb must not grow a ×1"
+        );
+    }
+
+    #[test]
+    fn tool_group_summary_truncates_gracefully() {
+        let tools = summary_tools(&[
+            "bash cargo test",
+            "bash cargo clippy",
+            "grep flaky",
+            "read src/app.rs",
+            "read src/render.rs",
+        ]);
+        let full = tool_group_summary(&tools);
+        assert_eq!(full, "bash ×2 · grep · read ×2");
+
+        let verbs = ["bash", "grep", "read"];
+        for max in 0..=full.width() + 4 {
+            let fitted = tool_group_summary_for_width(&tools, max);
+            assert!(
+                fitted.width() <= max || fitted.is_empty(),
+                "overran {max}: {fitted:?} width {}",
+                fitted.width()
+            );
+            if !fitted.is_empty() {
+                assert_summary_tokens(&fitted, &verbs);
+            }
+            assert!(
+                !fitted.chars().any(|c| c == '×')
+                    || fitted.split(" · ").any(|p| p.contains(" ×")
+                        && p.split_once(" ×").is_some_and(|(v, n)| {
+                            verbs.contains(&v) && n.chars().all(|c| c.is_ascii_digit())
+                        })),
+                "× must stay attached to a count: {fitted:?}"
+            );
+            assert!(
+                !fitted.contains("bas ") && !fitted.ends_with("bas") && !fitted.contains("gre "),
+                "mid-token cut: {fitted:?}"
+            );
+        }
+
+        let hybrid = tool_group_summary_for_width(&tools, "bash ×2 · grep · …".width());
+        assert_eq!(hybrid, "bash ×2 · grep · …");
+        let verbs_only = tool_group_summary_for_width(&tools, "bash · …".width());
+        assert_eq!(verbs_only, "bash · …");
+    }
+
     #[test]
     fn activity_tool_labels_use_phase_verbs() {
         assert_eq!(activity_tool_label("grep"), "searching · grep");
@@ -5142,7 +5427,7 @@ mod tests {
         // The transcript window math must agree with what is painted, or the
         // overflow scrolls the user's own prompt off the top of the pane.
         let mut app = App::new(SessionInfo::default());
-        app.theme = Theme { colored: true };
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         app.entries.push(Entry::user("summarise the repo"));
         app.entries.push(Entry::Tool {
             name: "bash echo ----; cat AGENTS.md 2>/dev/null || cat CLAUDE.md 2>/dev/null; \
@@ -5167,7 +5452,7 @@ mod tests {
         // estimate is smaller than what `entry_lines` actually paints, the
         // window slides and earlier entries get scrolled away.
         let mut app = App::new(SessionInfo::default());
-        app.theme = Theme { colored: true };
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         app.last_view_w = 40;
         let entries = vec![
             Entry::user("a short prompt"),
@@ -5193,7 +5478,7 @@ mod tests {
     #[test]
     fn caret_tracks_wrapped_and_wide_text() {
         let mut app = App::new(SessionInfo::default());
-        app.theme = Theme { colored: true };
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         let inner = Rect {
             x: 1,
             y: 5,
@@ -5239,7 +5524,7 @@ mod tests {
         // fall back to the DIM attribute — otherwise modals float on top of
         // undimmed text and the layering is invisible.
         let mut app = App::new(SessionInfo::default());
-        app.theme = Theme { colored: false };
+        app.theme = Theme::plain(ThemeName::CatppuccinMocha);
         app.entries.push(Entry::user("hello there"));
         app.overlay = Overlay::help();
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -5265,7 +5550,11 @@ mod tests {
         // width the client claims to support may "allow" be reachable while
         // "deny" is off screen.
         for width in MIN_WIDTH..=120 {
-            let line = decision_line(Theme { colored: true }, width, Some("bash"));
+            let line = decision_line(
+                Theme::colored(ThemeName::CatppuccinMocha),
+                width,
+                Some("bash"),
+            );
             let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
             for key in [" y ", " a ", " n "] {
                 assert!(text.contains(key), "width {width} lost {key}: {text:?}");
@@ -5281,7 +5570,7 @@ mod tests {
     #[test]
     fn permission_modal_shows_all_decisions_when_narrow() {
         let mut app = App::new(SessionInfo::default());
-        app.theme = Theme { colored: true };
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         app.pending_perm = Some(PermissionRequest {
             id: "perm-1".into(),
             name: "bash".into(),
@@ -5334,7 +5623,7 @@ mod tests {
     #[test]
     fn overlays_leave_the_composer_and_status_bar_alone() {
         let mut app = App::new(SessionInfo::default());
-        app.theme = Theme { colored: true };
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         app.input.push_str("draft text");
         app.cursor = app.input.chars().count();
         app.overlay = Overlay::help();
@@ -5379,7 +5668,7 @@ mod tests {
             model: "gpt-5-mini".into(),
             wire: "openai-responses".into(),
         });
-        app.theme = Theme { colored: true };
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         app.effort = "medium".into();
         app.entries.push(Entry::user("hi"));
         app.live.push_str("hello");
@@ -5430,7 +5719,7 @@ mod tests {
     #[test]
     fn composer_sits_on_base_without_a_top_rule() {
         let mut app = App::new(SessionInfo::default());
-        app.theme = Theme { colored: true };
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         app.input.push_str("draft");
         app.cursor = app.input.chars().count();
         let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
@@ -5471,7 +5760,7 @@ mod tests {
     #[test]
     fn footer_has_its_own_top_rule_and_keeps_status_text() {
         let mut app = App::new(SessionInfo::default());
-        app.theme = Theme { colored: true };
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         app.input.push_str("draft");
         let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
@@ -5506,7 +5795,7 @@ mod tests {
     #[test]
     fn busy_clock_lives_on_the_status_bar() {
         let mut app = App::new(SessionInfo::default());
-        app.theme = Theme { colored: true };
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         app.busy = true;
         app.animate = false;
         app.activity_started = Some(Instant::now());
@@ -5561,7 +5850,7 @@ mod tests {
             model: "gpt-5-mini".into(),
             wire: "openai-responses".into(),
         });
-        app.theme = Theme { colored: true };
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         let mut terminal = Terminal::new(TestBackend::new(80, 14)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer();
@@ -5574,7 +5863,7 @@ mod tests {
     #[test]
     fn activity_line_styles_the_live_clock() {
         let mut app = App::new(SessionInfo::default());
-        app.theme = Theme { colored: true };
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         app.busy = true;
         app.animate = false;
         app.activity_started = Some(Instant::now());
@@ -5630,7 +5919,7 @@ mod tests {
             model: "gpt-5-mini".into(),
             wire: "openai-responses".into(),
         });
-        app.theme = Theme { colored: true };
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         app.input.push_str("draft");
         let mut terminal = Terminal::new(TestBackend::new(100, 14)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
@@ -5662,7 +5951,7 @@ mod tests {
     #[test]
     fn user_entry_is_a_filled_band() {
         let mut app = App::new(SessionInfo::default());
-        app.theme = Theme { colored: true };
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         app.entries.push(Entry::user("hi"));
         let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
@@ -5703,7 +5992,7 @@ mod tests {
     #[test]
     fn user_prompt_stamp_is_inline_when_recorded() {
         let mut app = App::new(SessionInfo::default());
-        app.theme = Theme { colored: true };
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         let at = UNIX_EPOCH + Duration::from_secs(4 * 3600 + 2 * 60);
         app.entries.push(Entry::User {
             text: "hello there".into(),
@@ -5729,6 +6018,7 @@ mod tests {
         let mut app = App::from_transcript(
             SessionInfo::default(),
             vec![TranscriptMessage {
+                timestamp: None,
                 role: "user".into(),
                 content: "old prompt".into(),
             }],
@@ -5740,7 +6030,7 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
-        app.theme = Theme { colored: true };
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         let out = render(&mut app, 80, 16);
         let row = out
             .lines()
@@ -5813,7 +6103,7 @@ mod tests {
             model: "gpt-5-mini".into(),
             wire: "openai-responses".into(),
         });
-        app.theme = Theme { colored: true };
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         app.effort = "medium".into();
 
         let line = app.header_line(120);
@@ -5890,7 +6180,7 @@ mod tests {
             model: "gpt-5-mini".into(),
             wire: "openai-responses".into(),
         });
-        app.theme = Theme { colored: true };
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         app.effort = "medium".into();
         app.usage.input_tokens = 41_500;
         app.usage.output_tokens = 3_200;
@@ -6046,7 +6336,7 @@ mod tests {
     #[test]
     fn welcome_banner_paints_and_clears_without_swallowing_a_key() {
         let mut app = App::new(SessionInfo::default());
-        app.theme = Theme { colored: true };
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         app.welcome = true;
         let out = render(&mut app, 60, 16);
         assert!(out.contains("type to begin"), "{out}");
@@ -6363,7 +6653,7 @@ mod tests {
     #[test]
     fn ctrl_j_grows_the_input_area() {
         let mut app = App::new(SessionInfo::default());
-        app.theme = Theme { colored: true };
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         assert_eq!(input_height(&app, 56), 1);
         app.input.push_str("one");
         app.input.push('\n');
@@ -6763,7 +7053,7 @@ mod tests {
     #[test]
     fn fenced_diff_in_prose_is_not_one_card() {
         let mut app = App::new(SessionInfo::default());
-        app.theme = Theme { colored: true };
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         app.entries.push(Entry::Assistant(
             "Edited `cfg.go`:\n\n```diff\n--- a/cfg.go\n+++ b/cfg.go\n@@ -1 +1 @@\n-old\n+new\n```\n\nThe client now waits a minute.".into(),
         ));
@@ -6785,7 +7075,7 @@ mod tests {
     #[test]
     fn pathless_hunk_is_titled_hunk_not_diff() {
         let mut app = App::new(SessionInfo::default());
-        app.theme = Theme { colored: true };
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         app.entries.push(Entry::Assistant(
             "Edited `cfg.go`:\n\n```diff\n@@ -1 +1 @@\n-old\n+new\n```\n".into(),
         ));
@@ -6798,7 +7088,7 @@ mod tests {
     #[test]
     fn add_band_cells_use_add_background() {
         let mut app = App::new(SessionInfo::default());
-        app.theme = Theme { colored: true };
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         app.entries.push(Entry::Assistant(
             "--- a/x.go\n+++ b/x.go\n@@ -1 +1 @@\n-old\n+new".into(),
         ));
@@ -6991,38 +7281,52 @@ mod tests {
             .filter(|e| matches!(e, Entry::Tools { .. }))
             .count();
         assert_eq!(groups, 1, "group committed exactly once");
+        let Entry::Tools { tools, .. } = &app.entries[0] else {
+            panic!("expected a tool group, got {:?}", app.entries[0]);
+        };
+        assert_eq!(tool_group_summary(tools), "read · grep · bash");
     }
 
     #[test]
     fn tool_group_collapsed_paints_one_row_expanded_paints_all() {
         let mut app = App::new(SessionInfo::default());
-        app.theme = Theme { colored: true };
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         app.entries.push(Entry::user("run the suite"));
         app.entries.push(Entry::Tools {
             tools: vec![
-                ("read src/app.rs".into(), Some(120)),
-                ("grep estimated_entry_lines".into(), Some(40)),
                 ("bash cargo test".into(), Some(940)),
+                ("grep estimated_entry_lines".into(), Some(40)),
+                ("bash cargo clippy".into(), Some(510)),
             ],
             expanded: false,
         });
         let out = render(&mut app, 80, 20);
-        let collapsed_rows: Vec<&str> =
-            out.lines().filter(|l| l.contains("3 tool calls")).collect();
+        let collapsed_rows: Vec<&str> = out.lines().filter(|l| l.contains("bash ×2")).collect();
         assert_eq!(collapsed_rows.len(), 1, "collapsed group is one row");
+        assert!(
+            collapsed_rows[0].contains("bash ×2 · grep"),
+            "compact counts: {}",
+            collapsed_rows[0]
+        );
+        assert!(!out.contains("3 tool calls"), "{out}");
         assert!(!out.contains("grep estimated_entry_lines"), "{out}");
 
         assert!(app.toggle_tool_group(), "helper expands the group");
         let out = render(&mut app, 80, 20);
         assert!(out.contains("grep estimated_entry_lines"), "{out}");
+        assert!(
+            out.contains("3 tool calls"),
+            "expanded header keeps the count"
+        );
         let tool_rows = out
             .lines()
-            .filter(|l| l.contains("read src/app.rs") || l.contains("bash cargo test"))
+            .filter(|l| l.contains("bash cargo test") || l.contains("bash cargo clippy"))
             .count();
         assert_eq!(tool_rows, 2, "expanded group paints every call");
 
         assert!(app.toggle_tool_group(), "helper collapses again");
         let out = render(&mut app, 80, 20);
+        assert!(out.contains("bash ×2"), "{out}");
         assert!(!out.contains("grep estimated_entry_lines"), "{out}");
     }
 
@@ -7056,7 +7360,7 @@ mod tests {
 
     fn long_scroll_app() -> App {
         let mut app = App::new(SessionInfo::default());
-        app.theme = Theme { colored: false };
+        app.theme = Theme::plain(ThemeName::CatppuccinMocha);
         app.welcome = false;
         for i in 0..40 {
             app.entries.push(Entry::user(format!("user-line-{i}")));
@@ -7270,8 +7574,7 @@ mod tests {
         // The scrollbar extent derives from the estimate; a collapsed group
         // must claim exactly the row it paints, an expanded group header+rows.
         let mut app = App::new(SessionInfo::default());
-        app.theme = Theme { colored: true };
-        app.last_view_w = 40;
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         let collapsed = Entry::Tools {
             tools: vec![
                 (
@@ -7280,6 +7583,7 @@ mod tests {
                 ),
                 ("write docs/roadmap.md".into(), Some(60)),
                 ("read src/render.rs".into(), Some(30)),
+                ("bash cargo test".into(), Some(940)),
             ],
             expanded: false,
         };
@@ -7287,12 +7591,36 @@ mod tests {
         if let Entry::Tools { expanded: e, .. } = &mut expanded {
             *e = true;
         }
-        for entry in [collapsed, expanded] {
-            let painted = app.entry_lines(&entry).len();
-            let estimated = app.estimated_entry_lines(&entry) - 1; // minus separator
+        for width in [20u16, 32, 40, 60, 80] {
+            app.last_view_w = width;
+            let painted = app.entry_lines(&collapsed).len();
+            let estimated = app.estimated_entry_lines(&collapsed) - 1; // minus separator
+            assert_eq!(
+                estimated, painted,
+                "collapsed w={width}: estimated {estimated}, painted {painted}"
+            );
+            let text: String = app.entry_lines(&collapsed)[0]
+                .spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect();
+            let body = text.strip_prefix("⚙ ").unwrap_or(&text);
+            let summary = match body.rsplit_once(" · ") {
+                Some((head, tail))
+                    if tail.ends_with('s') && tail.trim_end_matches('s').parse::<f64>().is_ok() =>
+                {
+                    head
+                }
+                _ => body,
+            };
+            assert_summary_tokens(summary, &["bash", "write", "read"]);
+            assert!(painted >= 1, "collapsed group must paint the summary row");
+
+            let painted = app.entry_lines(&expanded).len();
+            let estimated = app.estimated_entry_lines(&expanded) - 1;
             assert!(
                 estimated >= painted,
-                "under-estimated {entry:?}: estimated {estimated}, painted {painted}"
+                "expanded w={width}: estimated {estimated}, painted {painted}"
             );
         }
     }
@@ -7339,7 +7667,7 @@ mod tests {
                 .any(|line| line.spans.len() > 1)
         );
         assert!(crate::render::is_unified_diff("@@ -1 +1 @@\n+foo\n-bar"));
-        app.theme = Theme { colored: false };
+        app.theme = Theme::plain(ThemeName::CatppuccinMocha);
         let _ = app.transcript_lines();
     }
 
@@ -7363,14 +7691,17 @@ mod tests {
             SessionInfo::default(),
             vec![
                 TranscriptMessage {
+                    timestamp: None,
                     role: "user".into(),
                     content: "hi".into(),
                 },
                 TranscriptMessage {
+                    timestamp: None,
                     role: "assistant".into(),
                     content: "hello".into(),
                 },
                 TranscriptMessage {
+                    timestamp: None,
                     role: "tool".into(),
                     content: "grep".into(),
                 },
@@ -7502,6 +7833,7 @@ mod tests {
         app.entries.push(Entry::Assistant("old answer".into()));
         app.rewind_user = Some("old prompt".into());
         app.load_transcript(vec![TranscriptMessage {
+            timestamp: None,
             role: "user".into(),
             content: "earlier".into(),
         }]);
@@ -7614,7 +7946,7 @@ mod tests {
 
     fn large_session_with_buried_answer() -> App {
         let mut app = App::new(SessionInfo::default());
-        app.theme = Theme { colored: true };
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         app.animate = false;
         app.last_view_w = 80;
         app.last_view_h = 24;
@@ -7771,6 +8103,22 @@ mod tests {
     }
 
     #[test]
+    fn transcript_memory_ceiling_keeps_recent_entries_and_reload_hint() {
+        let mut app = App::new(SessionInfo::default());
+        for i in 0..(TRANSCRIPT_ENTRY_CEILING + 200) {
+            app.entries.push(Entry::Assistant(format!("answer {i}")));
+        }
+        app.enforce_transcript_memory_ceiling();
+        assert!(app.entries.len() <= TRANSCRIPT_TRIM_TARGET + 1);
+        assert!(
+            matches!(app.entries.first(), Some(Entry::Note(note)) if note == EARLIER_ENTRIES_NOTE)
+        );
+        assert!(
+            matches!(app.entries.last(), Some(Entry::Assistant(text)) if text == &format!("answer {}", TRANSCRIPT_ENTRY_CEILING + 199))
+        );
+    }
+
+    #[test]
     fn large_entry_index_jumps_to_scrolled_window() {
         let mut app = App::new(SessionInfo::default());
         app.last_view_w = 80;
@@ -7822,7 +8170,7 @@ mod tests {
         use std::time::Instant;
 
         let mut app = App::new(SessionInfo::default());
-        app.theme = Theme { colored: true };
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         app.animate = false;
         app.last_view_w = 80;
         app.last_view_h = 24;
@@ -7895,7 +8243,7 @@ mod tests {
         use std::time::Instant;
 
         let mut app = App::new(SessionInfo::default());
-        app.theme = Theme { colored: true };
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         app.animate = false;
         app.last_view_w = 80;
         app.last_view_h = 24;

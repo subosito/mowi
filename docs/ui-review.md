@@ -11,8 +11,8 @@ NO_COLOR=1 cargo run -- snapshot --scene help      # monochrome frame
 ```
 
 Scenes live in `src/snapshot.rs`: `chat`, `busy`, `diff`, `welcome`, `help`,
-`permission`, `tools`, `narrow`. Add one whenever a state is hard to reach by
-hand.
+`permission`, `tools`, `toolgroup`, `narrow`. Add one whenever a state is
+hard to reach by hand.
 
 The tool honours `NO_COLOR` through the same `Theme::detect()` the client
 uses, so the monochrome frame it prints is the frame users get.
@@ -127,11 +127,14 @@ accumulate in `live_tools` while the loop runs (the status bar owns the
 live "tool · name" readout); `run.end` (or the turn's end, whichever comes
 first — commit is idempotent) folds them into one `Entry::Tools`. A single
 call stays the plain one-row entry it always was; two or more collapse to
-`⚙ N tool calls · total`. Esc collapses an expanded group. A plain `t` always
-types into the composer — it is never a tool-group shortcut. The estimate
-counts the collapsed line exactly as painted and, when expanded, header +
-every call, so the scrollbar extent never drifts. Pinned by
-`tools_estimate_matches_painted_height` and the `tools` snapshot scene.
+`⚙ bash ×2 · grep · total`. The counts follow first-seen verb order from
+`tool_label` and drop to `bash ×2 · grep · …` then verbs-only when the pane
+is too narrow — never a mid-token cut. Esc collapses an expanded group. A
+plain `t` always types into the composer — it is never a tool-group
+shortcut. The estimate counts the collapsed line exactly as painted and,
+when expanded, header + every call, so the scrollbar extent never drifts.
+Pinned by `tool_group_summary_*`, `tools_estimate_matches_painted_height`,
+and the `tools` / `toolgroup` snapshot scenes.
 
 ## Colour
 

@@ -767,6 +767,7 @@ mod tests {
     use super::{
         Line, Segment, Theme, diff_lines, is_unified_diff, markdown_lines, split_markdown_and_diffs,
     };
+    use crate::theme::ThemeName;
     use ratatui::style::Modifier;
 
     #[test]
@@ -865,7 +866,7 @@ mod tests {
 
     #[test]
     fn empty_source_lines_inside_a_hunk_are_not_painted() {
-        let theme = Theme { colored: true };
+        let theme = Theme::colored(ThemeName::CatppuccinMocha);
         let lines = diff_lines("@@ -1 +1 @@\n\n-old\n+new", theme, 20);
         assert_eq!(
             lines.len(),
@@ -888,7 +889,7 @@ mod tests {
     // ---- markdown ------------------------------------------------------
 
     fn md(text: &str) -> Vec<Line<'static>> {
-        markdown_lines(text, Theme { colored: true })
+        markdown_lines(text, Theme::colored(ThemeName::CatppuccinMocha))
     }
 
     fn md_text(text: &str) -> Vec<String> {
@@ -1025,7 +1026,7 @@ mod tests {
 
     #[test]
     fn add_and_del_rows_are_padded_into_full_width_bands() {
-        let theme = Theme { colored: true };
+        let theme = Theme::colored(ThemeName::CatppuccinMocha);
         let lines = diff_lines("@@ -1 +1 @@\n-old\n+new", theme, 20);
         // hunk header, del band, add band
         assert_eq!(lines.len(), 3);
@@ -1044,7 +1045,7 @@ mod tests {
 
     #[test]
     fn tab_indented_rows_expand_and_stay_within_width() {
-        let theme = Theme { colored: true };
+        let theme = Theme::colored(ThemeName::CatppuccinMocha);
         let lines = diff_lines("@@ -1 +1 @@\n-\ttimeout := 30\n+\ttimeout := 60", theme, 24);
         assert_eq!(lines.len(), 3);
         for row in &lines[1..] {
@@ -1077,7 +1078,7 @@ mod tests {
 
     #[test]
     fn context_rows_are_not_padded_or_washed() {
-        let theme = Theme { colored: true };
+        let theme = Theme::colored(ThemeName::CatppuccinMocha);
         let lines = diff_lines("@@ -1 +1 @@\n unchanged", theme, 30);
         assert_eq!(plain(&lines[1]), " unchanged");
         assert_eq!(lines[1].spans[0].style.bg, None);
@@ -1085,7 +1086,7 @@ mod tests {
 
     #[test]
     fn hunk_and_file_headers_are_meta_not_add_or_del() {
-        let theme = Theme { colored: true };
+        let theme = Theme::colored(ThemeName::CatppuccinMocha);
         let lines = diff_lines("--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n+added", theme, 40);
         for row in &lines[..3] {
             assert_eq!(row.spans[0].style, theme.diff_meta(), "{:?}", plain(row));
@@ -1097,7 +1098,7 @@ mod tests {
 
     #[test]
     fn signs_use_minus_and_survive_no_color() {
-        let theme = Theme { colored: false };
+        let theme = Theme::plain(ThemeName::CatppuccinMocha);
         let lines = diff_lines("@@ -1 +1 @@\n-old\n+new", theme, 12);
         assert!(plain(&lines[1]).starts_with('−'), "want U+2212 minus");
         assert!(plain(&lines[2]).starts_with('+'));
@@ -1107,7 +1108,7 @@ mod tests {
 
     #[test]
     fn paired_edit_inverts_only_the_changed_span() {
-        let theme = Theme { colored: true };
+        let theme = Theme::colored(ThemeName::CatppuccinMocha);
         let lines = diff_lines("@@ -1 +1 @@\n-let x = 1;\n+let x = 2;", theme, 40);
         let del: Vec<&str> = lines[1]
             .spans
@@ -1127,7 +1128,7 @@ mod tests {
 
     #[test]
     fn unrelated_rewrite_stays_a_plain_band() {
-        let theme = Theme { colored: true };
+        let theme = Theme::colored(ThemeName::CatppuccinMocha);
         let lines = diff_lines("@@ -1 +1 @@\n-alpha\n+omega", theme, 20);
         assert!(
             !lines[1]
