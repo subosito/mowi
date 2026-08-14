@@ -89,11 +89,11 @@ pub const SPINNER_STATIC: &str = "●";
 pub const TYPING: [&str; 4] = ["·  ", "·· ", "···", " ··"];
 
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // md_* roles are consumed as render.rs markdown lands
 pub struct Theme {
     pub colored: bool,
 }
 
+#[allow(dead_code)] // semantic roles are staged ahead of their UI consumers
 impl Theme {
     pub fn detect() -> Self {
         Self {
@@ -141,7 +141,7 @@ impl Theme {
         self.bg(mocha::CRUST)
     }
 
-    /// Raised chrome: user bands, input (`surface0`).
+    /// Raised chrome: user bands (`surface0`).
     pub fn surface(self) -> Style {
         self.bg(mocha::SURFACE0)
     }
@@ -246,7 +246,7 @@ impl Theme {
         }
     }
 
-    /// Border of the focused surface (input, active overlay).
+    /// Border of the focused surface (active overlay).
     pub fn chrome_focus(self) -> Style {
         if self.colored {
             Style::default().fg(mocha::LAVENDER)

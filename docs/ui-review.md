@@ -31,27 +31,51 @@ that it shows a "terminal too small" card instead of a broken one.
 
 ## Layout rules the frame is built on
 
-**Header — safety outranks vanity.** Capability (`read-only` / `write+shell`)
-and ask/auto never drop. Everything else is peeled off the front of
-`vanity_chips` as columns run out, ordered by what you can most afford to
-lose: tokens → session id → workspace → effort → model. The context gauge is
-suppressed below `GAUGE_MIN_COLS` entirely — knowing *which* model you are
-talking to outranks knowing how full its window is.
+**Header — identity left, usage right, safety never drops.** The left cluster
+is only `mowi`, the workspace *basename*, and `model (effort)` with the
+effort word dimmed. Token count and the context gauge sit right-aligned
+against the capability / ask chips and peel first (tokens, then gauge) so a
+tight row keeps identity. The gauge is not offered below `GAUGE_MIN_COLS`.
+Session id is never a header chip. The painted row has a one-column inset on
+each side so it shares a vertical rhythm with the composer and footer.
 
 **One live clock.** The activity band above the composer owns the spinner,
-elapsed time and typing pulse. The footer carries only `busy` / `idle`. Two
-clocks tick out of step and both stop being believed.
+elapsed time and typing pulse, each painted in its own role (`spinner` /
+`timing` / verb / `typing`) so the row has hierarchy instead of reading as
+one muted sentence. The footer names the state (`idle`, or the current verb
+while a turn runs) and never repeats the clock. Its enter hint says `queue`
+while a turn is running. Two clocks tick out of step and both stop being
+believed.
 
 **The footer is a status bar.** State flushed left, key hints flushed right,
 hints degrade through progressively shorter variants and drop before the
 state does. `ctx%` appears only past `CTX_FOOTER_PCT` — a number that is
-always on screen stops being read.
+always on screen stops being read. The full session id sits with the state
+when status and the minimum `?` hint still fit; long hints degrade around
+it. It is hidden only when those two cannot take ` · <id>`. The bar owns a
+two-row region: a top hairline plus the status text, so the rule never
+eats the line.
+
+**Bottom chrome is one hairline.** The composer sits on the document ground
+with a horizontal inset and no box. The status line is a separate sunk bar
+with its own top rule. Activity stays a one-line transient band immediately
+above the composer; it is not folded into the status line.
+
+**Scroll and recall are different keys.** PgUp/PgDn move the transcript and
+never rewrite the composer. Arrow-up recalls the last user prompt only when
+the input is empty; it does not scroll. `t` always types. `ctrl+u` / `ctrl+d`
+are unbound.
 
 **Modals sit on the document.** Overlays are drawn into the transcript
 region, never the full frame, so the composer and status bar stay usable
 underneath. `draw_scrim` dims what is behind them (DIM attribute under
 NO_COLOR), but never the header chips or the footer decision bar — those are
-what the operator reads to decide.
+what the operator reads to decide. The welcome card degrades by height so
+access and `type to begin` survive at `MIN_WIDTH`×`MIN_HEIGHT`; the help
+table sizes its key column to the keys so actions are not sheared at a
+normal 80-wide frame. The permission card uses the same overlay ground as
+the other modals — urgency lives in the warn border and the decision keys,
+not a second fill.
 
 **Consent is the highest-stakes surface.** `decision_line` guarantees all
 three of y/a/n survive at every supported width: labels degrade
@@ -86,10 +110,10 @@ accumulate in `live_tools` while the loop runs (the activity band owns the
 live "tool · name" readout); `run.end` (or the turn's end, whichever comes
 first — commit is idempotent) folds them into one `Entry::Tools`. A single
 call stays the plain one-row entry it always was; two or more collapse to
-`⚙ N tool calls · total`, and `t` on empty input expands them into a header
-plus one row per call (Esc collapses again). The estimate counts the
-collapsed line exactly as painted and, when expanded, header + every call, so
-the scrollbar extent never drifts. Pinned by
+`⚙ N tool calls · total`. Esc collapses an expanded group. A plain `t` always
+types into the composer — it is never a tool-group shortcut. The estimate
+counts the collapsed line exactly as painted and, when expanded, header +
+every call, so the scrollbar extent never drifts. Pinned by
 `tools_estimate_matches_painted_height` and the `tools` snapshot scene.
 
 ## Colour

@@ -7,11 +7,11 @@ operator experience**, not a subset that forgets permissions or resume.
 
 | Region | Behavior |
 |---|---|
-| Header | Workspace, model, session, safety chips (write/shell, ask/auto). Narrow terminals drop vanity first; safety never drops. Token chip = host + peer (`⇄`). |
-| Transcript | User blocks (soft fill), assistant markdown, one compact tool line per call — a turn's calls collapse into a single `⚙ N tool calls` row (`t` on empty input expands, Esc collapses). Edits = inline review cards (−/+). |
+| Header | Left: `mowi`, workspace basename, `model (effort)`. Right: token chip / context gauge when they fit, then safety chips (write/shell, ask/auto). Usage peels before identity; safety never drops. Full session id lives on the status bar when status and the minimum `?` hint fit; long hints degrade around it. |
+| Transcript | User blocks (soft fill), assistant markdown, one compact tool line per call — a turn's calls collapse into a single `⚙ N tool calls` row (Esc collapses an expanded group). Edits = inline review cards (−/+). |
 | Activity band | Only while busy: spinner, verb (“searching · grep · loop.go”), elapsed. |
-| Input | Enter sends; busy queues. `/steer` redirects the running turn. |
-| Welcome | Splash, dismisses on any key. |
+| Input | Sits on the document ground with a horizontal inset and no box. Enter sends; busy queues. `/steer` redirects the running turn. |
+| Welcome | Splash, dismisses on any key. Short panes drop the tagline/effort first so access and `type to begin` still fit. |
 | Min size | 40×10; below that a size warning, not a broken frame. |
 
 ## Input & keys (defaults)
@@ -20,18 +20,17 @@ operator experience**, not a subset that forgets permissions or resume.
 |---|---|
 | Enter | send (queue if busy) |
 | ctrl+j | newline (input grows 1–10 rows) |
-| ctrl+u / ctrl+d | scroll transcript |
-| pgup / pgdn | scroll transcript (larger steps) |
+| pgup / pgdn | scroll transcript (never rewrites the prompt) |
 | Esc | dismiss overlay, else collapse tool calls, else cancel turn, else ignore |
 | ctrl+l | clear transcript (UI-local; Engine history remains) |
 | shift+tab | ask ↔ auto (`perm.set`) |
 | ctrl+p | expand the last peer buffer in an overlay |
 | ctrl+/ or `?` on empty | help overlay (local keys + `slash.list`) |
 | ctrl+c | quit (cancel first if busy) |
-| Arrow-up on empty | edit last prompt |
+| Arrow-up on empty | edit last prompt (does not scroll) |
 | home / end | cursor to start / end of input |
+| left / right | move cursor |
 | delete | delete forward |
-| `t` on empty | expand / collapse the last tool group |
 | paste | bracketed paste at the cursor, multi-line safe |
 | any key | dismiss the welcome splash |
 
@@ -117,14 +116,16 @@ when the rows share enough affix to make a word-level edit meaningful.
 Follow-bottom until the user scrolls up; rebuild visible window on scroll
 (Go bug: placeholders stayed blank). Do not GC unreadied seed.
 
-ctrl+u is **scroll**, not kill-to-start-of-line.
+Transcript scroll is **PgUp / PgDn** only. Those keys never recall or rewrite
+the composer. Arrow-up on empty input is the only history-recall binding.
+`ctrl+u` / `ctrl+d` are unbound (they do not scroll and they do not type).
 
 ## Theme / a11y
 
 - Default theme name: catppuccin-mocha (chroma-compatible idea)
 - `NO_COLOR=1` — glyphs still distinct (◇ ⚙ ✕ ▲)
 - `MOW_NO_ANIM=1` — still spinner; elapsed still ticks
-- Native terminal selection/copy (no mouse capture; scroll with ctrl+u/d)
+- Native terminal selection/copy (no mouse capture; scroll with pgup/pgdn)
 - Not screen-reader complete; keyboard-complete is required
 
 ## Config (Go: `extensions.tui`)

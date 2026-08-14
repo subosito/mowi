@@ -17,8 +17,8 @@ use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{
-        Block, BorderType, Cell, Clear, List, ListItem, ListState, Padding, Paragraph, Row,
-        Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap,
+        Block, BorderType, Borders, Cell, Clear, List, ListItem, ListState, Padding, Paragraph,
+        Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table, TableState, Wrap,
     },
 };
 use serde_json::Value;
@@ -73,8 +73,8 @@ pub enum Entry {
         duration_ms: Option<u64>,
     },
     /// One turn's worth of tool calls, collapsed to a single summary line
-    /// unless expanded (`t` on empty input). A long agent turn that runs
-    /// `bash`/`write`/`read` a dozen times is one row, not a flood.
+    /// unless expanded. A long agent turn that runs `bash`/`write`/`read` a
+    /// dozen times is one row, not a flood. Esc collapses an expanded group.
     Tools {
         tools: Vec<(String, Option<u64>)>,
         expanded: bool,
@@ -212,6 +212,23 @@ fn step_table(state: &mut TableState, len: usize, delta: i32) {
     let cur = state.selected().unwrap_or(0).min(len - 1) as i32;
     let next = (cur + delta).clamp(0, (len as i32) - 1) as usize;
     state.select(Some(next));
+}
+
+/// Left-side identity chips, least important first so the drop loop peels
+/// from the front. Session id is never a header chip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IdentityChip {
+    Workspace(String),
+    Effort(String),
+    Model(String),
+}
+
+/// Right-aligned usage chips, least important first. Safety sits past these
+/// and never drops.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum MetricChip {
+    Tokens(String),
+    Gauge(String),
 }
 
 /// UI state. `draw` is pure over this struct so `TestBackend` can assert on it.
@@ -482,89 +499,152 @@ impl App {
         }
     }
 
-    /// Vanity chips in **drop order**: least important first.
+    /// Left-side identity in **drop order**: least important first.
     ///
-    /// The drop loop peels from the front, so this list is ordered by what a
-    /// developer can most afford to lose. Token usage and the session id are
-    /// trivia; the model is identity — "which brain am I talking to" is the
-    /// last thing to go, because answering it wrong is how you ship a patch
-    /// written by the wrong model.
-    ///
-    /// `width` also decides whether the context gauge is offered at all: below
-    /// `GAUGE_MIN_COLS` it is suppressed up front, so the remaining columns go
-    /// to identity rather than a meter.
-    fn vanity_chips(&self, width: u16) -> Vec<String> {
+    /// Workspace is the directory name, not the full path. Effort rides with
+    /// the model visually (`model (effort)`) but still peels first. The model
+    /// is last — "which brain am I talking to" is the last identity to go.
+    fn identity_chips(&self) -> Vec<IdentityChip> {
         let mut chips = Vec::new();
-        if self.usage.total() > 0 || self.usage.peer_tokens > 0 {
-            chips.push(self.usage.chip());
-        }
-        let short = self.session.short_id();
-        if !short.is_empty() {
-            chips.push(short);
-        }
-        if !self.session.workspace.is_empty() {
-            chips.push(self.session.workspace.clone());
+        let workspace = workspace_basename(&self.session.workspace);
+        if !workspace.is_empty() {
+            chips.push(IdentityChip::Workspace(workspace));
         }
         if !self.effort.is_empty() {
-            chips.push(self.effort.clone());
+            chips.push(IdentityChip::Effort(self.effort.clone()));
         }
         if !self.session.model.is_empty() {
-            chips.push(self.session.model.clone());
-        }
-        // Context pressure sits closest to the safety chips: it is the last
-        // vanity chip to drop, because it is the one that predicts trouble.
-        if width >= GAUGE_MIN_COLS
-            && let Some(ctx) = self.context_chip()
-        {
-            chips.push(ctx);
+            chips.push(IdentityChip::Model(self.session.model.clone()));
         }
         chips
     }
 
-    /// Header as spans. Safety chips (capability, ask/auto) never drop; vanity
-    /// chips fall off left-to-right until the row fits `width`.
+    /// Right-side usage chips in **drop order**: tokens first, then the gauge.
+    ///
+    /// Below `GAUGE_MIN_COLS` the meter is not offered at all, so leftover
+    /// columns go to identity and safety rather than a bar.
+    fn metric_chips(&self, width: u16) -> Vec<MetricChip> {
+        let mut chips = Vec::new();
+        if self.usage.total() > 0 || self.usage.peer_tokens > 0 {
+            chips.push(MetricChip::Tokens(self.usage.chip()));
+        }
+        if width >= GAUGE_MIN_COLS
+            && let Some(ctx) = self.context_chip()
+        {
+            chips.push(MetricChip::Gauge(ctx));
+        }
+        chips
+    }
+
+    /// Identity side of the header: `mowi · basename · model (effort)`.
+    /// Only the effort word is dimmed; the parentheses keep the header style.
+    fn header_identity_spans(&self, identity: &[IdentityChip]) -> Vec<Span<'static>> {
+        let header = self.theme.header();
+        let fold_effort = identity
+            .iter()
+            .any(|chip| matches!(chip, IdentityChip::Effort(_)))
+            && identity
+                .iter()
+                .any(|chip| matches!(chip, IdentityChip::Model(_)));
+        let effort = identity.iter().find_map(|chip| match chip {
+            IdentityChip::Effort(text) => Some(text.as_str()),
+            _ => None,
+        });
+
+        let mut groups: Vec<Vec<Span<'static>>> = vec![vec![Span::styled("mowi", header)]];
+        for chip in identity {
+            match chip {
+                IdentityChip::Effort(_) if fold_effort => {}
+                IdentityChip::Model(name) if fold_effort => {
+                    groups.push(vec![
+                        Span::styled(name.clone(), header),
+                        Span::styled(" (", header),
+                        Span::styled(
+                            effort.unwrap_or_default().to_string(),
+                            self.theme.note().patch(self.theme.header_bg()),
+                        ),
+                        Span::styled(")", header),
+                    ]);
+                }
+                IdentityChip::Workspace(text)
+                | IdentityChip::Effort(text)
+                | IdentityChip::Model(text) => {
+                    groups.push(vec![Span::styled(text.clone(), header)]);
+                }
+            }
+        }
+
+        let mut spans = Vec::new();
+        for (i, group) in groups.into_iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" · ", header));
+            }
+            spans.extend(group);
+        }
+        spans
+    }
+
+    fn header_metric_spans(&self, metrics: &[MetricChip]) -> Vec<Span<'static>> {
+        let mut groups: Vec<Vec<Span<'static>>> = Vec::new();
+        for chip in metrics {
+            match chip {
+                MetricChip::Tokens(text) => groups.push(vec![Span::styled(
+                    text.clone(),
+                    self.theme.note().patch(self.theme.header_bg()),
+                )]),
+                MetricChip::Gauge(text) => groups.push(vec![Span::styled(
+                    text.clone(),
+                    self.theme
+                        .badge(self.context_tone())
+                        .patch(self.theme.header_bg()),
+                )]),
+            }
+        }
+        let mut spans = Vec::new();
+        for (i, group) in groups.into_iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled(" · ", self.theme.header()));
+            }
+            spans.extend(group);
+        }
+        spans
+    }
+
+    /// Header as spans. Left is identity only. Usage/gauge sit right-aligned
+    /// against the safety chips and drop before identity does. Safety never
+    /// drops. Session id is not painted here.
     pub fn header_line(&self, width: u16) -> Line<'static> {
         let safety = format!("{} · {}", self.capability_chip(), self.mode_chip());
-        let mut vanity = self.vanity_chips(width);
+        let mut identity = self.identity_chips();
+        let mut metrics = self.metric_chips(width);
         let width = width as usize;
-        // The context meter is styled by pressure, not by the vanity style.
-        let ctx_chip = self.context_chip();
+        let safety_w = Span::raw(safety.as_str()).width();
         loop {
-            let left = if vanity.is_empty() {
-                "mowi".to_string()
-            } else {
-                format!("mowi · {}", vanity.join(" · "))
-            };
-            let left_w = Span::raw(left.as_str()).width();
-            let safety_w = Span::raw(safety.as_str()).width();
-            if left_w + safety_w < width || vanity.is_empty() {
-                let pad = width.saturating_sub(left_w + safety_w);
-                // Split the meter off the tail so it can carry its own tone.
-                let ctx_tail = ctx_chip
-                    .as_ref()
-                    .filter(|chip| left.ends_with(chip.as_str()))
-                    .map(|chip| left.len() - chip.len());
-                let mut spans = Vec::new();
-                match ctx_tail {
-                    Some(at) => {
-                        spans.push(Span::styled(left[..at].to_string(), self.theme.header()));
-                        spans.push(Span::styled(
-                            left[at..].to_string(),
-                            self.theme
-                                .badge(self.context_tone())
-                                .patch(self.theme.header_bg()),
-                        ));
-                    }
-                    None => spans.push(Span::styled(left, self.theme.header())),
-                }
+            let left = self.header_identity_spans(&identity);
+            let metric_spans = self.header_metric_spans(&metrics);
+            let left_w: usize = left.iter().map(Span::width).sum();
+            let metric_w: usize = metric_spans.iter().map(Span::width).sum();
+            let gap = if metric_w > 0 { 2 } else { 0 };
+            let right_w = metric_w + gap + safety_w;
+            if left_w + right_w <= width || (identity.is_empty() && metrics.is_empty()) {
+                let pad = width.saturating_sub(left_w + right_w);
+                let mut spans = left;
                 spans.push(Span::styled(" ".repeat(pad), self.theme.header_bg()));
+                spans.extend(metric_spans);
+                if gap > 0 {
+                    spans.push(Span::styled("  ", self.theme.header_bg()));
+                }
                 spans.push(Span::styled(
                     safety,
                     self.theme.chip().patch(self.theme.header_bg()),
                 ));
                 return Line::from(spans);
             }
-            vanity.remove(0);
+            if !metrics.is_empty() {
+                metrics.remove(0);
+            } else if !identity.is_empty() {
+                identity.remove(0);
+            }
         }
     }
 
@@ -598,13 +678,15 @@ impl App {
             }
         };
 
-        // The activity band above the composer owns the live turn readout
-        // (spinner, elapsed, current tool). Repeating it here would give the
-        // operator two clocks that tick out of step, so the footer carries
-        // only the coarse state word.
+        // The activity band owns the live clock (spinner, elapsed, pulse).
+        // The footer names the state — idle, or the current verb when busy —
+        // so the two rows do not tick two clocks.
         if self.busy {
             left.push(Span::styled("● ", self.theme.badge(Tone::Active)));
-            left.push(Span::styled("busy", self.theme.badge(Tone::Active)));
+            left.push(Span::styled(
+                clip_display(self.status_or_default(), 28),
+                self.theme.badge(Tone::Active),
+            ));
         } else {
             left.push(Span::styled("● ", self.theme.badge(Tone::Ok)));
             left.push(Span::styled("idle", self.theme.note()));
@@ -617,7 +699,7 @@ impl App {
                 self.theme.badge(Tone::Warn),
             ));
         }
-        // Status text is only news when the band is not already showing it.
+        // Idle-only news: while busy the verb above already carries status.
         if !self.status.is_empty() && !self.busy {
             sep(&mut left);
             let tone = if self.peers.is_empty() {
@@ -644,28 +726,57 @@ impl App {
         }
 
         let hints = self.footer_hints();
-        let left_w: usize = left.iter().map(Span::width).sum();
+        let mut left_w: usize = left.iter().map(Span::width).sum();
         let width = width as usize;
-        let mut spans = left;
+        let min_hint_w = Span::raw("?").width();
+
+        // Full session id outranks long hints. Hide it only when status plus
+        // the minimum `?` cannot take ` · <id>` without evicting either.
+        let session_id = self.session.session_id.as_str();
+        if !session_id.is_empty() {
+            let extra = 3 + Span::raw(session_id).width();
+            if left_w + extra + min_hint_w + 2 <= width {
+                sep(&mut left);
+                left.push(Span::styled(session_id.to_string(), self.theme.note()));
+                left_w = left.iter().map(Span::width).sum();
+            }
+        }
+
+        let mut chosen_hint = None;
         for hint in hints {
             let hint_w = Span::raw(hint.as_str()).width();
             // +2 keeps a breathing gap between state and hints.
-            if left_w + hint_w + 2 > width {
-                continue;
+            if left_w + hint_w + 2 <= width {
+                chosen_hint = Some(hint);
+                break;
             }
+        }
+
+        let left_w: usize = left.iter().map(Span::width).sum();
+        let mut spans = left;
+        if let Some(hint) = chosen_hint {
+            let hint_w = Span::raw(hint.as_str()).width();
             let pad = width.saturating_sub(left_w + hint_w);
             spans.push(Span::styled(" ".repeat(pad), self.theme.chrome()));
             spans.push(Span::styled(hint, self.theme.note()));
-            break;
         }
         Line::from(spans)
     }
 
     /// Key hints, widest first: the widest one that still fits is painted.
+    ///
+    /// The enter verb tracks state — `send` when idle, `queue` while a turn
+    /// is running — so the footer does not advertise a send that will not
+    /// happen.
     fn footer_hints(&self) -> Vec<String> {
+        let enter = if self.busy {
+            "enter queue"
+        } else {
+            "enter send"
+        };
         vec![
-            "enter send · esc cancel · ctrl+u/d scroll · ? help".to_string(),
-            "enter send · esc cancel · ? help".to_string(),
+            format!("{enter} · esc cancel · pgup/pgdn scroll · ? help"),
+            format!("{enter} · esc cancel · ? help"),
             "enter · esc · ?".to_string(),
             "?".to_string(),
         ]
@@ -982,22 +1093,43 @@ impl App {
     /// painted. The footer deliberately carries just the coarse state word, so
     /// there is never a second clock ticking out of step with this one.
     pub fn activity(&self) -> String {
+        self.activity_line()
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    /// Styled activity row: spinner, elapsed, verb and (when streaming) pulse
+    /// each keep their own role, so the live clock has hierarchy instead of
+    /// reading as one muted sentence.
+    pub fn activity_line(&self) -> Line<'static> {
         if !self.busy {
-            return String::new();
+            return Line::default();
         }
         let elapsed = self.elapsed().unwrap_or_else(|| "0.0s".into());
-        let mut out = format!(
-            "{} {} · {}",
-            self.spinner_frame(),
-            elapsed,
-            self.status_or_default()
-        );
+        let status = self.status_or_default();
+        let status_style = if status.starts_with("tool") {
+            self.theme.tool()
+        } else {
+            self.theme.text()
+        };
+        let mut spans = vec![
+            Span::styled(format!("{} ", self.spinner_frame()), self.theme.spinner()),
+            Span::styled(elapsed, self.theme.timing()),
+            Span::styled(" · ", self.theme.chrome()),
+            Span::styled(status.to_string(), status_style),
+        ];
         // The pulse only runs while tokens are actually landing, so a stalled
         // turn looks different from a streaming one.
         if !self.live.is_empty() {
-            out.push_str(&format!(" {}", self.typing_frame()));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(
+                self.typing_frame().to_string(),
+                self.theme.typing(),
+            ));
         }
-        out
+        Line::from(spans)
     }
 
     /// Spinner frame. `MOW_NO_ANIM=1` pins a static `●`; elapsed still ticks.
@@ -1221,9 +1353,8 @@ impl App {
         }
     }
 
-    /// `t` on empty input: expand/collapse the most recent tool group.
-    /// Returns false when there is nothing to toggle, so the key can fall
-    /// through to typing.
+    /// Expand/collapse the most recent tool group. No letter key binds this —
+    /// `t` always types — so this is a view helper (tests, and Esc collapse).
     pub fn toggle_tool_group(&mut self) -> bool {
         let Some(group) = self.entries.iter_mut().rev().find_map(|entry| match entry {
             Entry::Tools { expanded, .. } => Some(expanded),
@@ -1499,15 +1630,14 @@ impl App {
             ("enter", "send (queue while busy)"),
             ("ctrl+j", "newline"),
             ("↑ (empty input)", "edit last prompt"),
-            ("ctrl+u / ctrl+d", "scroll transcript"),
+            ("pgup / pgdn", "scroll transcript"),
             ("ctrl+l", "clear transcript (engine history kept)"),
             ("shift+tab", "ask ↔ auto"),
             ("ctrl+p", "expand peer output"),
-            ("t (empty input)", "expand / collapse tool calls"),
             ("home / end", "cursor to start / end"),
-            ("pgup / pgdn", "scroll transcript"),
+            ("delete", "delete forward"),
             ("ctrl+/ or ?", "this help"),
-            ("esc", "dismiss overlay, else cancel turn"),
+            ("esc", "dismiss overlay, else collapse tools, else cancel"),
             ("ctrl+c", "quit (cancel first if busy)"),
             ("tab (on /)", "slash autocomplete"),
             ("/model", "list models, or /model <id> to set"),
@@ -1673,6 +1803,20 @@ fn last_visible_line(buffer: &str) -> String {
         .rfind(|l| !l.trim().is_empty())
         .unwrap_or_default();
     clip_display(line.trim(), PEER_PREVIEW)
+}
+
+/// Last path component, so the header can name the workspace without the
+/// parent directories eating the row.
+fn workspace_basename(path: &str) -> String {
+    let trimmed = path.trim_end_matches(['/', '\\']);
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    trimmed
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(trimmed)
+        .to_string()
 }
 
 /// Truncate to `max` display columns, appending `…` when clipped.
@@ -1983,11 +2127,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if app.busy {
         rows.push(Constraint::Length(1));
     }
-    // The composer block eats 2 columns of border and 2 of padding; size the
-    // textarea against that inner width so wrapped text grows the box.
-    let input_cols = area.width.saturating_sub(4);
-    rows.push(Constraint::Length(input_height(app, input_cols) + 2));
-    rows.push(Constraint::Length(1));
+    // Composer sits on the document ground with no box: horizontal padding
+    // is the only inset. The status bar owns the bottom hairline.
+    let input_cols = area.width.saturating_sub(2);
+    rows.push(Constraint::Length(input_height(app, input_cols)));
+    // Footer hairline consumes a row; keep the status text on the row below.
+    rows.push(Constraint::Length(2));
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints(rows)
@@ -2012,7 +2157,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     // The activity band exists only while a turn runs.
     if let Some(band) = activity {
         frame.render_widget(
-            Paragraph::new(Line::styled(app.activity(), app.theme.note()))
+            Paragraph::new(app.activity_line())
                 .style(app.theme.base())
                 .block(Block::new().padding(Padding::horizontal(1))),
             band,
@@ -2021,15 +2166,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 
     draw_transcript(frame, app, transcript_area);
 
-    let input_block = Block::bordered()
-        .border_type(BorderType::Rounded)
-        .border_style(app.theme.chrome())
-        .style(app.theme.surface())
+    let input_block = Block::new()
+        .style(app.theme.base())
         .padding(Padding::horizontal(1));
     let input_inner = input_block.inner(input_area);
     frame.render_widget(input_block, input_area);
     frame.render_widget(
-        Paragraph::new(prompt_text(app, input_inner.width)).style(app.theme.surface()),
+        Paragraph::new(prompt_text(app, input_inner.width)).style(app.theme.base()),
         input_inner,
     );
     if app.pending_perm.is_none() && !app.welcome && !app.overlay.is_open() {
@@ -2038,12 +2181,17 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 
     // While a decision is pending the footer becomes the decision bar: the
     // keys stay visible even if the overlay is scrolled past or dimmed.
-    // The block eats one column of padding on each side.
+    // Its own top rule is a separate row so the status text is never eaten.
+    let footer_block = Block::new()
+        .borders(Borders::TOP)
+        .border_style(app.theme.chrome())
+        .style(app.theme.footer_bg())
+        .padding(Padding::horizontal(1));
+    let footer_inner = footer_block.inner(footer_area);
+    frame.render_widget(footer_block, footer_area);
     frame.render_widget(
-        Paragraph::new(app.footer_line(footer_area.width.saturating_sub(2)))
-            .style(app.theme.footer_bg())
-            .block(Block::new().padding(Padding::horizontal(1))),
-        footer_area,
+        Paragraph::new(app.footer_line(footer_inner.width)).style(app.theme.footer_bg()),
+        footer_inner,
     );
 
     // The scrim covers the document only: header safety chips, the composer
@@ -2085,24 +2233,25 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 }
 
 /// Paint the header as a solid mantle bar: fill every cell, then overlay chips.
+///
+/// One column of inset on each side matches the composer and footer, so the
+/// three chrome rows share a vertical rhythm instead of the header kissing
+/// the frame edge while everything below is padded.
 fn paint_filled_header(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let fill = Line::from(Span::styled(
         " ".repeat(area.width as usize),
         app.theme.header_bg(),
     ));
     frame.render_widget(Paragraph::new(fill).style(app.theme.header_bg()), area);
+    let inner_w = area.width.saturating_sub(2);
     frame.render_widget(
-        Paragraph::new(app.header_line(area.width)).style(app.theme.header_bg()),
+        Paragraph::new(app.header_line(inner_w))
+            .style(app.theme.header_bg())
+            .block(Block::new().padding(Padding::horizontal(1))),
         area,
     );
 }
 
-/// Input text with the prompt glyph on the first line, padded to `width` so
-/// the surface wash is a rectangle.
-/// Lay the composer text out into visual rows for an inner width of `width`
-/// columns. Only the very first row carries the prompt glyph; every later row —
-/// whether it came from a newline or from soft wrapping — is gutter-aligned, so
-/// long text expands downward instead of running off the right edge.
 /// One visual row of the composer: whether it carries the prompt glyph, its
 /// text, and the char offset into `input` where it starts.
 struct PromptRow {
@@ -2167,13 +2316,13 @@ fn prompt_text(app: &App, width: u16) -> Vec<Line<'static>> {
         .map(|(first, text)| {
             let glyph = if first { app.prompt_glyph() } else { "  " };
             let mut spans = vec![
-                Span::styled(glyph, app.theme.accent().patch(app.theme.surface())),
-                Span::styled(text, app.theme.user()),
+                Span::styled(glyph, app.theme.accent()),
+                Span::styled(text, app.theme.text()),
             ];
             let painted: usize = spans.iter().map(Span::width).sum();
             let pad = cols.saturating_sub(painted);
             if pad > 0 {
-                spans.push(Span::styled(" ".repeat(pad), app.theme.surface()));
+                spans.push(Span::raw(" ".repeat(pad)));
             }
             Line::from(spans)
         })
@@ -2303,6 +2452,28 @@ fn draw_too_small(frame: &mut Frame<'_>, app: &App, area: Rect) {
 /// shown as a badge because "this agent can run shell commands" is a safety
 /// fact, not a decoration.
 fn draw_welcome(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let width = area.width.saturating_sub(6).clamp(24, 60);
+    let inner_w = width.saturating_sub(4).max(8) as usize;
+    // Fit the card to a layout that actually fits the pane, so a 40×10
+    // first-run still answers "what can it do" and "how do I start".
+    let max_inner_h = area.height.saturating_sub(2).max(3) as usize;
+    let body = welcome_lines(app, inner_w, max_inner_h);
+    let height = (body.len() as u16 + 2).min(area.height);
+    let spot = centered(area, Constraint::Length(width), Constraint::Length(height));
+    frame.render_widget(Clear, spot);
+    frame.render_widget(
+        Paragraph::new(body)
+            .wrap(Wrap { trim: false })
+            .block(overlay_block(app, "session")),
+        spot,
+    );
+}
+
+/// Welcome body, richest layout that still fits `inner_h` rows.
+///
+/// Priority: identity and the start hint outrank the tagline and effort.
+/// Access is a safety fact and is kept as long as three rows exist.
+fn welcome_lines(app: &App, inner_w: usize, inner_h: usize) -> Vec<Line<'static>> {
     let workspace = if app.session.workspace.is_empty() {
         "workspace".to_string()
     } else {
@@ -2314,28 +2485,71 @@ fn draw_welcome(frame: &mut Frame<'_>, app: &App, area: Rect) {
         app.session.model.clone()
     };
 
+    let title = Line::from(Span::styled(
+        "mowi",
+        app.theme.accent().add_modifier(Modifier::BOLD),
+    ));
+    let tagline = Line::from(Span::styled(
+        clip_display("ratatui client for the mow harness", inner_w),
+        app.theme.note().patch(app.theme.overlay()),
+    ));
+    let mut fields = vec![
+        field_row(app, "workspace", &workspace, inner_w),
+        field_row(app, "model", &model, inner_w),
+    ];
+    if !app.effort.is_empty() {
+        fields.push(field_row(app, "effort", &app.effort, inner_w));
+    }
+    let access = welcome_access_row(app, inner_w);
+    let hint = welcome_hint_row(app, inner_w);
+
+    let mut full = vec![title.clone(), tagline, Line::raw("")];
+    full.extend(fields.clone());
+    full.push(Line::raw(""));
+    full.push(access.clone());
+    full.push(Line::raw(""));
+    full.push(hint.clone());
+
+    let mut mid = vec![title.clone()];
+    mid.extend(fields);
+    mid.push(access.clone());
+    mid.push(Line::raw(""));
+    mid.push(hint.clone());
+
+    let compact = vec![
+        title.clone(),
+        field_row(app, "workspace", &workspace, inner_w),
+        field_row(app, "model", &model, inner_w),
+        access.clone(),
+        hint.clone(),
+    ];
+    let tight = vec![title, access.clone(), hint.clone()];
+    let emergency = vec![access, hint];
+
+    for candidate in [full, mid, compact, tight, emergency] {
+        if candidate.len() <= inner_h {
+            return candidate;
+        }
+    }
+    welcome_hint_only(app, inner_w)
+}
+
+fn welcome_hint_only(app: &App, inner_w: usize) -> Vec<Line<'static>> {
+    vec![welcome_hint_row(app, inner_w)]
+}
+
+fn welcome_access_row(app: &App, inner_w: usize) -> Line<'static> {
     let cap_tone = if app.allow_shell || app.allow_write {
         Tone::Warn
     } else {
         Tone::Ok
     };
-    let mut body = vec![
-        Line::from(Span::styled(
-            "mowi",
-            app.theme.accent().add_modifier(Modifier::BOLD),
-        )),
-        Line::from(Span::styled(
-            "ratatui client for the mow harness",
-            app.theme.note().patch(app.theme.overlay()),
-        )),
-        Line::raw(""),
-        field_row(app, "workspace", &workspace),
-        field_row(app, "model", &model),
-    ];
-    if !app.effort.is_empty() {
-        body.push(field_row(app, "effort", &app.effort));
-    }
-    body.push(Line::from(vec![
+    let mode = if inner_w >= 36 {
+        format!("  {} mode", app.mode_chip())
+    } else {
+        format!("  {}", app.mode_chip())
+    };
+    Line::from(vec![
         Span::styled(
             format!("{:<10}", "access"),
             app.theme.note().patch(app.theme.overlay()),
@@ -2344,43 +2558,33 @@ fn draw_welcome(frame: &mut Frame<'_>, app: &App, area: Rect) {
             format!(" {} ", app.capability_chip()),
             app.theme.badge_solid(cap_tone),
         ),
-        Span::styled(
-            format!("  {} mode", app.mode_chip()),
-            app.theme.note().patch(app.theme.overlay()),
-        ),
-    ]));
-    body.push(Line::raw(""));
-    body.push(Line::from(vec![
-        Span::styled("type to begin", app.theme.text().patch(app.theme.overlay())),
-        Span::styled(
-            "  ·  ? for keys  ·  / for commands",
-            app.theme.note().patch(app.theme.overlay()),
-        ),
-    ]));
+        Span::styled(mode, app.theme.note().patch(app.theme.overlay())),
+    ])
+}
 
-    let height = (body.len() as u16 + 2).min(area.height);
-    let spot = centered(
-        area,
-        Constraint::Length(area.width.saturating_sub(6).clamp(24, 60)),
-        Constraint::Length(height),
-    );
-    frame.render_widget(Clear, spot);
-    frame.render_widget(
-        Paragraph::new(body).block(overlay_block(app, "session")),
-        spot,
-    );
+fn welcome_hint_row(app: &App, inner_w: usize) -> Line<'static> {
+    let extra = if inner_w >= 46 {
+        "  ·  ? for keys  ·  / for commands"
+    } else if inner_w >= 26 {
+        "  ·  ?  ·  /"
+    } else {
+        ""
+    };
+    Line::from(vec![
+        Span::styled("type to begin", app.theme.text().patch(app.theme.overlay())),
+        Span::styled(extra, app.theme.note().patch(app.theme.overlay())),
+    ])
 }
 
 /// `label      value` with the label in a fixed gutter, so stacked fields read
-/// as a table instead of drifting text.
-fn field_row(app: &App, label: &str, value: &str) -> Line<'static> {
+/// as a table instead of drifting text. Values clip to the remaining columns.
+fn field_row(app: &App, label: &str, value: &str, inner_w: usize) -> Line<'static> {
+    let label = format!("{label:<10}");
+    let room = inner_w.saturating_sub(label.width());
     Line::from(vec![
+        Span::styled(label, app.theme.note().patch(app.theme.overlay())),
         Span::styled(
-            format!("{label:<10}"),
-            app.theme.note().patch(app.theme.overlay()),
-        ),
-        Span::styled(
-            value.to_string(),
+            clip_display(value, room),
             app.theme.text().patch(app.theme.overlay()),
         ),
     ])
@@ -2389,7 +2593,7 @@ fn field_row(app: &App, label: &str, value: &str) -> Line<'static> {
 fn draw_help(frame: &mut Frame<'_>, app: &App, state: &mut TableState, area: Rect) {
     let spot = centered(
         area,
-        Constraint::Length(area.width.saturating_sub(4).min(64)),
+        Constraint::Length(area.width.saturating_sub(2).min(64)),
         Constraint::Length(area.height.saturating_sub(2)),
     );
     frame.render_widget(Clear, spot);
@@ -2403,7 +2607,18 @@ fn draw_help(frame: &mut Frame<'_>, app: &App, state: &mut TableState, area: Rec
             ])
         })
         .collect();
-    let table = Table::new(rows, [Constraint::Length(20), Constraint::Fill(1)])
+    // Size the key column to the keys (plus the `▸ ` highlight), not a
+    // fixed 20: that leftover is what sheared "engine history kept)" off
+    // the action column at a normal 80-wide frame.
+    let key_w = app
+        .help_rows()
+        .iter()
+        .map(|(key, _)| key.width())
+        .max()
+        .unwrap_or(12)
+        .saturating_add(2)
+        .clamp(12, 18) as u16;
+    let table = Table::new(rows, [Constraint::Length(key_w), Constraint::Fill(1)])
         .header(
             Row::new(vec!["key", "action"]).style(app.theme.accent().add_modifier(Modifier::BOLD)),
         )
@@ -2670,11 +2885,11 @@ fn draw_permission(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let block = Block::bordered()
         .border_type(BorderType::Rounded)
         .border_style(app.theme.warn())
-        .style(app.theme.surface())
+        .style(app.theme.overlay())
         .padding(Padding::horizontal(1))
         .title(Span::styled(
             " approval required ",
-            app.theme.warn().patch(app.theme.surface()),
+            app.theme.warn().patch(app.theme.overlay()),
         ));
     frame.render_widget(Paragraph::new(body).block(block), spot);
 }
@@ -2856,25 +3071,11 @@ fn handle_key(
             }
             app.quit = true;
         }
-        KeyCode::Char('j') if ctrl => app.insert_char('\n'),
-        KeyCode::Char('l') if ctrl => app.clear_transcript(),
-        KeyCode::Char('p') if ctrl => {
-            if app.toggle_peer_expand() {
-                app.overlay = if app.peer_focus.is_some() {
-                    Overlay::Peer
-                } else {
-                    Overlay::None
-                };
-            }
-        }
         KeyCode::BackTab => {
             let mode = app.toggle_ask_mode();
             client.perm_set(mode, Duration::from_secs(20))?;
             app.status = format!("mode: {mode}");
         }
-        // ctrl+/ arrives as Char('/') with CONTROL on most terminals.
-        KeyCode::Char('/') if ctrl => app.overlay = Overlay::help(),
-        KeyCode::Char('?') if app.input.is_empty() => app.overlay = Overlay::help(),
         KeyCode::Esc => {
             if app.dismiss_overlay() {
             } else if app.collapse_tool_group() {
@@ -2913,15 +3114,39 @@ fn handle_key(
                 app.clear_input();
             }
         }
+        _ => handle_view_key(app, key),
+    }
+    Ok(())
+}
+
+/// Composer, transcript scroll, and other local keys. Never talks to the Engine.
+///
+/// Scroll is PgUp/PgDn only and never rewrites the prompt. Arrow-up recalls
+/// the last user prompt when the composer is empty; otherwise it is ignored.
+/// Plain letters, including `t`, always type.
+fn handle_view_key(app: &mut App, key: KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Char('j') if ctrl => app.insert_char('\n'),
+        KeyCode::Char('l') if ctrl => app.clear_transcript(),
+        KeyCode::Char('p') if ctrl => {
+            if app.toggle_peer_expand() {
+                app.overlay = if app.peer_focus.is_some() {
+                    Overlay::Peer
+                } else {
+                    Overlay::None
+                };
+            }
+        }
+        // ctrl+/ arrives as Char('/') with CONTROL on most terminals.
+        KeyCode::Char('/') if ctrl => app.overlay = Overlay::help(),
+        KeyCode::Char('?') if app.input.is_empty() => app.overlay = Overlay::help(),
         KeyCode::Backspace => app.backspace_char(),
         KeyCode::Delete => app.delete_char(),
         KeyCode::Home => app.cursor_home(),
         KeyCode::End => app.cursor_end(),
         KeyCode::PageUp => leave_follow(app, 5),
         KeyCode::PageDown => scroll_down(app, 5),
-        // `t` on empty input toggles the last tool group; with nothing to
-        // toggle the key falls through and types like any other character.
-        KeyCode::Char('t') if app.input.is_empty() && app.toggle_tool_group() => {}
         KeyCode::Tab => {
             if app.input.starts_with('/') {
                 app.complete_slash();
@@ -2929,25 +3154,17 @@ fn handle_key(
         }
         KeyCode::Left => app.move_cursor(-1),
         KeyCode::Right => app.move_cursor(1),
-        KeyCode::Char('u') if ctrl => {
-            leave_follow(app, 5);
-        }
-        KeyCode::Char('d') if ctrl => {
-            scroll_down(app, 5);
-        }
         KeyCode::Up => {
-            if app.input.is_empty() && app.edit_last_prompt() {
-                return Ok(());
+            if app.input.is_empty() {
+                let _ = app.edit_last_prompt();
             }
-            leave_follow(app, 1);
         }
-        KeyCode::Down => {
-            scroll_down(app, 1);
-        }
+        KeyCode::Down => {}
+        // Unknown chords must not leak a letter into the composer.
+        KeyCode::Char(_) if ctrl => {}
         KeyCode::Char(c) => app.insert_char(c),
         _ => {}
     }
-    Ok(())
 }
 
 fn overlay_activate(client: &mut Client, app: &mut App) -> Result<(), Error> {
@@ -3485,13 +3702,22 @@ mod tests {
             wire: "openai-responses".into(),
         });
         app.theme = Theme { colored: true };
+        app.effort = "medium".into();
         app.entries.push(Entry::User("hi".into()));
         app.live.push_str("hello");
 
         let out = render(&mut app, 80, 14);
         assert!(out.contains("mowi"), "{out}");
-        assert!(out.contains("gpt-5-mini"), "{out}");
-        assert!(out.contains("abcdef01"), "{out}");
+        assert!(out.contains("gpt-5-mini (medium)"), "{out}");
+        let header = out.lines().next().expect("header");
+        assert!(
+            !header.contains("abcdef0123456789"),
+            "session id is not a header chip: {header}"
+        );
+        assert!(
+            out.contains("abcdef0123456789"),
+            "full session id belongs in the status bar: {out}"
+        );
         assert!(out.contains("hi"), "{out}");
         assert!(!out.contains("❯ hi"), "{out}");
         assert!(out.contains("hello"), "{out}");
@@ -3499,6 +3725,209 @@ mod tests {
         // Safety chips are always painted.
         assert!(out.contains("read-only"), "{out}");
         assert!(out.contains("ask"), "{out}");
+    }
+
+    fn row_text(buf: &ratatui::buffer::Buffer, y: u16, width: u16) -> String {
+        (0..width)
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect()
+    }
+
+    fn find_row(buf: &ratatui::buffer::Buffer, width: u16, height: u16, needle: &str) -> u16 {
+        for y in 0..height {
+            let row = row_text(buf, y, width);
+            if row.contains(needle) {
+                return y;
+            }
+        }
+        panic!(
+            "row containing {needle:?} not painted:\n{}",
+            (0..height)
+                .map(|y| row_text(buf, y, width))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    #[test]
+    fn composer_sits_on_base_without_a_top_rule() {
+        let mut app = App::new(SessionInfo::default());
+        app.theme = Theme { colored: true };
+        app.input.push_str("draft");
+        app.cursor = app.input.chars().count();
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        let composer_y = find_row(buf, 60, 16, "draft");
+        let above = row_text(buf, composer_y - 1, 60);
+        assert!(
+            above.chars().filter(|c| *c == '─').count() < 50,
+            "composer must not have a top rule: {above}"
+        );
+        assert!(
+            !above.contains('╭')
+                && !above.contains('╮')
+                && !above.contains('╰')
+                && !above.contains('╯'),
+            "composer must not be a rounded box: {above}"
+        );
+
+        let draft_x = row_text(buf, composer_y, 60).find("draft").expect("draft") as u16;
+        assert!(
+            draft_x >= 2,
+            "composer keeps a horizontal inset: {}",
+            row_text(buf, composer_y, 60)
+        );
+        assert_eq!(
+            buf[(draft_x, composer_y)].bg,
+            crate::theme::mocha::BASE,
+            "composer text sits on the document ground"
+        );
+        // Side edges of the composer row are also base, not a raised wash.
+        assert_eq!(buf[(0, composer_y)].bg, crate::theme::mocha::BASE);
+        assert_eq!(buf[(59, composer_y)].bg, crate::theme::mocha::BASE);
+        assert_eq!(buf[(draft_x, composer_y + 1)].symbol(), "─");
+    }
+
+    #[test]
+    fn footer_has_its_own_top_rule_and_keeps_status_text() {
+        let mut app = App::new(SessionInfo::default());
+        app.theme = Theme { colored: true };
+        app.input.push_str("draft");
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        let footer_y = find_row(buf, 60, 16, "idle");
+        assert!(
+            row_text(buf, footer_y, 60).contains("enter send"),
+            "status text must remain visible under its own rule"
+        );
+        let rule = row_text(buf, footer_y - 1, 60);
+        assert!(
+            rule.chars().filter(|c| *c == '─').count() >= 50,
+            "footer top rule: {rule}"
+        );
+        let composer_y = find_row(buf, 60, 16, "draft");
+        assert_eq!(
+            footer_y - 1,
+            composer_y + 1,
+            "footer rule sits on the row below the composer text"
+        );
+        assert!(
+            row_text(buf, composer_y - 1, 60)
+                .chars()
+                .filter(|c| *c == '─')
+                .count()
+                < 50,
+            "only the status bar keeps a top rule"
+        );
+    }
+
+    #[test]
+    fn activity_stays_a_band_above_the_composer() {
+        let mut app = App::new(SessionInfo::default());
+        app.theme = Theme { colored: true };
+        app.busy = true;
+        app.animate = false;
+        app.activity_started = Some(Instant::now());
+        app.status = "calling model".into();
+        app.input.push_str("queued draft");
+        let mut terminal = Terminal::new(TestBackend::new(80, 18)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+
+        let activity_y = find_row(buf, 80, 18, "calling model");
+        let composer_y = find_row(buf, 80, 18, "queued draft");
+        let footer_y = find_row(buf, 80, 18, "enter queue");
+        assert!(
+            activity_y < composer_y,
+            "activity ({activity_y}) must sit above the composer ({composer_y})"
+        );
+        assert_eq!(
+            activity_y + 1,
+            composer_y,
+            "activity is the row immediately above the composer"
+        );
+        let footer = row_text(buf, footer_y, 80);
+        assert!(
+            footer.contains("calling model"),
+            "footer names the busy verb, not a coarse busy: {footer}"
+        );
+        assert!(
+            !footer.contains("0.0s") && !footer.contains("···"),
+            "live clock stays on the activity band: {footer}"
+        );
+    }
+
+    #[test]
+    fn header_has_horizontal_inset_matching_composer() {
+        let mut app = App::new(SessionInfo {
+            session_id: "abcdef0123456789".into(),
+            workspace: "/w".into(),
+            model: "gpt-5-mini".into(),
+            wire: "openai-responses".into(),
+        });
+        app.theme = Theme { colored: true };
+        let mut terminal = Terminal::new(TestBackend::new(80, 14)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        assert_eq!(buf[(0, 0)].symbol(), " ", "header left inset");
+        assert_eq!(buf[(79, 0)].symbol(), " ", "header right inset");
+        let header = row_text(buf, 0, 80);
+        assert!(header.trim_start().starts_with("mowi"), "{header}");
+    }
+
+    #[test]
+    fn activity_line_styles_the_live_clock() {
+        let mut app = App::new(SessionInfo::default());
+        app.theme = Theme { colored: true };
+        app.busy = true;
+        app.animate = false;
+        app.activity_started = Some(Instant::now());
+        app.status = "calling model".into();
+        app.live.push_str("hello");
+
+        let line = app.activity_line();
+        let spinner = line
+            .spans
+            .iter()
+            .find(|span| span.content.contains('●'))
+            .expect("spinner");
+        assert_eq!(spinner.style.fg, app.theme.spinner().fg);
+        let elapsed = line
+            .spans
+            .iter()
+            .find(|span| {
+                span.content.ends_with('s') && span.content.chars().any(|c| c.is_ascii_digit())
+            })
+            .expect("elapsed");
+        assert_eq!(elapsed.style.fg, app.theme.timing().fg);
+        let status = line
+            .spans
+            .iter()
+            .find(|span| span.content.contains("calling"))
+            .expect("status");
+        assert_eq!(status.style.fg, app.theme.text().fg);
+        let pulse = line
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "···")
+            .expect("typing pulse");
+        assert_eq!(pulse.style.fg, app.theme.typing().fg);
+    }
+
+    #[test]
+    fn footer_says_queue_while_busy() {
+        let mut app = App::new(SessionInfo::default());
+        app.busy = true;
+        let wide = footer_text(&app, 80);
+        assert!(wide.contains("enter queue"), "{wide}");
+        assert!(!wide.contains("enter send"), "{wide}");
+        app.busy = false;
+        let idle = footer_text(&app, 80);
+        assert!(idle.contains("enter send"), "{idle}");
     }
 
     #[test]
@@ -3576,7 +4005,15 @@ mod tests {
             .iter()
             .map(|span| span.content.to_string())
             .collect();
-        assert!(wide.contains("/very/long/workspace/path"), "{wide}");
+        assert!(wide.contains("path"), "{wide}");
+        assert!(
+            !wide.contains("/very/long/workspace/path"),
+            "header uses the workspace basename: {wide}"
+        );
+        assert!(
+            !wide.contains("abcdef01"),
+            "session id is not a header chip: {wide}"
+        );
 
         let narrow: String = app
             .header_line(42)
@@ -3584,9 +4021,213 @@ mod tests {
             .iter()
             .map(|span| span.content.to_string())
             .collect();
-        assert!(!narrow.contains("/very/long/workspace/path"), "{narrow}");
+        assert!(!narrow.contains("/very/long"), "{narrow}");
         assert!(narrow.contains("write+shell"), "{narrow}");
         assert!(narrow.contains("ask"), "{narrow}");
+    }
+
+    fn header_text(app: &App, width: u16) -> String {
+        app.header_line(width)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    fn footer_text(app: &App, width: u16) -> String {
+        app.footer_line(width)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn header_renders_model_with_dimmed_effort() {
+        let mut app = App::new(SessionInfo {
+            session_id: "20260814abcdef".into(),
+            workspace: "/w".into(),
+            model: "gpt-5-mini".into(),
+            wire: "openai-responses".into(),
+        });
+        app.theme = Theme { colored: true };
+        app.effort = "medium".into();
+
+        let line = app.header_line(120);
+        let text = header_text(&app, 120);
+        assert!(text.contains("gpt-5-mini (medium)"), "{text}");
+        assert!(
+            !text.contains("20260814"),
+            "date-like session id stays out of the header: {text}"
+        );
+
+        let effort = line
+            .spans
+            .iter()
+            .find(|span| span.content == "medium")
+            .expect("effort word");
+        assert_eq!(
+            effort.style.fg,
+            app.theme.note().fg,
+            "only the effort word is dimmed"
+        );
+        let open = line
+            .spans
+            .iter()
+            .find(|span| span.content == " (")
+            .expect("opening paren");
+        let close = line
+            .spans
+            .iter()
+            .find(|span| span.content == ")")
+            .expect("closing paren");
+        assert_eq!(open.style.fg, app.theme.header().fg);
+        assert_eq!(close.style.fg, app.theme.header().fg);
+    }
+
+    #[test]
+    fn header_drops_effort_before_model_and_keeps_safety() {
+        let mut app = App::new(SessionInfo {
+            session_id: "20260814abcdef".into(),
+            workspace: "/very/long/workspace/path/that/eats/columns".into(),
+            model: "gpt-5-mini".into(),
+            wire: "openai-responses".into(),
+        });
+        app.effort = "medium".into();
+        app.usage.input_tokens = 41_500;
+
+        let wide = header_text(&app, 160);
+        assert!(wide.contains("gpt-5-mini (medium)"), "{wide}");
+        assert!(wide.contains("columns"), "{wide}");
+        assert!(
+            !wide.contains("/very/long/workspace/path"),
+            "header uses the workspace basename: {wide}"
+        );
+
+        // Peel tokens and workspace first; effort goes before the model name.
+        // `mowi · gpt-5-mini (medium)` + safety is 41 cols; 40 forces the
+        // parenthetical off and keeps the model.
+        let mid = header_text(&app, 40);
+        assert!(mid.contains("gpt-5-mini"), "width 40: {mid}");
+        assert!(!mid.contains("medium"), "effort peels before model: {mid}");
+        assert!(mid.contains("read-only"), "width 40: {mid}");
+        assert!(mid.contains("ask"), "width 40: {mid}");
+
+        let tight = header_text(&app, 42);
+        assert!(tight.contains("read-only"), "width 42: {tight}");
+        assert!(tight.contains("ask"), "width 42: {tight}");
+        assert!(!tight.contains("20260814"), "{tight}");
+    }
+
+    #[test]
+    fn header_left_is_identity_only_and_metrics_sit_right() {
+        let mut app = App::new(SessionInfo {
+            session_id: "01J8ZK4M7Q2XN5V9".into(),
+            workspace: "/home/dev/src/mow".into(),
+            model: "gpt-5-mini".into(),
+            wire: "openai-responses".into(),
+        });
+        app.theme = Theme { colored: true };
+        app.effort = "medium".into();
+        app.usage.input_tokens = 41_500;
+        app.usage.output_tokens = 3_200;
+        app.apply_context(&usage(41_500, Some(200_000), Some(21.0)));
+
+        let wide = header_text(&app, 120);
+        assert!(wide.contains("mowi"), "{wide}");
+        assert!(wide.contains("mow"), "{wide}");
+        assert!(!wide.contains("/home/dev/src/mow"), "basename only: {wide}");
+        assert!(wide.contains("gpt-5-mini (medium)"), "{wide}");
+        assert!(wide.contains("44.7k tok"), "{wide}");
+        assert!(wide.contains('▰'), "{wide}");
+        assert!(!wide.contains("01J8ZK4M"), "session id stays out: {wide}");
+        // Identity is left of usage: "mowi" before tokens, tokens before safety.
+        let mowi = wide.find("mowi").expect("mowi");
+        let tokens = wide.find("44.7k tok").expect("tokens");
+        let safety = wide.find("read-only").expect("safety");
+        assert!(mowi < tokens && tokens < safety, "{wide}");
+
+        let mid = header_text(&app, 80);
+        assert!(mid.contains("mow"), "{mid}");
+        assert!(mid.contains("gpt-5-mini (medium)"), "{mid}");
+        assert!(!mid.contains('▰'), "gauge waits for a wide row: {mid}");
+
+        let tight = header_text(&app, 40);
+        assert!(tight.contains("gpt-5-mini"), "{tight}");
+        assert!(tight.contains("read-only"), "{tight}");
+        assert!(
+            !tight.contains("44.7k"),
+            "tokens drop before identity: {tight}"
+        );
+    }
+
+    #[test]
+    fn workspace_basename_is_the_last_component() {
+        assert_eq!(workspace_basename("/home/dev/src/mow"), "mow");
+        assert_eq!(workspace_basename("/home/dev/src/mow/"), "mow");
+        assert_eq!(workspace_basename("mow"), "mow");
+        assert_eq!(workspace_basename(""), "");
+    }
+
+    #[test]
+    fn footer_busy_names_the_verb_without_the_clock() {
+        let mut app = App::new(SessionInfo::default());
+        app.busy = true;
+        app.animate = false;
+        app.activity_started = Some(Instant::now());
+        app.status = "calling model".into();
+        let text = footer_text(&app, 80);
+        assert!(text.contains("calling model"), "{text}");
+        assert!(!text.contains("0.0s"), "{text}");
+        assert!(!text.contains("busy"), "coarse busy is replaced: {text}");
+    }
+
+    #[test]
+    fn footer_shows_session_id_only_as_leftover() {
+        let mut app = App::new(SessionInfo {
+            session_id: "20260814abcdef".into(),
+            workspace: "/w".into(),
+            model: "gpt-5-mini".into(),
+            wire: "openai-responses".into(),
+        });
+
+        let wide = footer_text(&app, 80);
+        assert!(
+            wide.contains("20260814abcdef"),
+            "full session id when status and ? fit: {wide}"
+        );
+        assert!(wide.contains("?"), "minimum hint stays: {wide}");
+        assert!(wide.contains("idle"), "{wide}");
+
+        app.busy = true;
+        app.status = "calling model".into();
+        let busy = footer_text(&app, 80);
+        assert!(
+            busy.contains("20260814abcdef"),
+            "id outranks a long hint while busy: {busy}"
+        );
+        assert!(busy.contains("calling model"), "{busy}");
+        assert!(busy.contains('?'), "{busy}");
+        app.busy = false;
+        app.status.clear();
+
+        // Status + `?` fit; ` · 20260814abcdef` would push `?` off. Hide the id.
+        let tight = footer_text(&app, 16);
+        assert!(tight.contains("idle"), "{tight}");
+        assert!(tight.contains('?'), "minimum hint outranks the id: {tight}");
+        assert!(
+            !tight.contains("20260814"),
+            "no room for leftover id: {tight}"
+        );
+
+        app.status = "copied locally".into();
+        let news = footer_text(&app, 30);
+        assert!(news.contains("copied locally"), "{news}");
+        assert!(news.contains('?'), "{news}");
+        assert!(
+            !news.contains("20260814"),
+            "status and `?` are never evicted for the id: {news}"
+        );
     }
 
     #[test]
@@ -3609,6 +4250,17 @@ mod tests {
         assert!(out.contains("read-only"), "{out}");
         assert!(!out.contains("any key"), "{out}");
 
+        // Min-size first-run: access and the start hint must survive. The
+        // tagline and effort are the first things a short pane may drop.
+        app.welcome = true;
+        app.effort = "medium".into();
+        app.allow_write = true;
+        app.allow_shell = true;
+        let tight = render(&mut app, 40, 14);
+        assert!(tight.contains("type to begin"), "{tight}");
+        assert!(tight.contains("write+shell"), "{tight}");
+        assert!(tight.contains("ask"), "{tight}");
+
         // Typing clears the banner and still lands in the composer: no key is
         // spent just to dismiss the splash.
         app.welcome = false;
@@ -3622,13 +4274,14 @@ mod tests {
     fn long_prompt_wraps_and_grows_the_composer() {
         let mut app = App::new(SessionInfo::default());
         app.input = "x".repeat(120);
-        // 60 cols of frame → 56 of textarea inner width, so 120 chars need 3 rows.
-        assert!(input_height(&app, 56) >= 3, "{}", input_height(&app, 56));
+        // 60 cols of frame → 58 of textarea inner width (1-col pad each
+        // side, no box), so 120 chars need 3 rows.
+        assert!(input_height(&app, 58) >= 3, "{}", input_height(&app, 58));
         let out = render(&mut app, 60, 20);
         for row in out.lines() {
             assert!(row.chars().count() <= 60, "{row}");
         }
-        let rows = prompt_rows(&app, 56);
+        let rows = prompt_rows(&app, 58);
         assert!(rows.len() >= 3, "{rows:?}");
         assert!(rows[0].0 && !rows[1].0, "{rows:?}");
     }
@@ -3643,9 +4296,22 @@ mod tests {
             aliases: vec![],
         });
         app.overlay = Overlay::help();
-        let out = render(&mut app, 70, 24);
+        let out = render(&mut app, 80, 24);
         assert!(out.contains("help") || out.contains("keyboard"), "{out}");
         assert!(out.contains("ctrl+j"), "{out}");
+        assert!(
+            out.contains("engine history kept)"),
+            "action column must not shear the kept) close: {out}"
+        );
+        assert!(
+            !out.contains("ctrl+u"),
+            "ctrl+u is not a scroll binding: {out}"
+        );
+        assert!(
+            !out.contains("t (empty"),
+            "plain t is not a tool-group shortcut: {out}"
+        );
+        assert!(out.contains("pgup / pgdn"), "{out}");
         // The table is longer than any overlay: the tail is reachable by
         // scrolling, not by being painted at once.
         for _ in 0..app.help_rows().len() {
@@ -4294,7 +4960,7 @@ mod tests {
         assert_eq!(collapsed_rows.len(), 1, "collapsed group is one row");
         assert!(!out.contains("grep estimated_entry_lines"), "{out}");
 
-        assert!(app.toggle_tool_group(), "t toggles the group");
+        assert!(app.toggle_tool_group(), "helper expands the group");
         let out = render(&mut app, 80, 20);
         assert!(out.contains("grep estimated_entry_lines"), "{out}");
         let tool_rows = out
@@ -4303,15 +4969,103 @@ mod tests {
             .count();
         assert_eq!(tool_rows, 2, "expanded group paints every call");
 
-        assert!(app.toggle_tool_group(), "t collapses again");
+        assert!(app.toggle_tool_group(), "helper collapses again");
         let out = render(&mut app, 80, 20);
         assert!(!out.contains("grep estimated_entry_lines"), "{out}");
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        handle_view_key(app, KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    fn press_ctrl(app: &mut App, c: char) {
+        handle_view_key(app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    }
+
+    fn tall_transcript(app: &mut App) {
+        app.last_view_h = 6;
+        app.last_view_w = 40;
+        for i in 0..20 {
+            app.entries.push(Entry::User(format!("user-{i}")));
+            app.entries.push(Entry::Assistant(format!("asst-{i}")));
+        }
+        app.follow = true;
+        app.scroll = 0;
+    }
+
+    #[test]
+    fn plain_t_always_types_into_the_prompt() {
+        let mut app = App::new(SessionInfo::default());
+        app.entries.push(Entry::Tools {
+            tools: vec![("read a".into(), Some(1)), ("read b".into(), Some(2))],
+            expanded: false,
+        });
+        assert!(app.input.is_empty());
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(app.input, "t", "t types even as the first character");
+        let still_collapsed = app.entries.iter().any(|entry| {
+            matches!(
+                entry,
+                Entry::Tools {
+                    expanded: false,
+                    ..
+                }
+            )
+        });
+        assert!(still_collapsed, "t must not expand the tool group");
+        press(&mut app, KeyCode::Char('t'));
+        assert_eq!(app.input, "tt");
+    }
+
+    #[test]
+    fn arrow_up_recalls_only_when_composer_is_empty() {
+        let mut app = App::new(SessionInfo::default());
+        tall_transcript(&mut app);
+        app.entries.push(Entry::User("last prompt".into()));
+
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.input, "last prompt");
+        assert!(app.follow, "history recall must not scroll");
+
+        app.set_input("draft".into());
+        press(&mut app, KeyCode::Up);
+        assert_eq!(
+            app.input, "draft",
+            "arrow-up is inert when the composer has text"
+        );
+        assert!(app.follow, "arrow-up must not scroll a non-empty composer");
+    }
+
+    #[test]
+    fn scroll_keys_never_rewrite_the_composer() {
+        let mut app = App::new(SessionInfo::default());
+        tall_transcript(&mut app);
+        app.set_input("keep me".into());
+
+        press(&mut app, KeyCode::PageUp);
+        assert_eq!(app.input, "keep me");
+        assert!(!app.follow, "pgup scrolls the transcript");
+
+        app.follow = true;
+        press(&mut app, KeyCode::PageDown);
+        assert_eq!(app.input, "keep me");
+
+        app.follow = true;
+        press(&mut app, KeyCode::Down);
+        assert_eq!(app.input, "keep me");
+        assert!(app.follow, "arrow-down is not a scroll binding");
+
+        app.follow = true;
+        press_ctrl(&mut app, 'u');
+        press_ctrl(&mut app, 'd');
+        assert_eq!(app.input, "keep me", "ctrl+u/d must not type or recall");
+        assert!(app.follow, "ctrl+u/d must not scroll");
     }
 
     #[test]
     fn tool_group_toggle_has_nothing_to_do_without_a_group() {
         let mut app = App::new(SessionInfo::default());
-        assert!(!app.toggle_tool_group(), "no group: key falls through");
+        assert!(!app.toggle_tool_group(), "no group: nothing to toggle");
         assert!(!app.collapse_tool_group(), "no group to collapse");
         app.entries.push(Entry::Tools {
             tools: vec![("a".into(), Some(1)), ("b".into(), Some(2))],

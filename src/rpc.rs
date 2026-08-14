@@ -287,7 +287,7 @@ impl SessionInfo {
         }
     }
 
-    /// Short id for the header chip.
+    /// Short id for the status bar, when leftover columns allow it.
     pub fn short_id(&self) -> String {
         let id = self.session_id.as_str();
         match id.char_indices().nth(8) {

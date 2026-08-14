@@ -23,7 +23,7 @@ parity. Do not block v0 on diffs.
 - Exclusive slash refused when busy
 - `/sessions` from `sessions`
 - Token chip from `prompt.usage` + delegate.usage events
-- Follow-bottom / scroll (ctrl+u/d)
+- Follow-bottom / scroll (pgup/pgdn)
 
 ## Phase 2 — document quality ✓
 
@@ -47,10 +47,13 @@ parity. Do not block v0 on diffs.
 
 Ratatui widgets carry the chrome; the transcript stays the product.
 
-- **Header chips** built as spans: workspace / model / short session / token
-  (`⇄` peer) are vanity and drop left-to-right on a narrow terminal; the
-  capability chip (`read-only` / `write` / `shell` / `write+shell`) and the
-  `ask` ↔ `auto` chip never drop. `status` seeds them at handshake.
+- **Header chips** built as spans: left identity is `mowi` / workspace
+  basename / `model (effort)`; token (`⇄` peer) and the context gauge sit
+  right-aligned and drop first. The capability chip (`read-only` /
+  `write` / `shell` / `write+shell`) and the `ask` ↔ `auto` chip never drop.
+  The full session id is status-bar chrome (when status and `?` fit), not
+  a header chip. `status`
+  seeds them at handshake.
 - **Min size 40×10** — below that a centered `Clear` + bordered warning Block
   instead of a broken frame.
 - **Welcome splash** for a fresh session (no transcript seed); any key
@@ -60,8 +63,8 @@ Ratatui widgets carry the chrome; the transcript stays the product.
 - **Transcript** gets `Paragraph` + a `Scrollbar` bound to the scroll state,
   and diffs render as a review card with a `─ <file>` title parsed from `+++`.
 - **Input** is a multi-line Paragraph that grows 1–6 rows; `ctrl+j` inserts a
-  newline, arrow-up on empty input loads the last prompt, `ctrl+l` clears the
-  painted transcript (Engine history is untouched).
+  newline, arrow-up on empty input loads the last prompt without scrolling,
+  `ctrl+l` clears the painted transcript (Engine history is untouched).
 - **Overlays** (`Clear` + centered Block): help (`List` of local keys plus
   `slash.list` rows), `/sessions` (id / updated / preview + `mowi --session
   <id>` hint), peer buffer, and permissions (tool name + command string or
@@ -85,8 +88,9 @@ Still deliberately out: a remappable keymap file, PTY cell smoke.
   headers, unwashed context rows, and an inverted word chip on the changed span
   of a `-`/`+` pair. `NO_COLOR` keeps signs and structure without RGB.
 - **Chrome** — header chips close with a hairline rule; the transcript reserves
-  the scrollbar column so bands never run under the thumb; the input sits in a
-  bordered block with a `❯` glyph (`>` when colour is off); the footer goes
+  the scrollbar column so bands never run under the thumb; the input sits on
+  the document ground with no box, with a `❯` glyph (`>` when colour
+  is off); the footer is its own sunk bar with a top rule and goes
   quiet while the permission overlay owns the decision.
 - **Permission overlay** — the tool name titles the block and `y/n/a` sits on
   the title-right, with args as a wrapped Paragraph.
