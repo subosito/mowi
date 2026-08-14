@@ -43,19 +43,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - uses: cachix/install-nix-action@v31
 
-      - name: Cache Cargo
-        uses: Swatinem/rust-cache@v2
+      - uses: cachix/cachix-action@v16
+        with:
+          name: devenv
 
-      - name: Install shell-use
-        run: |
-          curl --proto '=https' --tlsv1.2 -LsSf \
-            https://raw.githubusercontent.com/microsoft/shell-use/main/install/install.sh | sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install devenv.sh
+        run: nix profile add nixpkgs#devenv
 
       - name: Run deterministic PTY smoke
-        run: scripts/smoke-tui.sh
+        run: devenv shell -- scripts/smoke-tui.sh
+

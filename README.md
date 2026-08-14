@@ -43,7 +43,8 @@ modifiers.
 
 ## PTY smoke
 
-With [Microsoft shell-use](https://github.com/microsoft/shell-use) installed:
+With [Microsoft tui-test](https://github.com/microsoft/tui-test) on `PATH`
+(included in `devenv shell`):
 
 ```bash
 scripts/smoke-tui.sh

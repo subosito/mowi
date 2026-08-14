@@ -98,7 +98,7 @@ Same baseline ([baseline.md](baseline.md)), deliberately better in:
   constraint layout for the frame, `Scrollbar` on the transcript, `Clear` +
   centered Block for help / sessions / peer / permission overlays.
 - **Testing** — ratatui `TestBackend` + protocol fixtures for logic, with the
-  deterministic `scripts/smoke-tui.sh` PTY smoke when `shell-use` is available.
+  deterministic `scripts/smoke-tui.sh` PTY smoke when `tui-test` is available.
 - **Theme** — mocha default and flashdiff-style diffs as a palette module,
   not Charm AdaptiveColor.
 - **No blank-import tricks in the UI** — one crate, one binary.

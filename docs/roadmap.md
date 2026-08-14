@@ -41,7 +41,7 @@ Historical implementation phases for the maintained Rust UI over additive
 - Wheel transcript scrolling (Shift+drag keeps terminal-native selection)
 - `/search`, `/copy`, `/retry`, `/edit`
 - Remappable keys through `extensions.mowi` if needed
-- Deterministic PTY smoke via `scripts/smoke-tui.sh` when `shell-use` is available
+- Deterministic PTY smoke via `scripts/smoke-tui.sh` when `tui-test` is available
 
 ## Phase 4 — product chrome & key parity ✓
 
