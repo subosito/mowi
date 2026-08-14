@@ -1474,7 +1474,7 @@ impl App {
         let width = self.last_view_w.max(8) as usize;
         let (glyph, glyph_style) = match duration_ms {
             Some(_) => ("✓", self.theme.badge(Tone::Ok).patch(self.theme.base())),
-            None => (self.spinner_frame(), self.theme.spinner()),
+            None => (self.tool_spinner_frame(), self.theme.spinner()),
         };
         let (verb, rest) = tool_label(name);
         let mut spans = vec![
@@ -1999,11 +1999,10 @@ impl App {
         } else {
             self.theme.text()
         };
-        let frame = if is_tool_activity_status(&status) {
-            self.tool_spinner_frame()
-        } else {
-            self.spinner_frame()
-        };
+        // The status spinner represents the whole turn, so it stays stable
+        // across model/tool phase changes. Tool-specific animation lives in
+        // the transcript progress rows.
+        let frame = self.spinner_frame();
         let mut spans = vec![
             Span::styled(format!("{frame} "), self.theme.spinner()),
             Span::styled(elapsed, self.theme.timing()),
@@ -6596,18 +6595,20 @@ mod tests {
     }
 
     #[test]
-    fn tool_activity_uses_distinct_arc_spinner() {
+    fn tool_activity_animates_in_content_not_status() {
         let mut app = App::new(SessionInfo::default());
         app.busy = true;
         app.animate = true;
         app.status = "reading · src/app.rs".into();
         app.tick = 0;
-        assert!(app.footer().starts_with("◜ "), "{}", app.footer());
-        app.status = "thinking".into();
         assert!(app.footer().starts_with("⠋ "), "{}", app.footer());
+        let live = app.tool_row_lines("read src/app.rs", None);
+        assert!(live[0].to_string().starts_with("◜ "), "{:?}", live[0]);
+
         app.animate = false;
-        app.status = "running · cargo test".into();
-        assert!(app.footer().starts_with("◆ "), "{}", app.footer());
+        assert!(app.footer().starts_with("● "), "{}", app.footer());
+        let still = app.tool_row_lines("bash cargo test", None);
+        assert!(still[0].to_string().starts_with("◆ "), "{:?}", still[0]);
     }
 
     #[test]
