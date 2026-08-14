@@ -1,7 +1,6 @@
 # Roadmap
 
-Ship a **running** UI against `mow rpc` v3, then climb toward Go mowi
-parity. Do not block v0 on diffs.
+Historical implementation phases for the maintained Rust UI over additive `mow rpc` (minimum v3; current host v4).
 
 ## Phase 0 — crate + spawn ✓
 
@@ -40,7 +39,7 @@ parity. Do not block v0 on diffs.
 - Queued prompts while busy
 - Wheel transcript scrolling (Shift+drag keeps terminal-native selection)
 - `/search`, `/copy`, `/retry`, `/edit`
-- Remappable keys / `extensions.tui` if we choose to read mow config
+- Remappable keys through `extensions.mowi` if needed
 - PTY cell smoke (optional)
 
 ## Phase 4 — product chrome & key parity ✓
@@ -48,11 +47,11 @@ parity. Do not block v0 on diffs.
 Ratatui widgets carry the chrome; the transcript stays the product.
 
 - **Header chips** built as spans: left identity is `mowi` / workspace
-  basename / `model (effort)`; after safety, optional git / extra-root /
+  basename / `model (effort)`; after safety, optional extra-root /
   status-bar Goal states, then the token chip (`⇄` peer), then the context size
   (`32k/128k ctx` or `32k ctx`) at the far right. A ` · ` joins safety
   to the first optional chip and is omitted when none remain. Drop
-  order: tokens, git, extra-roots, Goal, context, then identity.
+  order: tokens, extra-roots, context, then identity.
   Safety never drops. Git is a cached local workspace probe (startup +
   debounce; never per frame). Extra-roots decode from host
   `status`/`session` only. Goal is driven by `graph.goal.*` and clears

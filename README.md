@@ -1,27 +1,31 @@
-# mowi
+# mowi - mow with interface
 
-Ratatui client for the [mow](https://github.com/subosito/mow) harness.
-The Engine stays headless (`mow rpc`). This UI does not embed mow and
-does not manage ACP peers.
+The terminal interface for the [mow](https://github.com/subosito/mow) harness.
+Mowi is built using Ratatui and connects to the headless Engine through
+`mow rpc`; it does not embed mow or manage ACP peers itself.
 
 **Start here:** [docs/README.md](docs/README.md)
 
-| Doc | |
-|-----|---|
-| [docs/architecture.md](docs/architecture.md) | Process split |
-| [docs/protocol.md](docs/protocol.md) | `mow rpc` v3 |
-| [docs/baseline.md](docs/baseline.md) | Go mowi feature bar |
-| [docs/roadmap.md](docs/roadmap.md) | Phases |
+| Doc | Purpose |
+|---|---|
+| [docs/architecture.md](docs/architecture.md) | Process split and ownership |
+| [docs/protocol.md](docs/protocol.md) | Additive `mow rpc` contract |
+| [docs/baseline.md](docs/baseline.md) | Current mowi behavior |
+| [docs/ui-review.md](docs/ui-review.md) | Snapshot and responsive-layout review |
+| [docs/roadmap.md](docs/roadmap.md) | Historical implementation phases |
 
 ```bash
 devenv shell -- cargo test
 devenv shell -- cargo run -- --help
 ```
 
-Requires `mow` on `PATH` (or `$MOW_BIN`) built from the sibling `mow`
-repo with `ext/rpc` linked. Protocol `version.rpc` must be `"3"`.
+Requires `mow` on `PATH` (or `$MOW_BIN`) with `ext/rpc` linked. Mowi requires
+RPC compatibility epoch `1` and discovers additive behavior through
+`capabilities` plus `slash.list`.
 
-Themes are selected with full names:
+## Themes
+
+Themes use full identifiers:
 
 ```bash
 mowi --theme catppuccin-mocha
@@ -29,8 +33,13 @@ MOW_THEME=gruvbox-dark mowi
 ```
 
 Available themes are `catppuccin-mocha`, `catppuccin-latte`, `gruvbox-dark`,
-and `monokai`. `NO_COLOR=1` disables palette colors while retaining semantic
-text modifiers.
+and `monokai`. Precedence is `--theme` > `$MOW_THEME` >
+`extensions.mowi.theme` > `catppuccin-mocha`. Permission mode is
+`--ask`/`--auto` > `$MOW_PERMISSION_MODE` >
+`extensions.mowi.permission_mode` > ask. The pack section is fetched
+with `extension.config` `{name:"mowi"}` when the host advertises that
+method. `NO_COLOR=1` disables palette colors while retaining semantic text
+modifiers.
 
 ## PTY smoke
 
@@ -40,4 +49,6 @@ With [Microsoft shell-use](https://github.com/microsoft/shell-use) installed:
 scripts/smoke-tui.sh
 ```
 
-The smoke uses a deterministic JSON-RPC fixture; it requires no model credentials.
+The smoke uses a deterministic JSON-RPC fixture and requires no model
+credentials. It checks startup/resume, themes, resize, scrolling and typing,
+live assistant/tool progress, immediate write/edit diff cards, and clean exit.

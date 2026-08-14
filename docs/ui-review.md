@@ -41,7 +41,7 @@ fill bar. A ` · ` joins safety to the first optional chip and is omitted
 when none remain. Drop order (first to go): tokens, git, extra-roots,
 Goal, context, then identity (workspace, effort, model). There is no
 minimum-width gate — the compact size chip is offered whenever used
-tokens are known and peels when the row overflows. The git chip is a cached local
+tokens are known and peels when the row overflows.
 probe of the RPC workspace (never per frame, hidden outside a worktree).
 Extra-roots appear only from host `status`/`session` fields. Goal appears
 only from `graph.goal.*` and does not stay after completion once the
@@ -151,9 +151,11 @@ call, so the scrollbar extent never drifts. Pinned by `tool_group_summary_*`,
 
 Widgets never name raw colours — they ask `Theme` for a semantic role
 (`header`, `badge(Tone::Warn)`, `user_rail`). The palette is Catppuccin
-Mocha; a flavour swap should be one table in `theme.rs`. Historical user
-text is peach on the user band (not blue). Header and footer grounds are
-`Color::Reset` (the terminal default).
+Mocha; a flavour swap should be one table in `theme.rs`. Diffs use a
+dedicated `DiffPalette` (sage/rose washes, theme-text body, accent on the
+sign and word chip) so they do not share ok/error green/red. Historical
+user text is peach on the user band (not blue). Header and footer grounds
+are `Color::Reset` (the terminal default).
 
 Every role must degrade under `NO_COLOR` to modifiers only. This is enforced
 by `no_color_theme_never_emits_color` — if you add a role, add it there.

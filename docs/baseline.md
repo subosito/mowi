@@ -1,15 +1,14 @@
-# Baseline — what Go mowi already is
+# Baseline — current Rust mowi behavior
 
-Source of truth: `mow/packs/mowi`. This crate should reach **the same
-operator experience**, not a subset that forgets permissions or resume.
+Source of truth: the Rust implementation and its snapshot/PTTY tests. Optional host features are advertised by RPC capabilities and `slash.list`.
 
 ## Screen (document, not chat log)
 
 | Region | Behavior |
 |---|---|
-| Header | Left: `mowi`, workspace basename, `model (effort)`. Right: safety chips (write/shell, ask/auto), then optional git / extra-root / status-bar Goal states, then the token chip, then the context size (`32k/128k ctx`, or `32k ctx` if the window is unknown) at the far right. A ` · ` joins safety to the first optional chip and is omitted when none remain. Drop order (first to go): tokens, extra-roots, context size, then identity (workspace, effort, model). Safety never drops. The git chip is a cached local probe of the RPC workspace (startup + debounce after mutating tools / turn end; never per frame; hidden outside a worktree). Extra-root chips appear only when `status`/`session` sent those fields. The status-bar Goal state is driven only by confirmed `graph.goal.*` events and clears after `done`/`failed` on the next user prompt. Session id is never a header or status-bar chip; the help overlay titles the full id. |
+| Header | Left: `mowi`, workspace basename, `model (effort)`. Right: safety (`write`/`shell` combinations, ask/auto), optional `+N roots`, tokens, and far-right context size (`32k/128k ctx` or `32k ctx`). Optional chips use ` · ` separators and disappear cleanly. Drop order: tokens → roots → context → identity; safety never drops. |
 | Transcript | User blocks (soft fill), assistant markdown, one compact tool line per call — a turn's calls collapse into a counted row (`⚙ bash ×2 · grep`) that shortens by whole tokens on a narrow pane (Esc collapses an expanded group). While busy, a bounded live progress section shows streaming answer tokens, the current/recent tool (verb + path), and write/edit diffs as review cards; it folds into the tool group at turn end. Edits = inline review cards (−/+). |
-| Status bar | Idle: `● idle`. Busy: spinner, elapsed, verb (and typing pulse while tokens land) on this row — no separate activity band. Hints flush right and degrade before state does. |
+| Status bar | Idle: `● idle`. Busy: one stable turn spinner, elapsed, verb, optional Goal progress, concurrent peer count, and queue state. Tool rows in the transcript use their own clock-motion spinner. |
 | Input | Sits on the document ground with a horizontal inset and no box. Enter sends; busy queues. `/steer` redirects the running turn. |
 | Welcome | Splash, dismisses on any key. Short panes drop the tagline/effort first so access and `type to begin` still fit. |
 | Min size | 40×10; below that a size warning, not a broken frame. |
@@ -21,7 +20,7 @@ operator experience**, not a subset that forgets permissions or resume.
 | Enter | send (queue if busy) |
 | ctrl+j | newline (input grows 1–10 rows) |
 | ↑ / ↓ | browse prompt history |
-| Esc | dismiss overlay, else collapse tool calls, else cancel turn, else ignore |
+| Esc | dismiss overlay / collapse tools; while busy, press twice within 1.5s to cancel |
 | ctrl+l | clear transcript (UI-local; Engine history remains) |
 | shift+tab | ask ↔ auto (`perm.set`) |
 | ctrl+p | expand the last peer buffer in an overlay |
@@ -33,8 +32,7 @@ operator experience**, not a subset that forgets permissions or resume.
 | paste | bracketed paste at the cursor, multi-line safe |
 | any key | dismiss the welcome splash |
 
-All bindings remappable later (`extensions.tui.keys` in Go). v1 hard-codes
-defaults. Quit is `/quit` / `/exit` / `/q` or ctrl+c — a lone `q` on empty
+Key bindings are currently fixed. v1 hard-codes the defaults. Quit is `/quit` / `/exit` / `/q` or ctrl+c — a lone `q` on empty
 input does not quit. Mowi captures wheel events for transcript scrolling; hold Shift while dragging for terminal-native selection/copy.
 
 ## Commands (typed)
@@ -86,8 +84,10 @@ strip: tool name plus the command string when the args carry one, else
 pretty-printed args JSON. Esc denies the prompt (never auto-allows). Keys
 are ignored for ~200 ms after paint so a stray key cannot approve.
 
-Default Go mowi is ask when capabilities are on. This crate should
-`perm.set ask` unless `--auto`.
+Mowi requests ask mode unless `--auto`, `$MOW_PERMISSION_MODE=auto`, or
+`extensions.mowi.permission_mode: auto` wins the precedence stack
+(CLI > env > pack > default ask). `--ask` / `--auto` are explicit;
+absent flags fall through.
 
 Trust: `mow trust` / `mowi trust` out of band. No marker in the workspace.
 
@@ -104,10 +104,11 @@ External peers often omit usage; chip stays host-only then.
 
 ## Diffs (flashdiff recipe)
 
-Dark sunk band + theme accent as text. Mocha: add `#a6e3a1` on ~`#334138`,
-del `#f38ba8` on ~`#4d3240`. Syntax highlight **context only**. Word-diff:
-shared tokens stay full accent; changed tokens invert. Gutter unbanded,
-tinted numbers. See mow `packs/mowi/styles.go` / `diff_*.go`.
+Dark sunk band + theme text as the row body; dedicated add/del accents on
+the sign and the inverted word chip (not the semantic ok/error green/red).
+Mocha: text `#cdd6f4` on add `#334138` / del `#3c2f34`; signs `#a6e3a1` /
+`#f38ba8`. Syntax highlight **context only**. Word-diff: shared tokens stay
+on the band; changed tokens invert. Gutter unbanded, tinted numbers.
 
 Diff entries render as a review card: a `─ <file>` rule parsed from the `+++`
 header, then full-width bands. Add/del rows are padded to the transcript width
@@ -130,40 +131,31 @@ are unbound (they do not scroll and they do not type). The client captures mouse
 
 - Default theme name: catppuccin-mocha; selectable names are
   catppuccin-mocha, catppuccin-latte, gruvbox-dark, and monokai
-- Select with `--theme NAME` or `MOW_THEME=NAME`; unknown names list all
-  available themes
+- Select with `--theme NAME` or `MOW_THEME=NAME`; those beat
+  `extensions.mowi.theme`. Unknown CLI/env names list all available themes.
 - `NO_COLOR=1` — glyphs still distinct (◇ ⚙ ✕ ▲)
 - `MOW_NO_ANIM=1` — still spinner; elapsed still ticks
-- Native terminal selection/copy (no mouse capture; scroll with ↑↓ / pgup/pgdn)
+- Mouse wheel is captured for transcript scrolling; hold Shift while dragging for terminal-native selection/copy
 - Not screen-reader complete; keyboard-complete is required
 
-## Config (Go: `extensions.tui`)
+## Config (`extensions.mowi`)
 
-welcome, welcome_message, prompt glyph, theme.name / colors, keys.
+Fetched over RPC with `extension.config` `{name:"mowi"}` when the host
+advertises the method. The client does not open a second config file.
 
-v1: env + flags only is OK. Do not require a second config file.
+```yaml
+extensions:
+  mowi:
+    permission_mode: ask          # ask | auto
+    theme: catppuccin-mocha       # full identifier
+    welcome: true
+    welcome_message: hello pack   # optional splash tagline
+    prompt: "❯"
+```
 
-## Files in Go mowi (map for ports)
-
-| File | Role |
-|---|---|
-| `tui.go` | model, Engine hooks, seedTranscript |
-| `tui_update.go` | keys, mouse, overlays |
-| `tui_chrome.go` | header, layout, help |
-| `tui_transcript.go` | entries, applyVP |
-| `tui_stream.go` | live answer + peer buffers |
-| `tui_perm.go` | ask strip |
-| `tui_commands.go` | `/sessions`, `/status`, … |
-| `packslash.go` | slash.Lookup |
-| `peer_live.go` | peer collapse |
-| `virtual.go` | off-screen placeholders |
-| `diff_*.go` | review cards |
-| `styles.go` | palette, flashdiff wash |
-| `markdown_render.go` | glamour |
-| `cmd/mowi/main.go` | flags + pack subcommands |
-
-This crate: `rpc` client + `app` (ratatui) + `render`. No `cmd` pack
-dispatch — operators use `mow review` / `mow acp` on the mow binary.
+Precedence: CLI > env (`$MOW_THEME`, `$MOW_PERMISSION_MODE`) >
+`extensions.mowi` > built-in defaults. Absent method → defaults after
+CLI/env. Keys stay hard-coded.
 
 ## Out of scope for the Rust binary
 

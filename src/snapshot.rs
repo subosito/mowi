@@ -165,9 +165,8 @@ pub fn scene_with_theme(name: &str, theme: Theme) -> App {
                     .into(),
                 duration_ms: Some(340),
             });
-            app.entries.push(Entry::Assistant(
-                "It is the Ratatui client for the mow harness.".into(),
-            ));
+            app.entries
+                .push(Entry::Assistant("Mowi is mow with interface.".into()));
         }
         // Tool-grouping scene: one turn's four tool calls collapse to a
         // counted summary (`read ×2 · grep · bash`); an expanded group
@@ -268,6 +267,7 @@ pub fn scene_with_theme(name: &str, theme: Theme) -> App {
 }
 
 /// Render `scene` at `width`x`height` and return it as an ANSI string.
+#[cfg(test)]
 pub fn render(name: &str, width: u16, height: u16) -> String {
     render_with_theme(name, width, height, Theme::detect())
 }

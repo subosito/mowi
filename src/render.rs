@@ -614,18 +614,35 @@ fn git_diff_path(rest: &str) -> Option<String> {
 /// `+` row, the changed span of each is inverted as a word chip.
 pub fn diff_lines(text: &str, theme: Theme, width: u16) -> Vec<Line<'static>> {
     let rows: Vec<String> = text.lines().map(|row| expand_tabs(row, 0)).collect();
+    let number_width = diff_number_width(&rows);
+    let gutter_width = number_width * 2 + 4; // old + space + new + " │ "
+    let body_width = width.saturating_sub(gutter_width as u16).max(1);
+    let mut old_line: Option<usize> = None;
+    let mut new_line: Option<usize> = None;
     let mut out = Vec::with_capacity(rows.len());
     let mut index = 0;
     while index < rows.len() {
         let row = rows[index].as_str();
         if row.is_empty() {
-            // Blank source lines are not painted: they show up as a hole after
-            // `@@` and break the card. A real empty file line is ` ` (space).
             index += 1;
             continue;
         }
-        if row.starts_with("+++") || row.starts_with("---") || row.starts_with("@@") {
+        if row.starts_with("@@") {
+            if let Some((old, new)) = parse_hunk_starts(row) {
+                old_line = Some(old);
+                new_line = Some(new);
+            }
             out.push(Line::from(Span::styled(row.to_string(), theme.diff_meta())));
+            index += 1;
+            continue;
+        }
+        if row.starts_with("+++") || row.starts_with("---") || row.starts_with("diff --git") {
+            out.push(Line::from(Span::styled(row.to_string(), theme.diff_meta())));
+            index += 1;
+            continue;
+        }
+        if row.starts_with("\\ No newline") {
+            out.push(numbered_context(None, None, row, number_width, theme));
             index += 1;
             continue;
         }
@@ -633,39 +650,163 @@ pub fn diff_lines(text: &str, theme: Theme, width: u16) -> Vec<Line<'static>> {
         let add_style = (theme.add(), theme.add_sign(), theme.add_chip());
         match (row.strip_prefix('-'), row.strip_prefix('+')) {
             (Some(old_body), None) => {
-                // Pair with the next row to word-diff a single-line edit.
                 let new_body = rows
                     .get(index + 1)
                     .map(|s| s.as_str())
                     .filter(|next| !next.starts_with("+++"))
                     .and_then(|next| next.strip_prefix('+'));
+                let old_no = old_line;
+                old_line = old_line.map(|n| n + 1);
                 match new_body {
                     Some(new_body) => {
+                        let new_no = new_line;
+                        new_line = new_line.map(|n| n + 1);
                         let (old_chip, new_chip) = match changed_span(old_body, new_body) {
                             Some((old_range, new_range)) => (Some(old_range), Some(new_range)),
                             None => (None, None),
                         };
-                        out.push(band('−', old_body, old_chip, del_style, width));
-                        out.push(band('+', new_body, new_chip, add_style, width));
+                        out.push(numbered_band(
+                            old_no,
+                            None,
+                            '−',
+                            old_body,
+                            old_chip,
+                            del_style,
+                            number_width,
+                            body_width,
+                            theme,
+                        ));
+                        out.push(numbered_band(
+                            None,
+                            new_no,
+                            '+',
+                            new_body,
+                            new_chip,
+                            add_style,
+                            number_width,
+                            body_width,
+                            theme,
+                        ));
                         index += 2;
                     }
                     None => {
-                        out.push(band('−', old_body, None, del_style, width));
+                        out.push(numbered_band(
+                            old_no,
+                            None,
+                            '−',
+                            old_body,
+                            None,
+                            del_style,
+                            number_width,
+                            body_width,
+                            theme,
+                        ));
                         index += 1;
                     }
                 }
             }
             (None, Some(new_body)) => {
-                out.push(band('+', new_body, None, add_style, width));
+                let new_no = new_line;
+                new_line = new_line.map(|n| n + 1);
+                out.push(numbered_band(
+                    None,
+                    new_no,
+                    '+',
+                    new_body,
+                    None,
+                    add_style,
+                    number_width,
+                    body_width,
+                    theme,
+                ));
                 index += 1;
             }
             _ => {
-                out.push(Line::from(Span::styled(row.to_string(), theme.context())));
+                let body = row.strip_prefix(' ').unwrap_or(row);
+                let old_no = old_line;
+                let new_no = new_line;
+                old_line = old_line.map(|n| n + 1);
+                new_line = new_line.map(|n| n + 1);
+                out.push(numbered_context(old_no, new_no, body, number_width, theme));
                 index += 1;
             }
         }
     }
     out
+}
+
+fn parse_hunk_starts(row: &str) -> Option<(usize, usize)> {
+    let mut fields = row.split_whitespace();
+    (fields.next()? == "@@").then_some(())?;
+    let old = fields
+        .next()?
+        .strip_prefix('-')?
+        .split(',')
+        .next()?
+        .parse()
+        .ok()?;
+    let new = fields
+        .next()?
+        .strip_prefix('+')?
+        .split(',')
+        .next()?
+        .parse()
+        .ok()?;
+    Some((old, new))
+}
+
+fn diff_number_width(rows: &[String]) -> usize {
+    let mut max_no = 1usize;
+    for row in rows {
+        if let Some((old, new)) = parse_hunk_starts(row) {
+            max_no = max_no.max(old).max(new);
+        }
+    }
+    max_no.to_string().len().max(2)
+}
+
+fn gutter_spans(
+    old: Option<usize>,
+    new: Option<usize>,
+    digits: usize,
+    theme: Theme,
+) -> Vec<Span<'static>> {
+    let number =
+        |n: Option<usize>| n.map_or_else(|| " ".repeat(digits), |n| format!("{n:>digits$}"));
+    vec![
+        Span::styled(number(old), theme.diff_meta()),
+        Span::styled(" ", theme.chrome()),
+        Span::styled(number(new), theme.diff_meta()),
+        Span::styled(" │ ", theme.chrome()),
+    ]
+}
+
+fn numbered_context(
+    old: Option<usize>,
+    new: Option<usize>,
+    body: &str,
+    digits: usize,
+    theme: Theme,
+) -> Line<'static> {
+    let mut spans = gutter_spans(old, new, digits, theme);
+    spans.push(Span::styled(body.to_string(), theme.context()));
+    Line::from(spans)
+}
+
+fn numbered_band(
+    old: Option<usize>,
+    new: Option<usize>,
+    sign: char,
+    body: &str,
+    chip: Option<Range<usize>>,
+    styles: (Style, Style, Style),
+    digits: usize,
+    width: u16,
+    theme: Theme,
+) -> Line<'static> {
+    let mut spans = gutter_spans(old, new, digits, theme);
+    spans.extend(band(sign, body, chip, styles, width).spans);
+    Line::from(spans)
 }
 
 /// Replace tabs with spaces at tabstops of 8, starting at `col`.
@@ -701,12 +842,16 @@ fn band(
     width: u16,
 ) -> Line<'static> {
     let (band, sign_style, chip_style) = styles;
-    let max_body = (width as usize).saturating_sub(1);
+    // Reserve a dedicated two-cell sign gutter: `+ ` / `− `.
+    let max_body = (width as usize).saturating_sub(2);
     let body = clip_cols(body, max_body);
     let chip = chip.filter(|range| {
         range.start <= body.len() && range.end <= body.len() && range.start <= range.end
     });
-    let mut spans = vec![Span::styled(sign.to_string(), sign_style)];
+    let mut spans = vec![
+        Span::styled(sign.to_string(), sign_style),
+        Span::styled(" ", band),
+    ];
     match chip
         .filter(|range| body.is_char_boundary(range.start) && body.is_char_boundary(range.end))
     {
@@ -875,8 +1020,8 @@ mod tests {
             lines.iter().map(plain).collect::<Vec<_>>()
         );
         assert!(plain(&lines[0]).starts_with("@@"));
-        assert!(plain(&lines[1]).starts_with('−'));
-        assert!(plain(&lines[2]).starts_with('+'));
+        assert!(plain(&lines[1]).contains('−'));
+        assert!(plain(&lines[2]).contains('+'));
     }
 
     fn plain(line: &Line<'_>) -> String {
@@ -1025,6 +1170,33 @@ mod tests {
     }
 
     #[test]
+    fn diff_rows_show_old_new_line_numbers_and_context() {
+        let theme = Theme::plain(ThemeName::CatppuccinMocha);
+        let lines = diff_lines(
+            "--- a/x.rs\n+++ b/x.rs\n@@ -10,4 +10,4 @@\n keep before\n-old value\n+new value\n keep after",
+            theme,
+            40,
+        );
+        let text: Vec<String> = lines.iter().map(plain).collect();
+        assert!(
+            text.iter().any(|row| row.contains("10 10 │ keep before")),
+            "{text:?}"
+        );
+        assert!(
+            text.iter().any(|row| row.contains("11    │ − old value")),
+            "{text:?}"
+        );
+        assert!(
+            text.iter().any(|row| row.contains("   11 │ + new value")),
+            "{text:?}"
+        );
+        assert!(
+            text.iter().any(|row| row.contains("12 12 │ keep after")),
+            "{text:?}"
+        );
+    }
+
+    #[test]
     fn add_and_del_rows_are_padded_into_full_width_bands() {
         let theme = Theme::colored(ThemeName::CatppuccinMocha);
         let lines = diff_lines("@@ -1 +1 @@\n-old\n+new", theme, 20);
@@ -1060,7 +1232,7 @@ mod tests {
             lines[2]
                 .spans
                 .iter()
-                .all(|span| add_family.contains(&span.style.bg)),
+                .all(|span| span.style.bg.is_none() || add_family.contains(&span.style.bg)),
             "add row leaked another band: {:?}",
             lines[2]
                 .spans
@@ -1080,7 +1252,7 @@ mod tests {
     fn context_rows_are_not_padded_or_washed() {
         let theme = Theme::colored(ThemeName::CatppuccinMocha);
         let lines = diff_lines("@@ -1 +1 @@\n unchanged", theme, 30);
-        assert_eq!(plain(&lines[1]), " unchanged");
+        assert!(plain(&lines[1]).ends_with("unchanged"));
         assert_eq!(lines[1].spans[0].style.bg, None);
     }
 
@@ -1093,17 +1265,22 @@ mod tests {
             assert_ne!(row.spans[0].style, theme.add());
         }
         // The real add row still gets the wash.
-        assert_eq!(lines[3].spans[0].style, theme.add_sign());
+        assert!(
+            lines[3]
+                .spans
+                .iter()
+                .any(|span| span.style == theme.add_sign())
+        );
     }
 
     #[test]
     fn signs_use_minus_and_survive_no_color() {
         let theme = Theme::plain(ThemeName::CatppuccinMocha);
         let lines = diff_lines("@@ -1 +1 @@\n-old\n+new", theme, 12);
-        assert!(plain(&lines[1]).starts_with('−'), "want U+2212 minus");
-        assert!(plain(&lines[2]).starts_with('+'));
+        assert!(plain(&lines[1]).contains('−'), "want U+2212 minus");
+        assert!(plain(&lines[2]).contains('+'));
         // No RGB when colour is off.
-        assert_eq!(lines[1].spans[1].style.bg, None);
+        assert!(lines[1].spans.iter().all(|span| span.style.bg.is_none()));
     }
 
     #[test]

@@ -43,9 +43,15 @@ pub mod mocha {
     pub const MANTLE: Color = Color::Rgb(0x18, 0x18, 0x25);
     pub const CRUST: Color = Color::Rgb(0x11, 0x11, 0x1b);
 
-    /// Diff bands: deeper accent hue mixed into `base` so +/− rows pop more.
-    pub const ADD_BAND: Color = Color::Rgb(0x26, 0x4f, 0x3d);
-    pub const DEL_BAND: Color = Color::Rgb(0x5e, 0x2d, 0x3a);
+    /// Diff signs / word chips. Same hex as `GREEN`/`RED` on Mocha, but a
+    /// dedicated token so badges and diffs can diverge.
+    pub const DIFF_ADD: Color = GREEN;
+    pub const DIFF_DEL: Color = RED;
+    /// Sage/rose washes (Catppuccin-delta), not forest/maroon caves.
+    pub const ADD_BAND: Color = Color::Rgb(0x33, 0x41, 0x38);
+    pub const DEL_BAND: Color = Color::Rgb(0x3c, 0x2f, 0x34);
+    pub const ADD_CHIP: Color = GREEN;
+    pub const DEL_CHIP: Color = RED;
 }
 
 /// Full theme identifiers accepted by the CLI and `MOW_THEME`.
@@ -84,6 +90,12 @@ impl ThemeName {
     }
 }
 
+impl Default for ThemeName {
+    fn default() -> Self {
+        Self::CatppuccinMocha
+    }
+}
+
 impl fmt::Display for ThemeName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -107,6 +119,21 @@ impl FromStr for ThemeName {
     }
 }
 
+/// Add/del tokens, kept apart from semantic `green`/`red` (ok/error badges).
+///
+/// Line bodies use theme `text` on the band; these accents paint the sign
+/// column and the inverted word chip. That is the GitHub/Primer recipe:
+/// hue is a cue, not the only way to read the row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiffPalette {
+    pub add: Color,
+    pub del: Color,
+    pub add_band: Color,
+    pub del_band: Color,
+    pub add_chip: Color,
+    pub del_chip: Color,
+}
+
 /// Colors consumed by semantic theme methods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
@@ -126,8 +153,7 @@ pub struct Palette {
     pub yellow: Color,
     pub green: Color,
     pub red: Color,
-    pub add_band: Color,
-    pub del_band: Color,
+    pub diff: DiffPalette,
 }
 
 impl Palette {
@@ -149,8 +175,14 @@ impl Palette {
             yellow: mocha::YELLOW,
             green: mocha::GREEN,
             red: mocha::RED,
-            add_band: mocha::ADD_BAND,
-            del_band: mocha::DEL_BAND,
+            diff: DiffPalette {
+                add: mocha::DIFF_ADD,
+                del: mocha::DIFF_DEL,
+                add_band: mocha::ADD_BAND,
+                del_band: mocha::DEL_BAND,
+                add_chip: mocha::ADD_CHIP,
+                del_chip: mocha::DEL_CHIP,
+            },
         }
     }
 
@@ -172,8 +204,16 @@ impl Palette {
             yellow: Color::Rgb(0xdf, 0x8e, 0x1d),
             green: Color::Rgb(0x40, 0xa0, 0x2b),
             red: Color::Rgb(0xd2, 0x0f, 0x39),
-            add_band: Color::Rgb(0xd8, 0xed, 0xd2),
-            del_band: Color::Rgb(0xf5, 0xd5, 0xdc),
+            diff: DiffPalette {
+                add: Color::Rgb(0x40, 0xa0, 0x2b),
+                del: Color::Rgb(0xd2, 0x0f, 0x39),
+                add_band: Color::Rgb(0xdc, 0xee, 0xe0),
+                del_band: Color::Rgb(0xf6, 0xdc, 0xe1),
+                // Darker than semantic green so inverted chips meet ~4.5:1
+                // on latte base (`#40a02b` on `#eff1f5` is only ~3:1).
+                add_chip: Color::Rgb(0x25, 0x7a, 0x1d),
+                del_chip: Color::Rgb(0xd2, 0x0f, 0x39),
+            },
         }
     }
 
@@ -195,8 +235,14 @@ impl Palette {
             yellow: Color::Rgb(0xfa, 0xbd, 0x2f),
             green: Color::Rgb(0xb8, 0xbb, 0x26),
             red: Color::Rgb(0xfb, 0x49, 0x34),
-            add_band: Color::Rgb(0x3b, 0x4a, 0x2d),
-            del_band: Color::Rgb(0x52, 0x2f, 0x2b),
+            diff: DiffPalette {
+                add: Color::Rgb(0xb8, 0xbb, 0x26),
+                del: Color::Rgb(0xfb, 0x49, 0x34),
+                add_band: Color::Rgb(0x32, 0x39, 0x2a),
+                del_band: Color::Rgb(0x3d, 0x2a, 0x28),
+                add_chip: Color::Rgb(0xb8, 0xbb, 0x26),
+                del_chip: Color::Rgb(0xfb, 0x49, 0x34),
+            },
         }
     }
 
@@ -218,8 +264,14 @@ impl Palette {
             yellow: Color::Rgb(0xe6, 0xdb, 0x74),
             green: Color::Rgb(0xa6, 0xe2, 0x2e),
             red: Color::Rgb(0xf9, 0x26, 0x72),
-            add_band: Color::Rgb(0x35, 0x4a, 0x2a),
-            del_band: Color::Rgb(0x55, 0x2c, 0x3a),
+            diff: DiffPalette {
+                add: Color::Rgb(0xa6, 0xe2, 0x2e),
+                del: Color::Rgb(0xf9, 0x26, 0x72),
+                add_band: Color::Rgb(0x2e, 0x38, 0x28),
+                del_band: Color::Rgb(0x3d, 0x24, 0x30),
+                add_chip: Color::Rgb(0xa6, 0xe2, 0x2e),
+                del_chip: Color::Rgb(0xf9, 0x26, 0x72),
+            },
         }
     }
 }
@@ -257,8 +309,8 @@ impl Tone {
 
 /// Braille spinner — one cell wide, no layout jitter.
 pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-/// Tool activity uses a mechanical rotating arc, distinct from model work.
-pub const TOOL_SPINNER: [&str; 4] = ["◜", "◝", "◞", "◟"];
+/// Tool activity uses clock motion, distinct from the model-work braille orbit.
+pub const TOOL_SPINNER: [&str; 4] = ["◴", "◷", "◶", "◵"];
 pub const TOOL_SPINNER_STATIC: &str = "◆";
 
 /// Frame used when animation is off (`MOW_NO_ANIM=1`, or a non-TTY capture).
@@ -724,8 +776,8 @@ impl Theme {
     pub fn add(self) -> Style {
         if self.colored {
             Style::default()
-                .fg(self.palette.green)
-                .bg(self.palette.add_band)
+                .fg(self.palette.text)
+                .bg(self.palette.diff.add_band)
         } else {
             Style::default()
         }
@@ -734,8 +786,8 @@ impl Theme {
     pub fn del(self) -> Style {
         if self.colored {
             Style::default()
-                .fg(self.palette.red)
-                .bg(self.palette.del_band)
+                .fg(self.palette.text)
+                .bg(self.palette.diff.del_band)
         } else {
             Style::default()
         }
@@ -754,14 +806,28 @@ impl Theme {
         }
     }
 
-    /// Sign column of an added line: accent on the add band.
+    /// Sign column of an added line: dedicated add accent on the add band.
     pub fn add_sign(self) -> Style {
-        self.add().add_modifier(Modifier::BOLD)
+        if self.colored {
+            Style::default()
+                .fg(self.palette.diff.add)
+                .bg(self.palette.diff.add_band)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        }
     }
 
-    /// Sign column of a removed line: accent on the del band.
+    /// Sign column of a removed line: dedicated del accent on the del band.
     pub fn del_sign(self) -> Style {
-        self.del().add_modifier(Modifier::BOLD)
+        if self.colored {
+            Style::default()
+                .fg(self.palette.diff.del)
+                .bg(self.palette.diff.del_band)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        }
     }
 
     /// Word-diff chip inside an added line: inverted against the band.
@@ -769,7 +835,7 @@ impl Theme {
         if self.colored {
             Style::default()
                 .fg(self.palette.base)
-                .bg(self.palette.green)
+                .bg(self.palette.diff.add_chip)
         } else {
             Style::default().add_modifier(Modifier::REVERSED)
         }
@@ -778,7 +844,9 @@ impl Theme {
     /// Word-diff chip inside a removed line: inverted against the band.
     pub fn del_chip(self) -> Style {
         if self.colored {
-            Style::default().fg(self.palette.base).bg(self.palette.red)
+            Style::default()
+                .fg(self.palette.base)
+                .bg(self.palette.diff.del_chip)
         } else {
             Style::default().add_modifier(Modifier::REVERSED)
         }
@@ -803,6 +871,10 @@ mod tests {
             t.md_code(),
             t.add(),
             t.del(),
+            t.add_sign(),
+            t.del_sign(),
+            t.add_chip(),
+            t.del_chip(),
         ];
         for style in styles {
             assert!(style.fg.is_none(), "fg leaked with NO_COLOR");
@@ -857,6 +929,33 @@ mod tests {
                 .windows(2)
                 .all(|pair| pair[0].palette != pair[1].palette)
         );
+    }
+
+    #[test]
+    fn diff_roles_use_dedicated_palette_not_semantic_green() {
+        for name in ThemeName::ALL {
+            let t = Theme::colored(name.parse().unwrap());
+            assert_eq!(t.add().fg, Some(t.palette.text), "{name}");
+            assert_eq!(t.add().bg, Some(t.palette.diff.add_band), "{name}");
+            assert_eq!(t.del().fg, Some(t.palette.text), "{name}");
+            assert_eq!(t.del().bg, Some(t.palette.diff.del_band), "{name}");
+            assert_eq!(t.add_sign().fg, Some(t.palette.diff.add), "{name}");
+            assert_eq!(t.del_sign().fg, Some(t.palette.diff.del), "{name}");
+            assert_eq!(t.add_chip().bg, Some(t.palette.diff.add_chip), "{name}");
+            assert_eq!(t.del_chip().bg, Some(t.palette.diff.del_chip), "{name}");
+            assert_ne!(t.add().fg, t.badge(Tone::Ok).fg, "{name}");
+            assert_ne!(t.add().bg, t.del().bg, "{name}");
+        }
+    }
+
+    #[test]
+    fn mocha_diff_bands_are_sage_not_forest() {
+        let t = Theme::colored(ThemeName::CatppuccinMocha);
+        assert_eq!(t.palette.diff.add_band, mocha::ADD_BAND);
+        assert_eq!(t.palette.diff.del_band, mocha::DEL_BAND);
+        assert_eq!(mocha::ADD_BAND, Color::Rgb(0x33, 0x41, 0x38));
+        assert_eq!(mocha::DEL_BAND, Color::Rgb(0x3c, 0x2f, 0x34));
+        assert_ne!(t.palette.diff.add, t.palette.diff.del);
     }
 
     #[test]

@@ -1,7 +1,20 @@
-# Host protocol (`mow rpc` v3)
+# Host protocol (`mow rpc` compatibility epoch 1)
 
 Line-delimited JSON. One object per line. Requests may omit `"jsonrpc":"2.0"`.
 Responses and notifications always include it.
+
+The handshake reports three separate identities:
+
+- `rpc` is the wire compatibility epoch. Mowi requires epoch `1`. Additive
+  methods do not change it and must be feature-detected from `methods`. A future
+  incompatible wire contract uses a new epoch.
+- `version` is the mow release/build version, for diagnostics and optional
+  human-readable compatibility messages—not protocol gating.
+- `jsonrpc` is the JSON-RPC envelope version (`2.0`), not mow's protocol.
+
+Mowi should therefore gate correctness on `rpc` plus advertised methods, not on
+a minimum mow release. This supports backports and custom mow builds without
+pretending semantic-version ordering describes their capabilities.
 
 Spawn:
 
@@ -18,16 +31,21 @@ Stderr is Engine logs — do not parse it.
 
 ## Handshake
 
-1. `{"id":1,"method":"version"}` → `rpc` must be `"3"` or newer (additive protocol).
+1. `{"id":1,"method":"version"}` → `rpc` must be `"1"`. This is the compatibility epoch, not the mow release version.
    `methods`, `control_methods`, and `features` gate Help / completion /
    startup calls. An empty `methods` list means "not advertised" — do not
    infer a stock build. If `methods` is empty, try `capabilities` once.
 2. `{"id":2,"method":"session"}` → workspace, model, session_id.
 3. `{"id":3,"method":"status"}` → busy, allow_write, allow_shell, ask_mode.
-4. If the UI wants ask mode: `perm.set` `{mode:"ask"}` (default server is
-   fail-open auto).
-5. `transcript` to seed history on `--session` / `--continue` (messages may include additive RFC 3339 `ts`).
-6. `slash.list` for `/help` — only when advertised. Pack names (`/goal`,
+4. If `extension.config` is advertised: `{name:"mowi"}` for
+   `extensions.mowi`. Absent method, empty section, or a failed call
+   means built-in defaults.
+5. If the UI wants ask mode: `perm.set` `{mode:"ask"}` (default server is
+   fail-open auto). Mode comes from CLI `--ask`/`--auto`, then
+   `$MOW_PERMISSION_MODE`, then `extensions.mowi.permission_mode`, then
+   ask.
+6. `transcript` to seed history on `--session` / `--continue` (messages may include additive RFC 3339 `ts`).
+7. `slash.list` for `/help` — only when advertised. Pack names (`/goal`,
    `/review`, `/sec`, …) stay dynamic from that list.
 
 ## Methods
@@ -51,6 +69,7 @@ Stderr is Engine logs — do not parse it.
 | `effort.set` | yes | `{id}` | `{ok, effort}` |
 | `version` | yes | — | `{name, version, rpc, package, methods?, control_methods?, features?}` |
 | `capabilities` | yes | — | same surface as `version` when the handshake omitted `methods` |
+| `extension.config` | yes | `{name}` | `extensions.<name>` object (see below) |
 | `ping` | yes | — | `"pong"` |
 
 Control methods are answered concurrently with an in-flight `prompt`.
@@ -71,6 +90,25 @@ Engine.
 Caps: prompt/steer text 512k runes; event deltas 8k; transcript content 32k
 per message; stdin line 1 MiB.
 
+### `extension.config`
+
+Additive. Feature-detect from `version` / `capabilities` `methods`.
+Params: `{name:"mowi"}`. Result is the decoded `extensions.mowi` section
+(or `{config:{…}}` / `{mowi:{…}}`). Unknown fields are ignored.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `permission_mode` | `"ask"` \| `"auto"` | Initial `perm.set` when CLI/env did not set a mode. |
+| `theme` | string | Full theme identifier (`catppuccin-mocha`, `catppuccin-latte`, `gruvbox-dark`, `monokai`). |
+| `welcome` | bool | Fresh-session splash. Default on. |
+| `welcome_message` | string | Splash tagline; blank keeps the built-in line. |
+| `prompt` | string | Composer glyph; always stored with a trailing space. |
+
+Precedence: CLI (`--ask` / `--auto` / `--theme`) > env
+(`$MOW_PERMISSION_MODE` / `$MOW_THEME`) > this section > built-in
+defaults (`ask`, `catppuccin-mocha`, welcome on, `❯`). An empty
+`methods` list means the method is not advertised — do not probe.
+
 ### `status`
 
 `busy`, `run_id`, `session_id`, `workspace`, `model`, `wire`,
@@ -88,7 +126,7 @@ workspace itself.
 `args:["help"]` (also `-h`, `--help`, `?`) returns usage without `Run`.
 
 `exclusive && status.busy` → JSON-RPC error (not an envelope): refuse like
-Go mowi.
+the maintained TUI.
 
 `Run` failures (empty scope, bad flags) are **`{title, body, error}`** with
 a success `id` — paint as an error entry, not a crashed socket.
@@ -178,16 +216,7 @@ blocked so a stale `status` cannot leave a running chip. `done` /
 
 ## Host chrome
 
-mowi will not walk extra-root paths on a paint frame, and it will not
-consume RPC `git` metadata. Current `mow rpc` does not emit extra-root
-fields; this is the contract for a later host change. Do not edit
-`../mow` from this client task.
-
 ### Git (client-owned)
-
-The header git chip is a cached local probe of the RPC `workspace`
-path (`git rev-parse --abbrev-ref HEAD` + `git status --porcelain`).
-Rules:
 
 - Probe on startup and after a mutating tool (`write` / `edit` /
   `bash` / `apply_patch` / `str_replace`) or turn end.
@@ -224,6 +253,8 @@ explicit empty `extra_roots` array clears the chip.
 - `extra_roots` on `status` and `session` — client decodes the shapes
   above; host does not emit them yet. Git is client-owned.
 - Model picker catalog — v1 can omit
-- Theme / keys — UI-local config
+- Keys — UI-local; not configurable through `extensions.mowi` yet
+- Theme / permission / welcome — `extension.config` `{name:"mowi"}` when
+  advertised; otherwise CLI, env, and built-in defaults
 - Binary diffs — events carry text; UI pretty-prints
 - Spawning peers — Engine only

@@ -1,10 +1,12 @@
-//! mowi — Ratatui client for `mow rpc`.
+//! mowi - mow with interface.
 //!
-//! The Engine runs in a child process (`mow rpc`); this binary only paints and
+//! Built using Ratatui. The Engine runs in a child process (`mow rpc`); this
+//! binary only paints and
 //! sends host-protocol requests. It never embeds an Engine and never speaks ACP
 //! to peers — peer management belongs to mow.
 
 mod app;
+mod config;
 mod render;
 mod rpc;
 mod slash;
@@ -24,25 +26,25 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use app::App;
+use config::{
+    MowiConfig, UserSources, cli_permission_mode, decode_mowi_config, env_permission_mode,
+    env_theme, resolve_config,
+};
 use rpc::Client;
 use theme::{Theme, ThemeName};
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Parser)]
-#[command(
-    name = "mowi",
-    version,
-    about = "Ratatui client for the mow harness (mow rpc)"
-)]
+#[command(name = "mowi", version, about = "mowi - mow with interface")]
 struct Cli {
     /// mow binary to spawn (`mow rpc …`).
     #[arg(long, env = "MOW_BIN", default_value = "mow")]
     mow_bin: String,
 
-    /// UI theme name.
-    #[arg(long, env = "MOW_THEME", default_value = "catppuccin-mocha")]
-    theme: ThemeName,
+    /// UI theme name (overrides `$MOW_THEME` and `extensions.mowi`).
+    #[arg(long)]
+    theme: Option<ThemeName>,
 
     /// Resume a session id (engine flag).
     #[arg(long)]
@@ -72,11 +74,13 @@ struct Cli {
     #[arg(long = "skill", action = clap::ArgAction::Append)]
     skill: Vec<String>,
 
-    /// Ask before power tools (engine flag).
+    /// Ask before power tools (engine flag; overrides `$MOW_PERMISSION_MODE`
+    /// and `extensions.mowi`).
     #[arg(long)]
     ask: bool,
 
-    /// Run power tools without asking (engine flag).
+    /// Run power tools without asking (engine flag; overrides
+    /// `$MOW_PERMISSION_MODE` and `extensions.mowi`).
     #[arg(long)]
     auto: bool,
 
@@ -156,6 +160,37 @@ impl Cli {
     }
 }
 
+/// CLI `--ask`/`--auto` and `--theme`, then `$MOW_PERMISSION_MODE` / `$MOW_THEME`.
+fn resolve_user_sources(cli: &Cli) -> Result<UserSources, String> {
+    let permission_mode = match cli_permission_mode(cli.ask, cli.auto) {
+        Some(mode) => Some(mode),
+        None => env_permission_mode()?,
+    };
+    let theme = match cli.theme {
+        Some(name) => Some(name),
+        None => env_theme()?,
+    };
+    Ok(UserSources {
+        permission_mode,
+        theme,
+    })
+}
+
+/// Feature-detect `extension.config`. Missing method or a failed call → defaults.
+fn load_mowi_config(client: &mut Client, version: &rpc::VersionInfo) -> MowiConfig {
+    let advertised = version
+        .methods
+        .iter()
+        .any(|method| method.eq_ignore_ascii_case("extension.config"));
+    if !advertised {
+        return MowiConfig::default();
+    }
+    match client.extension_config("mowi", HANDSHAKE_TIMEOUT) {
+        Ok(value) => decode_mowi_config(&value),
+        Err(_) => MowiConfig::default(),
+    }
+}
+
 /// Parse an extra-root spec the same way mow does (`SplitExtraRootSpec`):
 /// `PATH:ro` is read-only; `PATH` / `PATH:rw` are read-write. The suffix is
 /// case-insensitive. Returns `(path, read_only)`.
@@ -192,7 +227,14 @@ fn main() -> ExitCode {
         height,
     }) = &cli.command
     {
-        print_snapshots(scene, *width, *height, Theme::new(cli.theme));
+        let theme = match resolve_user_sources(&cli) {
+            Ok(user) => Theme::new(resolve_config(&user, &MowiConfig::default()).theme),
+            Err(e) => {
+                eprintln!("mowi: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
+        print_snapshots(scene, *width, *height, theme);
         return ExitCode::SUCCESS;
     }
     let ping_only = cli.no_tui || matches!(cli.command, Some(Command::Ping));
@@ -250,8 +292,10 @@ fn ping(cli: &Cli) -> Result<(), rpc::Error> {
 
 fn tui(cli: &Cli) -> Result<(), rpc::Error> {
     let (mut client, session, version) = connect(cli)?;
-    let mode = if cli.auto { "auto" } else { "ask" };
-    client.perm_set(mode, HANDSHAKE_TIMEOUT)?;
+    let user = resolve_user_sources(cli).map_err(rpc::Error::Protocol)?;
+    let pack = load_mowi_config(&mut client, &version);
+    let resolved = resolve_config(&user, &pack);
+    client.perm_set(resolved.permission_mode.as_str(), HANDSHAKE_TIMEOUT)?;
     let resuming = cli.session.is_some() || cli.continue_session;
     let mut app = if resuming {
         let messages = client.transcript(HANDSHAKE_TIMEOUT)?;
@@ -259,17 +303,16 @@ fn tui(cli: &Cli) -> Result<(), rpc::Error> {
     } else {
         App::new(session)
     };
-    app.theme = Theme::new(cli.theme);
+    app.apply_resolved_config(&resolved);
     // Feature-detect from the advertised surface. Empty methods stay empty.
     app.apply_host_surface(&version);
-    app.ask_mode = !cli.auto;
     app.allow_write = cli.allow_write;
     app.allow_shell = cli.allow_shell;
     if let Ok(status) = client.status(HANDSHAKE_TIMEOUT) {
         app.apply_status(&status);
     }
-    // Splash only for a fresh session (no transcript seed).
-    app.welcome = app.entries.is_empty();
+    // Splash only for a fresh session (no transcript seed) when config allows it.
+    app.welcome = app.entries.is_empty() && resolved.welcome;
     if app.supports("slash.list") {
         app.slash_commands = client.slash_list(HANDSHAKE_TIMEOUT)?;
     }
@@ -303,6 +346,7 @@ fn tui(cli: &Cli) -> Result<(), rpc::Error> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    use config::PermissionMode;
 
     #[test]
     fn cli_verifies() {
@@ -312,7 +356,34 @@ mod tests {
     #[test]
     fn theme_flag_accepts_full_names() {
         let cli = Cli::parse_from(["mowi", "--theme", "gruvbox-dark"]);
-        assert_eq!(cli.theme, ThemeName::GruvboxDark);
+        assert_eq!(cli.theme, Some(ThemeName::GruvboxDark));
+    }
+
+    #[test]
+    fn theme_and_ask_auto_absent_are_none() {
+        let cli = Cli::parse_from(["mowi"]);
+        assert_eq!(cli.theme, None);
+        assert!(!cli.ask);
+        assert!(!cli.auto);
+        assert_eq!(cli_permission_mode(cli.ask, cli.auto), None);
+    }
+
+    #[test]
+    fn ask_and_auto_flags_are_explicit() {
+        let ask = Cli::parse_from(["mowi", "--ask"]);
+        assert!(ask.ask);
+        assert!(!ask.auto);
+        assert_eq!(
+            cli_permission_mode(ask.ask, ask.auto),
+            Some(PermissionMode::Ask)
+        );
+        let auto = Cli::parse_from(["mowi", "--auto"]);
+        assert!(auto.auto);
+        assert!(!auto.ask);
+        assert_eq!(
+            cli_permission_mode(auto.ask, auto.auto),
+            Some(PermissionMode::Auto)
+        );
     }
 
     #[test]

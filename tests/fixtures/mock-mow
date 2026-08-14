@@ -4,7 +4,7 @@ for line in sys.stdin:
     try: req=json.loads(line)
     except Exception: continue
     i=req.get('id'); m=req.get('method')
-    if m=='version': result={'name':'mow','version':'test','rpc':'4','methods':['prompt','cancel','status','session','transcript','slash.list','perm.set','effort.list','context'],'control_methods':['cancel','status','session','transcript','slash.list','perm.set','effort.list','context'],'features':{}}
+    if m=='version': result={'name':'mow','version':'test','rpc':'1','methods':['prompt','cancel','status','session','transcript','slash.list','perm.set','effort.list','context','extension.config'],'control_methods':['cancel','status','session','transcript','slash.list','perm.set','effort.list','context','extension.config'],'features':{}}
     elif m=='session': result={'session_id':'pty-session','workspace':'/tmp/fixture-workspace','model':'fixture-model','wire':'fixture'}
     elif m=='status': result={'busy':False,'allow_write':False,'allow_shell':False,'ask_mode':True,'session_id':'pty-session','workspace':'/tmp/fixture-workspace','model':'fixture-model'}
     elif m=='transcript': result={'messages':[{'role':'user','content':'resumed prompt','ts':'2026-08-14T04:02:00Z'},{'role':'assistant','content':'resumed answer'}]}
@@ -12,6 +12,12 @@ for line in sys.stdin:
     elif m=='effort.list': result={'efforts':[],'current':'none','default':'none'}
     elif m=='context': result={'tokens':123,'context_window':1000,'percent':12.3}
     elif m=='perm.set': result={'ok':True,'ask_mode':req.get('params',{}).get('mode')=='ask'}
+    elif m=='extension.config':
+        name=(req.get('params') or {}).get('name')
+        if name=='mowi':
+            result={'permission_mode':'ask','theme':'catppuccin-mocha','welcome':True,'welcome_message':'fixture splash','prompt':'❯'}
+        else:
+            result={}
     elif m=='cancel': result={'ok':True}
     elif m=='prompt':
         def ev(params):

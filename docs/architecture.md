@@ -19,7 +19,6 @@ mowi does:
 - probe Git branch/dirty locally from the RPC workspace (startup + debounce
   after mutating tools / turn end; never per frame; hide outside a worktree)
 - decode optional `extra_roots` when `status` / `session` send them — never
-  by walking roots per frame, and never by consuming RPC `git` metadata
 
 ## Processes
 
@@ -40,7 +39,7 @@ Default: mowi **spawns** `mow` (or `$MOW_BIN`) with `rpc` plus the same engine
 flags the user passed. Alternative: attach to an already-running `mow rpc` on
 stdio / a socket later — not required for v1.
 
-One Engine per process. In-app session switch is out (same as Go mowi):
+One Engine per process. In-app session switch is out (by design):
 resume with `--session` / `--continue` on the next launch.
 
 ## Why RPC, not ACP, for the UI
@@ -71,8 +70,13 @@ Workspace trust (`mow trust`) stays out-of-band. mowi may shell out to
 
 `--allow-write` / `--allow-shell` / `--ask` / `--auto` / `--extra-root` are
 **engine flags** passed through to `mow rpc`. `--extra-root` is repeatable
-and uses mow's spec: `PATH`, `PATH:ro`, or explicit `PATH:rw`. After
-connect, `perm.set` mirrors ask/auto so the UI and Engine agree.
+and uses mow's spec: `PATH`, `PATH:ro`, or explicit `PATH:rw`. `--ask` /
+`--auto` are forwarded only when present on the CLI. After connect,
+`perm.set` mirrors the resolved mode (CLI > `$MOW_PERMISSION_MODE` >
+`extensions.mowi` > ask) so the UI and Engine agree.
+
+UI config is `extensions.mowi` via additive `extension.config`
+`{name:"mowi"}` when advertised. mowi never opens the host YAML itself.
 
 ## Packs
 
@@ -83,7 +87,7 @@ build from an empty `version.methods` list. Help, completion, and
 behavior are gated by advertised `methods` / `control_methods` /
 `features` plus the cached `slash.list`.
 
-## Improved vs Go mowi
+## Rust client properties
 
 Same baseline ([baseline.md](baseline.md)), deliberately better in:
 

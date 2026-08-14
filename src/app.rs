@@ -32,6 +32,7 @@ use serde_json::Value;
 use unicode_width::UnicodeWidthChar;
 use unicode_width::UnicodeWidthStr;
 
+use crate::config::{PermissionMode, ResolvedConfig};
 use crate::render::{
     Segment, diff_title, is_unified_diff, markdown_lines, split_markdown_and_diffs,
 };
@@ -89,35 +90,29 @@ const LIVE_PROGRESS_RECENT: usize = 3;
 /// Write/edit diff cards kept in the live progress section.
 const LIVE_PROGRESS_DIFFS: usize = 2;
 
-/// Compact token count for status text: 950 -> "950", 12_300 -> "12.3k".
-fn human_tokens(n: u64) -> String {
-    if n < 1000 {
-        return n.to_string();
-    }
-    let k = n as f64 / 1000.0;
-    if k < 100.0 {
-        format!("{k:.1}k")
+/// Compact counts with SI suffixes: 12_300 -> `12.3k`, 13_570_500 -> `13.6m`.
+fn compact_count(n: u64) -> String {
+    let (value, suffix) = if n >= 1_000_000_000 {
+        (n as f64 / 1_000_000_000.0, "b")
+    } else if n >= 1_000_000 {
+        (n as f64 / 1_000_000.0, "m")
+    } else if n >= 1_000 {
+        (n as f64 / 1_000.0, "k")
     } else {
-        format!("{k:.0}k")
+        return n.to_string();
+    };
+    if value < 100.0 {
+        let text = format!("{value:.1}");
+        format!("{}{suffix}", text.trim_end_matches(".0"))
+    } else {
+        format!("{value:.0}{suffix}")
     }
 }
-
-/// Header context size: `32k`, `3.2k`, `950`. Drops a trailing `.0`.
+fn human_tokens(n: u64) -> String {
+    compact_count(n)
+}
 fn compact_tokens(n: u64) -> String {
-    if n < 1000 {
-        return n.to_string();
-    }
-    let k = n as f64 / 1000.0;
-    if k < 100.0 {
-        let tenths = (k * 10.0).round() as u64;
-        if tenths % 10 == 0 {
-            format!("{}k", tenths / 10)
-        } else {
-            format!("{:.1}k", tenths as f64 / 10.0)
-        }
-    } else {
-        format!("{k:.0}k")
-    }
+    compact_count(n)
 }
 
 /// One painted transcript block.
@@ -223,11 +218,7 @@ impl Usage {
 }
 
 fn format_tokens(tokens: u64) -> String {
-    if tokens >= 1000 {
-        format!("{:.1}k", tokens as f64 / 1000.0)
-    } else {
-        tokens.to_string()
-    }
+    compact_count(tokens)
 }
 
 /// Which modal overlay (if any) is painted over the document.
@@ -488,6 +479,10 @@ pub struct App {
     pub allow_shell: bool,
     /// Splash for a fresh session; any key dismisses it.
     pub welcome: bool,
+    /// Configured splash tagline; empty means the built-in line.
+    pub welcome_message: String,
+    /// Composer prefix from `extensions.mowi` / defaults (always ends with a space).
+    pub prompt_prefix: String,
     pub overlay: Overlay,
     /// Instant the permission overlay was painted; keys are ignored briefly.
     pub perm_shown: Option<Instant>,
@@ -496,6 +491,9 @@ pub struct App {
     /// Peer overlay scroll offset measured upward from the newest output.
     pub peer_scroll: u16,
     pub animate: bool,
+    /// When true, mouse capture is released so the terminal can drag-select.
+    pub select_mode: bool,
+    mouse_mode_dirty: bool,
     /// Reasoning effort from `effort.list` / `effort.set`.
     pub effort: String,
     /// Latest `context` result, for the used/window chip and /status.
@@ -580,11 +578,15 @@ impl Default for App {
             allow_write: false,
             allow_shell: false,
             welcome: false,
+            welcome_message: String::new(),
+            prompt_prefix: String::new(),
             overlay: Overlay::None,
             perm_shown: None,
             peer_focus: None,
             peer_scroll: 0,
             animate: std::env::var_os("MOW_NO_ANIM").is_none(),
+            select_mode: false,
+            mouse_mode_dirty: false,
             effort: String::new(),
             ctx: None,
             extra_roots: Vec::new(),
@@ -772,6 +774,19 @@ impl App {
         self.control_caps = methods.to_vec();
     }
 
+    /// Apply resolved `extensions.mowi` / CLI / env values (theme, ask, prompt).
+    pub fn apply_resolved_config(&mut self, resolved: &ResolvedConfig) {
+        self.theme = Theme::new(resolved.theme);
+        self.ask_mode = matches!(resolved.permission_mode, PermissionMode::Ask);
+        self.welcome_message = resolved.welcome_message.clone();
+        self.prompt_prefix = resolved.prompt_prefix(self.theme.colored);
+    }
+
+    /// Splash tagline: configured `welcome_message` or the built-in line.
+    pub fn welcome_tagline(&self) -> &str {
+        crate::config::welcome_tagline(&self.welcome_message)
+    }
+
     /// Apply `version` / `capabilities` in one shot. Empty methods stay empty.
     pub fn apply_host_surface(&mut self, version: &VersionInfo) {
         self.set_capabilities(&version.methods);
@@ -897,9 +912,16 @@ impl App {
         if self.ask_mode { "ask" } else { "auto" }
     }
 
-    /// Prompt glyph: a plain `>` when colour is off, so it stays legible.
-    pub fn prompt_glyph(&self) -> &'static str {
-        if self.theme.colored { "❯ " } else { "> " }
+    /// Prompt glyph: configured prefix, else `❯ ` / `>` when colour is off.
+    pub fn prompt_glyph(&self) -> &str {
+        if !self.prompt_prefix.is_empty() {
+            return &self.prompt_prefix;
+        }
+        if self.theme.colored {
+            crate::config::DEFAULT_PROMPT
+        } else {
+            crate::config::DEFAULT_PROMPT_PLAIN
+        }
     }
 
     /// Compact used/window size for the header, e.g. `32k/128k ctx`.
@@ -1115,7 +1137,15 @@ impl App {
     /// is omitted when none remain. Optional chips drop before identity.
     /// Safety never drops. Session id is not painted here.
     pub fn header_line(&self, width: u16) -> Line<'static> {
-        let safety = format!("{} · {}", self.capability_chip(), self.mode_chip());
+        let safety = if self.select_mode {
+            format!(
+                "{} · {} · ⛶ select",
+                self.capability_chip(),
+                self.mode_chip()
+            )
+        } else {
+            format!("{} · {}", self.capability_chip(), self.mode_chip())
+        };
         let mut identity = self.identity_chips();
         let mut right = self.right_chips();
         let width = width as usize;
@@ -1832,6 +1862,7 @@ impl App {
         }
     }
 
+    #[cfg(test)]
     fn estimated_live_lines(&self) -> usize {
         self.ensure_heights().1
     }
@@ -1969,6 +2000,7 @@ impl App {
     }
 
     /// Plain-text live clock (styling dropped) — used by tests.
+    #[cfg(test)]
     pub fn activity(&self) -> String {
         self.activity_line()
             .spans
@@ -1980,6 +2012,7 @@ impl App {
     /// Styled live clock: spinner, elapsed, verb and (when streaming) pulse
     /// each keep their own role, so the status bar has hierarchy instead of
     /// reading as one muted sentence.
+    #[cfg(test)]
     pub fn activity_line(&self) -> Line<'static> {
         if !self.busy {
             return Line::default();
@@ -2503,6 +2536,7 @@ impl App {
 
     /// Expand/collapse the most recent tool group. No letter key binds this —
     /// `t` always types — so this is a view helper (tests, and Esc collapse).
+    #[cfg(test)]
     pub fn toggle_tool_group(&mut self) -> bool {
         let Some(group) = self.entries.iter_mut().rev().find_map(|entry| match entry {
             Entry::Tools { expanded, .. } => Some(expanded),
@@ -2542,13 +2576,17 @@ impl App {
         let agents = self.peer_agents();
         self.peer_order.clear();
         self.peer_state.clear();
-        for agent in agents {
-            if self.peers.remove(&agent).is_some() {
-                self.entries.push(Entry::Note(format!(
-                    "⇄ {} · done",
-                    sanitize_preview(&agent)
-                )));
-            }
+        let finished: Vec<String> = agents
+            .into_iter()
+            .filter_map(|agent| self.peers.remove(&agent).map(|_| sanitize_preview(&agent)))
+            .collect();
+        if !finished.is_empty() {
+            let label = if finished.len() == 1 {
+                format!("⇄ {} · done", finished[0])
+            } else {
+                format!("⇄ {} peers · done", finished.len())
+            };
+            self.entries.push(Entry::Note(label));
         }
         self.peers.clear();
     }
@@ -2643,22 +2681,19 @@ impl App {
             return false;
         }
         self.queue.push_back(text);
-        self.status = format!("queued {}", self.queue.len());
+        // The footer owns the queue count. Reusing the live activity status
+        // here paints the same state twice while a turn is running
+        // (`queued 3` plus `3 queued`).
         true
     }
 
     pub fn next_queued_prompt(&mut self) -> Option<String> {
-        let next = self.queue.pop_front();
-        if next.is_some() {
-            self.status = if self.queue.is_empty() {
-                "running".into()
-            } else {
-                format!("queued {}", self.queue.len())
-            };
-        }
-        next
+        // Queue count is derived directly by the footer. Do not mirror it into
+        // `status`: that produces stale/duplicated text if submission fails.
+        self.queue.pop_front()
     }
 
+    #[cfg(test)]
     pub fn last_user_prompt(&self) -> Option<String> {
         self.entries.iter().rev().find_map(|entry| match entry {
             Entry::User { text, .. } => Some(text.clone()),
@@ -2666,6 +2701,7 @@ impl App {
         })
     }
 
+    #[cfg(test)]
     pub fn edit_last_prompt(&mut self) -> bool {
         if let Some(prompt) = self.last_user_prompt() {
             self.set_input(prompt);
@@ -3378,6 +3414,7 @@ fn pack_tool_group_items(
 }
 
 /// Ordered counts with no width budget: `bash ×2 · grep`.
+#[cfg(test)]
 fn tool_group_summary(tools: &[(String, Option<u64>)]) -> String {
     join_tool_group_items(&tool_group_counts(tools), true)
 }
@@ -4122,7 +4159,11 @@ fn prompt_text(app: &App, width: u16) -> Vec<Line<'static>> {
     rows.into_iter()
         .skip(skip)
         .map(|(first, text)| {
-            let glyph = if first { app.prompt_glyph() } else { "  " };
+            let glyph = if first {
+                app.prompt_glyph().to_string()
+            } else {
+                "  ".to_string()
+            };
             let mut spans = vec![
                 Span::styled(glyph, app.theme.accent()),
                 Span::styled(text, app.theme.text()),
@@ -4321,7 +4362,7 @@ fn welcome_lines(app: &App, inner_w: usize, inner_h: usize) -> Vec<Line<'static>
         app.theme.accent().add_modifier(Modifier::BOLD),
     ));
     let tagline = Line::from(Span::styled(
-        clip_display("ratatui client for the mow harness", inner_w),
+        clip_display(app.welcome_tagline(), inner_w),
         app.theme.note().patch(app.theme.overlay()),
     ));
     let mut fields = vec![
@@ -4887,6 +4928,17 @@ pub fn run<B: Backend>(
         if poll_input(client, app, &mut turn, &mut slash_rx)? {
             dirty = true;
         }
+        if app.mouse_mode_dirty {
+            app.mouse_mode_dirty = false;
+            let mut stdout = std::io::stdout();
+            if app.select_mode {
+                crossterm::execute!(stdout, crossterm::event::DisableMouseCapture)
+                    .map_err(Error::Io)?;
+            } else {
+                crossterm::execute!(stdout, crossterm::event::EnableMouseCapture)
+                    .map_err(Error::Io)?;
+            }
+        }
     }
     Ok(())
 }
@@ -4996,13 +5048,33 @@ fn poll_slash(
                         }
                     }
                     ("compact.transcript", Ok(value)) => {
-                        match crate::rpc::decode_transcript(&value) {
-                            Ok(messages) => app.load_transcript(messages),
-                            Err(error) => app
-                                .entries
-                                .push(Entry::Note(format!("transcript refresh: {error}"))),
+                        let refreshed = match crate::rpc::decode_transcript(&value) {
+                            Ok(messages) => {
+                                app.load_transcript(messages);
+                                true
+                            }
+                            Err(error) => {
+                                app.entries
+                                    .push(Entry::Note(format!("transcript refresh: {error}")));
+                                false
+                            }
+                        };
+                        if refreshed && let Some(next) = app.next_queued_prompt() {
+                            match start_prompt(client, app, &next) {
+                                Ok(rx) => *turn = Some(rx),
+                                Err(error) => {
+                                    // Preserve the prompt if submission fails;
+                                    // it was queued, not successfully sent.
+                                    app.queue.push_front(next);
+                                    app.entries.push(Entry::Note(format!(
+                                        "queued prompt failed: {error}"
+                                    )));
+                                }
+                            }
                         }
-                        app.status = "compacted".into();
+                        if !app.busy {
+                            app.status = "compacted".into();
+                        }
                         *slash_rx = None;
                     }
                     ("steer", Ok(_)) => {
@@ -5284,6 +5356,10 @@ fn handle_key(
         app.cancel_armed_at = None;
     }
     match key.code {
+        KeyCode::Char('s') if ctrl => {
+            app.select_mode = !app.select_mode;
+            app.mouse_mode_dirty = true;
+        }
         KeyCode::Char('c') if ctrl => {
             if app.busy || turn.is_some() {
                 app.request_cancel();
@@ -5358,6 +5434,10 @@ fn handle_key(
 fn handle_view_key(app: &mut App, key: KeyEvent) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
+        KeyCode::Char('s') if ctrl => {
+            app.select_mode = !app.select_mode;
+            app.mouse_mode_dirty = true;
+        }
         KeyCode::Char('j') if ctrl => app.insert_char('\n'),
         KeyCode::Char('l') if ctrl => app.clear_transcript(),
         KeyCode::Char('p') if ctrl => {
@@ -5895,6 +5975,7 @@ fn start_prompt(
     app: &mut App,
     text: &str,
 ) -> Result<Receiver<Result<Value, Error>>, Error> {
+    let rx = client.prompt(text)?;
     app.entries.push(Entry::user(text));
     app.dismiss_terminal_goal();
     app.live.clear();
@@ -5906,7 +5987,7 @@ fn start_prompt(
     app.scroll = u16::MAX;
     app.status = "running".into();
     app.activity_started = Some(Instant::now());
-    client.prompt(text)
+    Ok(rx)
 }
 
 #[cfg(test)]
@@ -5922,6 +6003,15 @@ mod tests {
             remaining: window.map(|w| w.saturating_sub(tokens)),
             percent: pct,
         }
+    }
+
+    #[test]
+    fn token_counts_promote_to_millions() {
+        assert_eq!(compact_count(950), "950");
+        assert_eq!(compact_count(12_300), "12.3k");
+        assert_eq!(compact_count(1_000_000), "1m");
+        assert_eq!(compact_count(13_570_500), "13.6m");
+        assert_eq!(compact_count(1_250_000_000), "1.2b");
     }
 
     #[test]
@@ -6603,7 +6693,7 @@ mod tests {
         app.tick = 0;
         assert!(app.footer().starts_with("⠋ "), "{}", app.footer());
         let live = app.tool_row_lines("read src/app.rs", None);
-        assert!(live[0].to_string().starts_with("◜ "), "{:?}", live[0]);
+        assert!(live[0].to_string().starts_with("◴ "), "{:?}", live[0]);
 
         app.animate = false;
         assert!(app.footer().starts_with("● "), "{}", app.footer());
@@ -7121,6 +7211,25 @@ mod tests {
         let out = render(&mut app, 60, 16);
         assert!(!out.contains("ask anything"), "{out}");
         assert!(out.contains("❯ h"), "{out}");
+    }
+
+    #[test]
+    fn welcome_message_and_prompt_come_from_resolved_config() {
+        let mut app = App::new(SessionInfo::default());
+        app.apply_resolved_config(&crate::config::ResolvedConfig {
+            permission_mode: crate::config::PermissionMode::Auto,
+            theme: ThemeName::GruvboxDark,
+            welcome: true,
+            welcome_message: "hello pack".into(),
+            prompt: Some("$".into()),
+        });
+        app.welcome = true;
+        assert!(!app.ask_mode);
+        assert_eq!(app.theme.name(), ThemeName::GruvboxDark);
+        assert_eq!(app.welcome_tagline(), "hello pack");
+        assert_eq!(app.prompt_glyph(), "$ ");
+        let out = render(&mut app, 60, 16);
+        assert!(out.contains("hello pack"), "{out}");
     }
 
     #[test]
@@ -7734,6 +7843,16 @@ mod tests {
         overlay_key(&mut app, KeyCode::Esc);
         assert_eq!(app.overlay, Overlay::None);
         assert!(app.peer_focus.is_none());
+    }
+
+    #[test]
+    fn select_mode_is_a_persistent_header_safety_chip() {
+        let mut app = App::new(SessionInfo::default());
+        assert!(!app.header_line(100).to_string().contains("select"));
+        press_ctrl_key(&mut app, 's');
+        assert!(app.select_mode);
+        assert!(app.mouse_mode_dirty);
+        assert!(app.header_line(100).to_string().contains("⛶ select"));
     }
 
     #[test]
@@ -8573,7 +8692,7 @@ mod tests {
             "diff card from tool.end result:\n{writing}"
         );
         assert!(
-            writing.contains("old") && writing.contains("+new"),
+            writing.contains("old") && writing.contains("+ new"),
             "{writing}"
         );
         assert!(
@@ -8733,12 +8852,12 @@ mod tests {
         assert!(!out.contains("grep estimated_entry_lines"), "{out}");
     }
 
-    fn press(app: &mut App, code: KeyCode) {
-        handle_view_key(app, KeyEvent::new(code, KeyModifiers::NONE));
+    fn press_ctrl_key(app: &mut App, c: char) {
+        handle_view_key(app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
     }
 
-    fn press_ctrl(app: &mut App, c: char) {
-        handle_view_key(app, KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL));
+    fn press(app: &mut App, code: KeyCode) {
+        handle_view_key(app, KeyEvent::new(code, KeyModifiers::NONE));
     }
 
     /// Rightmost column of the transcript pane, and the same column under
@@ -9150,13 +9269,35 @@ mod tests {
     #[test]
     fn queue_is_capped_and_drains_in_order() {
         let mut app = App::new(SessionInfo::default());
+        app.busy = true;
         for index in 0..16 {
             assert!(app.enqueue_prompt(format!("prompt-{index}")));
         }
-        assert!(!app.enqueue_prompt("overflow".into()));
         assert_eq!(app.queue.len(), 16);
+        assert!(
+            !app.activity().contains("queued"),
+            "queue count must not replace the live activity state: {}",
+            app.activity()
+        );
+        assert!(!app.enqueue_prompt("overflow".into()));
         assert_eq!(app.next_queued_prompt().as_deref(), Some("prompt-0"));
         assert_eq!(app.queue.len(), 15);
+    }
+
+    #[test]
+    fn queued_prompt_survives_transcript_refresh_until_submitted() {
+        let mut app = App::new(SessionInfo::default());
+        app.enqueue_prompt("after compact".into());
+        app.load_transcript(vec![TranscriptMessage {
+            timestamp: None,
+            role: "user".into(),
+            content: "history".into(),
+        }]);
+
+        assert_eq!(app.queue.len(), 1);
+        assert_eq!(app.last_user_prompt().as_deref(), Some("history"));
+        assert_eq!(app.next_queued_prompt().as_deref(), Some("after compact"));
+        assert!(app.queue.is_empty());
     }
 
     #[test]

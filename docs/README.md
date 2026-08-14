@@ -1,29 +1,29 @@
-# mowi (Rust)
+# mowi - mow with interface
 
-A Ratatui terminal UI for [mow](https://github.com/subosito/mow). This
-repository is a **client**. The agent loop, tools, path jail, sessions, ACP
-peers, and review/sec all live in the headless `mow` process.
+Mowi is the terminal interface for [mow](https://github.com/subosito/mow),
+built using Ratatui. This repository is a **client**. The agent loop, tools,
+path jail, sessions, ACP peers, and review/sec all live in the headless `mow`
+process.
 
 ```
-[mowi — Ratatui]
-        │  JSON-lines  (mow rpc, protocol v3)
+[mowi — mow with interface]
+        │  JSON-lines  (mow rpc, compatibility epoch 1)
         ▼
 [mow Engine] ── acp_delegate ──▶ Cursor / Gemini / mow acp
         └── /review /sec, sessions, perm policy
 ```
 
-Go mowi (`mow/packs/mowi`) is the in-process reference host. This crate aims
-at the **same product surface** over a wire, not a Charm port.
+The former Go `packs/mowi` host has been retired. This Rust client is the maintained TUI over the additive RPC contract.
 
 | Doc | Read when |
 |-----|-----------|
 | [architecture.md](architecture.md) | Process split, what mow owns vs the UI |
-| [protocol.md](protocol.md) | `mow rpc` v3 methods, events, perm.ask |
-| [baseline.md](baseline.md) | Feature inventory of Go mowi (the bar) |
+| [protocol.md](protocol.md) | `mow rpc` compatibility, methods, events, perm.ask |
+| [baseline.md](baseline.md) | Current Rust mowi feature and behavior inventory |
 | [ui-review.md](ui-review.md) | Snapshot tool + the layout rules to review against |
 | [roadmap.md](roadmap.md) | Phases from hello-RPC to parity |
 
-## Run (once the crate exists)
+## Run
 
 ```bash
 # sibling checkout: mow built as ../mow/bin/mow
@@ -31,11 +31,14 @@ devenv shell -- cargo run -- --help
 # mowi spawns: $MOW_BIN rpc [engine flags]
 ```
 
-mowi should spawn `mow rpc` by default (same flags as today’s Go `mowi` CLI:
+mowi spawns `mow rpc` by default (with supported Engine flags:
 `--session`, `--continue`, `--model`, `--effort`, `--allow-write`,
 `--allow-shell`, `--ask` / `--auto`, repeatable `--skill NAME` and
 `--extra-root PATH` /
-`PATH:ro` / `PATH:rw`). It must not embed Engine and must not spawn ACP peers.
+`PATH:ro` / `PATH:rw`). Theme and permission mode also read
+`$MOW_THEME` / `$MOW_PERMISSION_MODE` and, when advertised,
+`extension.config` `{name:"mowi"}` (`extensions.mowi`). It does not
+embed the Engine or spawn ACP peers.
 
 ## Public samples
 

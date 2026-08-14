@@ -15,7 +15,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 /// Protocol version this client speaks.
-pub const RPC_MIN_VERSION: u32 = 3;
+pub const RPC_COMPATIBILITY_EPOCH: u32 = 1;
 
 #[derive(Debug)]
 pub enum Error {
@@ -293,7 +293,7 @@ pub fn merge_capabilities(mut version: VersionInfo, v: &Value) -> VersionInfo {
 }
 
 /// Validate a `version` result. The protocol is additive: a server newer than
-/// `RPC_MIN_VERSION` still speaks every method we send, so accept `>=` rather
+/// `RPC_COMPATIBILITY_EPOCH` still speaks every method we send, so accept `>=` rather
 /// than pinning equality (which made each new method a breaking change).
 pub fn check_version(v: &Value) -> Result<VersionInfo, Error> {
     let rpc = v
@@ -304,9 +304,9 @@ pub fn check_version(v: &Value) -> Result<VersionInfo, Error> {
         .trim()
         .parse()
         .map_err(|_| Error::Protocol(format!("mow rpc: unrecognized protocol version {rpc:?}")))?;
-    if n < RPC_MIN_VERSION {
+    if n != RPC_COMPATIBILITY_EPOCH {
         return Err(Error::Protocol(format!(
-            "mow rpc protocol {rpc:?}, need >= {RPC_MIN_VERSION}: rebuild mow with a current ext/rpc"
+            "mow rpc compatibility epoch {rpc:?}, need {RPC_COMPATIBILITY_EPOCH}; use compatible mow and mowi builds"
         )));
     }
     Ok(VersionInfo {
@@ -351,6 +351,7 @@ impl SessionInfo {
     }
 
     /// Short id for the status bar, when leftover columns allow it.
+    #[cfg(test)]
     pub fn short_id(&self) -> String {
         let id = self.session_id.as_str();
         match id.char_indices().nth(8) {
@@ -1106,6 +1107,15 @@ impl Client {
         )
     }
 
+    /// Fetch `extensions.<name>` when the host advertises `extension.config`.
+    pub fn extension_config(&mut self, name: &str, timeout: Duration) -> Result<Value, Error> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(Error::Protocol("extension name must not be empty".into()));
+        }
+        self.call("extension.config", Some(json!({ "name": name })), timeout)
+    }
+
     /// Set the host permission mode.
     pub fn perm_set(&mut self, mode: &str, timeout: Duration) -> Result<Value, Error> {
         if !matches!(mode, "ask" | "auto") {
@@ -1510,11 +1520,11 @@ mod tests {
 
     #[test]
     fn parses_response_result() {
-        let m = parse_message(r#"{"jsonrpc":"2.0","id":1,"result":{"rpc":"3"}}"#).unwrap();
+        let m = parse_message(r#"{"jsonrpc":"2.0","id":1,"result":{"rpc":"1"}}"#).unwrap();
         match m {
             Message::Response { id, result } => {
                 assert_eq!(id, 1);
-                assert_eq!(result.unwrap()["rpc"], "3");
+                assert_eq!(result.unwrap()["rpc"], "1");
             }
             other => panic!("want response, got {other:?}"),
         }
@@ -1587,16 +1597,16 @@ mod tests {
     }
 
     #[test]
-    fn handshake_requires_rpc_3() {
-        let ok = serde_json::json!({"name":"mow","version":"0.1.0","rpc":"3"});
+    fn handshake_requires_compatibility_epoch_1() {
+        let ok = serde_json::json!({"name":"mow","version":"0.1.0","rpc":"1"});
         let info = check_version(&ok).unwrap();
-        assert_eq!(info.rpc, "3");
+        assert_eq!(info.rpc, "1");
         // No capability list (older server): do not infer a stock method set.
         assert!(info.methods.is_empty());
         assert!(info.features.is_empty());
 
         let modern = serde_json::json!({
-            "name":"mow","version":"0.1.0","rpc":"4",
+            "name":"mow","version":"0.1.0","rpc":"1",
             "methods":["prompt","context","compact"],
             "control_methods":["context"],
             "features":{"ephemeral_prompt":true,"batch":false},
@@ -1608,8 +1618,8 @@ mod tests {
         assert_eq!(info.features.get("batch"), Some(&false));
 
         // Additive protocol: a newer server is fine, an older one is not.
-        let newer = serde_json::json!({"name":"mow","version":"0.1.0","rpc":"4"});
-        assert_eq!(check_version(&newer).unwrap().rpc, "4");
+        let incompatible = serde_json::json!({"name":"mow","version":"0.1.0","rpc":"4"});
+        assert!(check_version(&incompatible).is_err());
         let older = serde_json::json!({"name":"mow","version":"0.1.0","rpc":"2"});
         assert!(check_version(&older).is_err());
 
@@ -1627,7 +1637,7 @@ mod tests {
         let version = check_version(&serde_json::json!({
             "name": "mow",
             "version": "0.1.0",
-            "rpc": "3"
+            "rpc": "1"
         }))
         .unwrap();
         assert!(version.methods.is_empty());
@@ -1979,6 +1989,27 @@ mod tests {
             steer_params("focus on tests").unwrap()["text"],
             "focus on tests"
         );
+    }
+
+    #[test]
+    fn extension_config_fixture_decodes_as_mowi_section() {
+        // Same payload the PTY mock returns for params {name:"mowi"}.
+        let value = serde_json::json!({
+            "permission_mode": "ask",
+            "theme": "catppuccin-mocha",
+            "welcome": true,
+            "welcome_message": "fixture splash",
+            "prompt": "❯"
+        });
+        let cfg = crate::config::decode_mowi_config(&value);
+        assert_eq!(
+            cfg.permission_mode,
+            Some(crate::config::PermissionMode::Ask)
+        );
+        assert_eq!(cfg.theme, Some(crate::theme::ThemeName::CatppuccinMocha));
+        assert_eq!(cfg.welcome, Some(true));
+        assert_eq!(cfg.welcome_message.as_deref(), Some("fixture splash"));
+        assert_eq!(cfg.prompt.as_deref(), Some("❯"));
     }
 
     #[test]
