@@ -55,8 +55,9 @@ pub mod mocha {
 }
 
 /// Full theme identifiers accepted by the CLI and `MOW_THEME`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ThemeName {
+    #[default]
     CatppuccinMocha,
     CatppuccinLatte,
     GruvboxDark,
@@ -87,12 +88,6 @@ impl ThemeName {
             Self::GruvboxDark => Palette::gruvbox(),
             Self::Monokai => Palette::monokai(),
         }
-    }
-}
-
-impl Default for ThemeName {
-    fn default() -> Self {
-        Self::CatppuccinMocha
     }
 }
 

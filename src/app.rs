@@ -2027,7 +2027,7 @@ impl App {
     fn live_clock_spans(&self) -> Vec<Span<'static>> {
         let elapsed = self.elapsed().unwrap_or_else(|| "0.0s".into());
         let status = self.status_or_default();
-        let status_style = if is_tool_activity_status(&status) {
+        let status_style = if is_tool_activity_status(status) {
             self.theme.tool()
         } else {
             self.theme.text()
@@ -3849,7 +3849,7 @@ fn help_card_title(width: u16, session_id: &str) -> &'static str {
         session_id.width() + 3
     };
     let long = "keyboard reference".width() + 2;
-    if 2 + long + id_w + 1 <= width as usize {
+    if 2 + long + id_w < width as usize {
         "keyboard reference"
     } else {
         "help"
@@ -4482,7 +4482,7 @@ fn help_geometry(rows: &[(String, String)], area: Rect, session_id: &str) -> (Re
         .max()
         .unwrap_or(24) as u16;
     // Size to a readable action column; the longest outlier can clip.
-    let action_want = action_natural.min(40).max(HELP_ACTION_FLOOR);
+    let action_want = action_natural.clamp(HELP_ACTION_FLOOR, 40);
     let want_w = key_natural
         .saturating_add(action_want)
         .saturating_add(HELP_CHROME_W);
@@ -4806,7 +4806,7 @@ fn draw_peer_picker(frame: &mut Frame<'_>, app: &App, state: &mut ListState, are
             .map(|agent| {
                 let line = app.peer_picker_line(agent);
                 let clipped = clip_display(&app.peer_picker_label(agent), inner_w);
-                if line.width() as usize > inner_w {
+                if line.width() > inner_w {
                     ListItem::new(Line::styled(clipped, app.theme.note()))
                 } else {
                     ListItem::new(line)
@@ -6133,7 +6133,7 @@ mod tests {
             }
             if let Some((verb, rest)) = part.split_once(" ×") {
                 assert!(
-                    verbs.iter().any(|v| *v == verb),
+                    verbs.contains(&verb),
                     "unknown verb {verb:?} in {summary:?}"
                 );
                 assert!(
@@ -6142,7 +6142,7 @@ mod tests {
                 );
             } else {
                 assert!(
-                    verbs.iter().any(|v| *v == part),
+                    verbs.contains(&part),
                     "mid-token or unknown part {part:?} in {summary:?}"
                 );
             }
@@ -8100,7 +8100,7 @@ mod tests {
         app.apply_host_surface(&VersionInfo {
             name: "mow".into(),
             version: "0.1.0".into(),
-            rpc: "3".into(),
+            rpc: "1".into(),
             methods: vec!["prompt".into(), "context".into()],
             control_methods: vec!["context".into()],
             features: BTreeMap::from([("ephemeral_prompt".into(), true)]),

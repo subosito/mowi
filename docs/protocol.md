@@ -52,13 +52,14 @@ Stderr is Engine logs — do not parse it.
 
 | Method | Control? | Params | Result |
 |---|---|---|---|
-| `prompt` | no (worker) | `{text, ephemeral?}` | `{text, session_id, run_id, stop_reason, usage, ephemeral, attached[]}` |
-| `slash` | no (worker) | `{name, args[], color?}` | `{title, body, error?}` |
+| `prompt` | no (worker queue) | `{text, ephemeral?}` | `{text, session_id, run_id, stop_reason, usage, ephemeral, attached[]}` |
+| `slash` | yes (async) | `{name, args[], color?}` | `{title, body, error?}` |
+| `compact` | no (worker queue) | `{max_chars?}` | compaction report + `tokens` |
 | `cancel` | yes | — | `{ok}` |
 | `status` | yes | — | see below |
-| `session` / `session_id` | yes | — | `{session_id, workspace, model, wire}` |
+| `session` / `session_id` | yes | — | `{session_id, workspace, model, wire, extra_roots…}` |
 | `sessions` | yes | — | `{sessions:[{id, updated, preview}]}` |
-| `transcript` | yes | — | `{messages:[{role, content}]}` |
+| `transcript` | yes | — | `{messages:[{role, content, ts?}]}` |
 | `steer` | yes | `{text}` | `{ok}` |
 | `slash.list` | yes | — | `{commands:[{name, summary, exclusive, aliases}]}` |
 | `perm.set` | yes | `{mode:"ask"\|"auto"}` | `{ok, ask_mode}` |
@@ -67,20 +68,25 @@ Stderr is Engine logs — do not parse it.
 | `model.set` | yes | `{id}` | `{ok, model}` |
 | `effort.list` | yes | — | `{efforts:[{id,current}], current, default}` |
 | `effort.set` | yes | `{id}` | `{ok, effort}` |
+| `context` | yes | — | `{tokens, context_window?, remaining?, percent?}` |
+| `rewind` | yes | — | `{ok, last_user}` |
+| `skill.list` | yes | — | `{skills:[name]}` |
+| `skill.activate` | yes | `{names[]}` | `{activated, unknown}` |
 | `version` | yes | — | `{name, version, rpc, package, methods?, control_methods?, features?}` |
 | `capabilities` | yes | — | same surface as `version` when the handshake omitted `methods` |
 | `extension.config` | yes | `{name}` | `extensions.<name>` object (see below) |
 | `ping` | yes | — | `"pong"` |
 
 Control methods are answered concurrently with an in-flight `prompt`.
-**`transcript` can return before the current turn is appended.** After
-`prompt` completes, call `transcript` again if you need the stored turns.
-Messages are `{role, content}` only — no per-message timestamp. The client
-stamps prompts it records locally and leaves resumed history untimed.
+Worker-queue methods (`prompt`, `compact`) share a depth-4 queue;
+overflow → error, retry. `slash` is control-routed but still runs
+asynchronously. **`transcript` can return before the current turn is
+appended.** After `prompt` completes, call `transcript` again if you need
+the stored turns. Messages are `{role, content}` with optional additive
+RFC 3339 `ts` when the host has one. The client stamps prompts it records
+locally and does not invent timestamps for resumed history that omits `ts`.
 
 `prompt.ephemeral=true` runs an aside against current context without persisting the exchange (`/btw`). Prompt text may contain `@path` references; the RPC host resolves them through the Engine path jail (workspace + extra roots), ignores denied/missing/directory references, deduplicates them, and caps each attachment at 100,000 bytes before appending it for the model. The UI continues to display the original prompt.
-
-`prompt` / `slash` share a worker queue (depth 4). Overflow → error, retry.
 
 The linked `goal` pack registers `/goal` in the same slash registry as
 `/review` and `/sec`; it therefore appears in `slash.list` and is invoked with
@@ -114,10 +120,11 @@ defaults (`ask`, `catppuccin-mocha`, welcome on, `❯`). An empty
 `busy`, `run_id`, `session_id`, `workspace`, `model`, `wire`,
 `allow_write`, `allow_shell`, `ask_mode`, `pending_perm`.
 
-Optional chrome fields (not emitted by current `mow rpc`; the client
-decodes them when present — see [Host chrome](#host-chrome)):
-`extra_roots` / `extra_root_count`. The same keys are accepted on
-`session`. RPC `git` metadata is ignored; the client probes the
+Current `mow rpc` also emits security-scoped extra-root metadata on both
+`status` and `session` (see [Host chrome](#host-chrome)): `extra_roots`
+(`{path, read_only}` rows), `extra_roots_rw`, and `extra_roots_ro`. The
+client also accepts a count-only `extra_root_count` shape for older or
+minimal hosts. RPC `git` metadata is ignored; the client probes the
 workspace itself.
 
 ### `slash`
@@ -250,11 +257,7 @@ explicit empty `extra_roots` array clears the chip.
 
 ## What is not on the wire (yet)
 
-- `extra_roots` on `status` and `session` — client decodes the shapes
-  above; host does not emit them yet. Git is client-owned.
-- Model picker catalog — v1 can omit
-- Keys — UI-local; not configurable through `extensions.mowi` yet
-- Theme / permission / welcome — `extension.config` `{name:"mowi"}` when
-  advertised; otherwise CLI, env, and built-in defaults
+- Git presentation — client-owned; RPC must not carry branch/dirty chrome
+- Keys / keybindings — UI-local; not configurable through `extensions.mowi` yet
 - Binary diffs — events carry text; UI pretty-prints
 - Spawning peers — Engine only

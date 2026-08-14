@@ -1,13 +1,14 @@
 # Roadmap
 
-Historical implementation phases for the maintained Rust UI over additive `mow rpc` (minimum v3; current host v4).
+Historical implementation phases for the maintained Rust UI over additive
+`mow rpc` (compatibility epoch 1).
 
 ## Phase 0 — crate + spawn ✓
 
 - Cargo bin `mowi`
 - Spawn `$MOW_BIN` or `mow` with `rpc` + passthrough engine flags
 - JSON-lines client: id allocator, request/response, notification split
-- Handshake: `version` (require `rpc=3`), `session`, `status`
+- Handshake: `version` (require `rpc=1`), `session`, `status`
 - Ratatui: header (model/workspace), transcript viewport, input, status line
 - Enter → `prompt`; Esc → `cancel`; quit
 - Render `event` token deltas as live assistant text
@@ -40,7 +41,7 @@ Historical implementation phases for the maintained Rust UI over additive `mow r
 - Wheel transcript scrolling (Shift+drag keeps terminal-native selection)
 - `/search`, `/copy`, `/retry`, `/edit`
 - Remappable keys through `extensions.mowi` if needed
-- PTY cell smoke (optional)
+- Deterministic PTY smoke via `scripts/smoke-tui.sh` when `shell-use` is available
 
 ## Phase 4 — product chrome & key parity ✓
 
@@ -83,7 +84,7 @@ Ratatui widgets carry the chrome; the transcript stays the product.
 - Theme gained `chrome` / `chip` / `warn` / `accent` roles; `NO_COLOR` keeps
   the glyphs distinct.
 
-Still deliberately out: a remappable keymap file, PTY cell smoke.
+Still deliberately out: a remappable keymap file.
 
 ## Phase 5 — production chrome & flashdiff bands ✓
 

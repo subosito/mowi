@@ -793,6 +793,7 @@ fn numbered_context(
     Line::from(spans)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn numbered_band(
     old: Option<usize>,
     new: Option<usize>,

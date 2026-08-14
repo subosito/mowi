@@ -58,8 +58,10 @@ other products.
 
 ## Protocol version
 
-`version.rpc` is `"3"`. Feature-detect that field. Older `mow rpc` (`"2"`)
-has prompt/cancel/status only — refuse to start a full UI against it.
+`version.rpc` is the compatibility epoch. Mowi requires exact epoch `"1"`.
+Additive methods do not bump the epoch — feature-detect them from
+`methods` / `control_methods` / `features`. A future incompatible wire
+contract uses a new epoch; refuse to start against any other value.
 
 See [protocol.md](protocol.md).
 
@@ -95,8 +97,8 @@ Same baseline ([baseline.md](baseline.md)), deliberately better in:
 - **Layout** — Ratatui widgets/constraints instead of hand-rolled lipgloss:
   constraint layout for the frame, `Scrollbar` on the transcript, `Clear` +
   centered Block for help / sessions / peer / permission overlays.
-- **Testing** — ratatui `TestBackend` + protocol fixtures (no PTY required
-  for logic). Optional cell smoke later.
+- **Testing** — ratatui `TestBackend` + protocol fixtures for logic, with the
+  deterministic `scripts/smoke-tui.sh` PTY smoke when `shell-use` is available.
 - **Theme** — mocha default and flashdiff-style diffs as a palette module,
   not Charm AdaptiveColor.
 - **No blank-import tricks in the UI** — one crate, one binary.

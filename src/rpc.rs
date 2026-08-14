@@ -1,4 +1,4 @@
-//! JSON-lines client for `mow rpc` (host protocol v3).
+//! JSON-lines client for `mow rpc` (compatibility epoch 1).
 //!
 //! The Engine is a child process: mowi writes requests to its stdin and reads
 //! responses plus notifications from its stdout. Stderr is Engine logging and
@@ -292,9 +292,11 @@ pub fn merge_capabilities(mut version: VersionInfo, v: &Value) -> VersionInfo {
     version
 }
 
-/// Validate a `version` result. The protocol is additive: a server newer than
-/// `RPC_COMPATIBILITY_EPOCH` still speaks every method we send, so accept `>=` rather
-/// than pinning equality (which made each new method a breaking change).
+/// Validate a `version` result.
+///
+/// The compatibility epoch is an exact match, not a floor: a future epoch
+/// means an incompatible wire contract. Additive methods stay on epoch 1 and
+/// are discovered through `methods` / `control_methods` / `features`.
 pub fn check_version(v: &Value) -> Result<VersionInfo, Error> {
     let rpc = v
         .get("rpc")
@@ -603,18 +605,14 @@ fn index_close_tag(s: &str, close_tag: &str) -> Option<usize> {
         let bytes = s.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
-            let Some(rel) = s[i..].find("```") else {
-                return None;
-            };
+            let rel = s[i..].find("```")?;
             let j = i + rel;
             let rest = &s[j + 3..];
             let line = rest.split_once('\n').map(|(l, _)| l).unwrap_or(rest);
             if line.trim().is_empty() {
                 return Some(j);
             }
-            let Some(k) = rest.find("```") else {
-                return None;
-            };
+            let k = rest.find("```")?;
             i = j + 3 + k + 3;
         }
         return None;
@@ -830,7 +828,7 @@ pub fn decode_lsp_diagnostics(params: &Value) -> Option<LspProblems> {
             });
         }
     }
-    diagnostics.sort_by(|a, b| lsp_severity_rank(&b.severity).cmp(&lsp_severity_rank(&a.severity)));
+    diagnostics.sort_by_key(|b| std::cmp::Reverse(lsp_severity_rank(&b.severity)));
     Some(LspProblems {
         path,
         count,
@@ -1010,7 +1008,7 @@ impl Client {
         }
     }
 
-    /// version → session → status. Refuses a non-v3 server.
+    /// version → session → status. Requires compatibility epoch 1.
     ///
     /// When `version` omits `methods`, try `capabilities` once. An empty
     /// list after that means the host did not advertise a surface — do not
@@ -1617,16 +1615,24 @@ mod tests {
         assert_eq!(info.features.get("ephemeral_prompt"), Some(&true));
         assert_eq!(info.features.get("batch"), Some(&false));
 
-        // Additive protocol: a newer server is fine, an older one is not.
-        let incompatible = serde_json::json!({"name":"mow","version":"0.1.0","rpc":"4"});
-        assert!(check_version(&incompatible).is_err());
-        let older = serde_json::json!({"name":"mow","version":"0.1.0","rpc":"2"});
-        assert!(check_version(&older).is_err());
+        // Epoch is an exact contract: pre-release numbers and future epochs
+        // are both refused (they are not additive floors).
+        for bad in ["2", "3", "4", "0", "99"] {
+            let incompatible = serde_json::json!({"name":"mow","version":"0.1.0","rpc": bad});
+            assert!(
+                check_version(&incompatible).is_err(),
+                "epoch {bad} must be refused"
+            );
+        }
 
         let old = serde_json::json!({"name":"mow","version":"0.1.0","rpc":"2"});
         let err = check_version(&old).unwrap_err();
         assert!(matches!(err, Error::Protocol(_)), "got {err:?}");
         assert!(err.to_string().contains("\"2\""), "{err}");
+        assert!(
+            err.to_string().contains("compatibility epoch"),
+            "error should name the epoch gate: {err}"
+        );
 
         let missing = serde_json::json!({"name":"mow"});
         assert!(matches!(check_version(&missing), Err(Error::Protocol(_))));
