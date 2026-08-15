@@ -44,7 +44,7 @@ use crate::rpc::{
     TranscriptMessage, VersionInfo, decode_extra_roots, decode_goal_event, decode_lsp_diagnostics,
     decode_rewind, decode_sessions, decode_skill_activate, decode_skill_list, extract_thinking,
     has_extra_roots_field, reasoning_delta, token_delta, tool_args, tool_denied, tool_error,
-    tool_name, tool_progress_label, tool_result,
+    tool_name, tool_progress_label_for, tool_result,
 };
 use crate::slash::{
     HostOffer, LOCAL_HELP, SlashRoute, canonical_slash, command_offered, slash_completions,
@@ -2500,7 +2500,12 @@ impl App {
             }
             k if k.ends_with("tool.start") || k == "tool.start" => {
                 if let Some(name) = tool_name(params) {
-                    let label = tool_progress_label(name, tool_args(params));
+                    let label = tool_progress_label_for(
+                        name,
+                        tool_args(params),
+                        &self.session.workspace,
+                        &self.extra_roots,
+                    );
                     self.status = activity_tool_label(&label);
                     self.live_tools.push((label, None));
                     if self.follow {
@@ -2548,7 +2553,14 @@ impl App {
             k if k.ends_with("tool.end") || k == "tool.end" => {
                 let name = tool_name(params);
                 let label = name
-                    .map(|n| tool_progress_label(n, tool_args(params)))
+                    .map(|n| {
+                        tool_progress_label_for(
+                            n,
+                            tool_args(params),
+                            &self.session.workspace,
+                            &self.extra_roots,
+                        )
+                    })
                     .unwrap_or_default();
                 self.note_tool_end(
                     name,
@@ -2583,8 +2595,10 @@ impl App {
                 .to_string();
             self.peers
                 .entry(agent.clone())
-                .or_default()
-                .push_str(params.get("delta").and_then(Value::as_str).unwrap_or(""));
+                .or_default();
+            if let Some(buf) = self.peers.get_mut(&agent) {
+                append_stream_text(buf, params.get("delta").and_then(Value::as_str).unwrap_or(""));
+            }
             self.touch_peer(&agent);
             self.status = format!("⇄ {} · receiving", sanitize_preview(&agent));
         } else if kind.contains("delegate") && kind.contains("progress") {
@@ -3602,12 +3616,67 @@ pub fn sanitize_preview(text: &str) -> String {
 /// The last non-empty sanitized line of a peer buffer, clipped to `PEER_PREVIEW`
 /// display columns (not chars — CJK and emoji are double-width).
 fn last_visible_line(buffer: &str) -> String {
-    let line = buffer
+    let line = reflow_stream_text(buffer)
         .lines()
         .map(sanitize_preview)
         .rfind(|l| !l.trim().is_empty())
         .unwrap_or_default();
     clip_display(line.trim(), PEER_PREVIEW)
+}
+
+/// Join a streamed peer/think delta without welding the next sentence onto
+/// the previous one. Mid-word token splits stay glued (`recommend` + `ing`).
+fn append_stream_text(buf: &mut String, delta: &str) {
+    if delta.is_empty() {
+        return;
+    }
+    if needs_stream_space(buf, delta) {
+        buf.push(' ');
+    }
+    buf.push_str(delta);
+}
+
+fn needs_stream_space(buf: &str, delta: &str) -> bool {
+    let Some(prev) = buf.chars().rev().find(|c| !c.is_control()) else {
+        return false;
+    };
+    let Some(next) = delta.chars().find(|c| !c.is_control()) else {
+        return false;
+    };
+    if prev.is_whitespace() || next.is_whitespace() {
+        return false;
+    }
+    if matches!(next, ',' | '.' | '!' | '?' | ';' | ':' | ')' | ']' | '}' | '\'' | '"') {
+        return false;
+    }
+    if matches!(prev, '(' | '[' | '{' | '"' | '\'' | '/' | '\\' | '-' | '_') {
+        return false;
+    }
+    // New sentence starting with a capital after a terminator — the usual
+    // ACP/think weld (`…recommending.Now let me…`).
+    if matches!(prev, '.' | '!' | '?' | ':') && next.is_uppercase() {
+        return true;
+    }
+    false
+}
+
+/// Repair already-buffered welds when painting the ctrl+p viewer.
+fn reflow_stream_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut prev: Option<char> = None;
+    for ch in text.chars() {
+        if let Some(p) = prev
+            && matches!(p, '.' | '!' | '?' | ':')
+            && ch.is_uppercase()
+        {
+            out.push(' ');
+        }
+        out.push(ch);
+        if !ch.is_control() {
+            prev = Some(ch);
+        }
+    }
+    out
 }
 
 /// Last path component, so the header can name the workspace without the
@@ -4311,6 +4380,10 @@ const HINT_ESC_CLOSE: OverlayHint = OverlayHint {
 const HINT_ESC_BACK: OverlayHint = OverlayHint {
     key: "esc",
     action: "back",
+};
+const HINT_X_CLOSE: OverlayHint = OverlayHint {
+    key: "x",
+    action: "close",
 };
 const HINT_TAB_PEERS: OverlayHint = OverlayHint {
     key: "tab",
@@ -5432,10 +5505,11 @@ fn draw_skills(
 fn draw_peer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let agent = app.peer_focus.clone().unwrap_or_else(|| "peer".to_string());
     let raw = app.peers.get(&agent).map(String::as_str).unwrap_or("");
+    let display = reflow_stream_text(raw);
 
     // Hug readable content instead of opening a document-height slab. Width is
     // bounded first; the same inner width then drives wrapping and height.
-    let natural = raw
+    let natural = display
         .lines()
         .map(|line| sanitize_preview(line).width() as u16)
         .max()
@@ -5444,7 +5518,7 @@ fn draw_peer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let max_w = area.width.saturating_sub(2).min(72);
     let width = natural.clamp(32.min(max_w), max_w.max(1));
     let inner_w = width.saturating_sub(4).max(1) as usize;
-    let body: Vec<Line<'static>> = raw
+    let body: Vec<Line<'static>> = display
         .lines()
         .flat_map(|line| wrap_cols(&sanitize_preview(line), inner_w))
         .map(|line| Line::styled(line, app.theme.context()))
@@ -5470,19 +5544,30 @@ fn draw_peer(frame: &mut Frame<'_>, app: &App, area: Rect) {
         String::new()
     };
     let (hints, note) = if app.peer_agents().len() > 1 {
-        ([HINT_SCROLL, HINT_TAB_PEERS, HINT_ESC_BACK].as_slice(), "")
+        (
+            [HINT_SCROLL, HINT_TAB_PEERS, HINT_ESC_BACK, HINT_X_CLOSE].as_slice(),
+            "",
+        )
     } else {
-        ([HINT_SCROLL, HINT_ESC_CLOSE].as_slice(), "")
+        ([HINT_SCROLL, HINT_ESC_CLOSE, HINT_X_CLOSE].as_slice(), "")
     };
+    let mut block = overlay_block_hint(
+        app,
+        &format!("⇄ {agent}{position}"),
+        hints,
+        note,
+    );
+    block = block.title(
+        Line::from(Span::styled(
+            " x ",
+            app.theme.chip().patch(app.theme.overlay()),
+        ))
+        .alignment(Alignment::Right),
+    );
     frame.render_widget(
         Paragraph::new(visible)
             .style(app.theme.context().patch(app.theme.overlay()))
-            .block(overlay_block_hint(
-                app,
-                &format!("⇄ {agent}{position}"),
-                hints,
-                note,
-            )),
+            .block(block),
         spot,
     );
 }
@@ -6305,7 +6390,7 @@ fn handle_overlay_keys(app: &mut App, key: KeyEvent) -> OverlayAction {
             }
             OverlayAction::Handled
         }
-        KeyCode::Char('q') if app.overlay_query.is_empty() => {
+        KeyCode::Char('q' | 'x') if app.overlay_query.is_empty() => {
             app.dismiss_overlay();
             OverlayAction::Handled
         }
@@ -10689,6 +10774,54 @@ mod tests {
         app.push_visible_token("key files.<think>plan the approach</think>Let me go");
         assert_eq!(app.live, "key files. Let me go");
         assert!(!app.live.contains("plan the approach"));
+    }
+
+    #[test]
+    fn peer_chunks_do_not_weld_sentences() {
+        let mut app = App::new(SessionInfo::default());
+        peer_chunk(&mut app, "cursor", "I'll inspect the theme.");
+        peer_chunk(&mut app, "cursor", "Now let me see the overlay.");
+        let body = app.peers.get("cursor").expect("peer");
+        assert!(
+            body.contains("theme. Now let me"),
+            "streamed sentences must not weld: {body:?}"
+        );
+        assert!(
+            !body.contains("theme.Now"),
+            "missing space after terminator: {body:?}"
+        );
+
+        // Mid-word token splits must stay glued.
+        let mut word = String::from("recommend");
+        append_stream_text(&mut word, "ing");
+        assert_eq!(word, "recommending");
+
+        assert_eq!(
+            reflow_stream_text("recommending.Now let me"),
+            "recommending. Now let me"
+        );
+        assert_eq!(reflow_stream_text("v1.2 Release"), "v1.2 Release");
+    }
+
+    #[test]
+    fn peer_viewer_x_closes_like_help() {
+        let mut app = App::new(SessionInfo::default());
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
+        app.animate = false;
+        peer_chunk(&mut app, "cursor", "recommending.Now let me inspect.");
+        assert!(app.toggle_peer_expand());
+        assert!(matches!(app.overlay, Overlay::Peer));
+        let out = render(&mut app, 72, 18);
+        assert!(
+            out.contains("recommending. Now let me"),
+            "viewer must reflow welded sentences:\n{out}"
+        );
+        assert!(
+            out.contains(" x close") || out.contains(" x ") || out.contains("x close"),
+            "viewer must advertise close:\n{out}"
+        );
+        overlay_key(&mut app, KeyCode::Char('x'));
+        assert!(matches!(app.overlay, Overlay::None));
     }
 
     fn huge_markdown(sections: usize) -> String {

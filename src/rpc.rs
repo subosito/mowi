@@ -443,17 +443,30 @@ pub fn tool_error(params: &Value) -> Option<&str> {
 /// Display label `verb detail` from a tool event, matching mow `FormatToolProgress`.
 ///
 /// A name that already carries its argument (`read src/app.rs`) is left alone
-/// so tests and older hosts that inline the path keep working.
+/// so tests and older hosts that inline the path keep working. Prefer
+/// [`tool_progress_label_for`] when the session workspace is known so in-root
+/// files paint as relative paths.
 pub fn tool_progress_label(tool: &str, args: Option<&Value>) -> String {
+    tool_progress_label_for(tool, args, "", &[])
+}
+
+/// Like [`tool_progress_label`], but workspace files are shown relative to
+/// `workspace`. Extra-root and any other absolute path stay full.
+pub fn tool_progress_label_for(
+    tool: &str,
+    args: Option<&Value>,
+    workspace: &str,
+    extra_roots: &[ExtraRoot],
+) -> String {
     let tool = tool.trim();
     if tool.is_empty() {
         return String::new();
     }
     if tool.contains(char::is_whitespace) {
-        return tool.to_string();
+        return rewrite_composed_tool_label(tool, workspace, extra_roots);
     }
     let detail = args
-        .map(|args| tool_progress_detail(tool, args))
+        .map(|args| tool_progress_detail(tool, args, workspace, extra_roots))
         .unwrap_or_default();
     if detail.is_empty() {
         tool.to_string()
@@ -462,7 +475,27 @@ pub fn tool_progress_label(tool: &str, args: Option<&Value>) -> String {
     }
 }
 
-fn tool_progress_detail(tool: &str, args: &Value) -> String {
+fn rewrite_composed_tool_label(label: &str, workspace: &str, extra_roots: &[ExtraRoot]) -> String {
+    let mut parts = label.splitn(2, char::is_whitespace);
+    let verb = parts.next().unwrap_or("");
+    let rest = parts.next().unwrap_or("").trim();
+    if rest.is_empty() {
+        return label.to_string();
+    }
+    match verb.to_ascii_lowercase().as_str() {
+        "read" | "write" | "edit" | "delete" => {
+            format!("{verb} {}", display_jail_path(rest, workspace, extra_roots))
+        }
+        _ => label.to_string(),
+    }
+}
+
+fn tool_progress_detail(
+    tool: &str,
+    args: &Value,
+    workspace: &str,
+    extra_roots: &[ExtraRoot],
+) -> String {
     let get = |key: &str| -> String {
         match args {
             Value::Object(map) => map
@@ -476,7 +509,9 @@ fn tool_progress_detail(tool: &str, args: &Value) -> String {
         }
     };
     match tool.to_ascii_lowercase().as_str() {
-        "read" | "write" | "edit" | "delete" => clip_runes(&get("path"), 72),
+        "read" | "write" | "edit" | "delete" => {
+            clip_runes(&display_jail_path(&get("path"), workspace, extra_roots), 72)
+        }
         "glob" => clip_runes(&get("pattern"), 72),
         "grep" => {
             let pat = clip_runes(&get("pattern"), 40);
@@ -485,7 +520,10 @@ fn tool_progress_detail(tool: &str, args: &Value) -> String {
             }
             let path = get("path");
             if !path.is_empty() && path != "." {
-                format!("{pat} in {}", clip_runes(&path, 40))
+                format!(
+                    "{pat} in {}",
+                    clip_runes(&display_jail_path(&path, workspace, extra_roots), 40)
+                )
             } else {
                 pat
             }
@@ -495,9 +533,50 @@ fn tool_progress_detail(tool: &str, args: &Value) -> String {
             .into_iter()
             .map(get)
             .find(|value| !value.is_empty())
-            .map(|value| clip_runes(&value, 64))
+            .map(|value| {
+                clip_runes(&display_jail_path(&value, workspace, extra_roots), 64)
+            })
             .unwrap_or_default(),
     }
+}
+
+/// How a jail path should look in the TUI.
+///
+/// Files under the session workspace are relative (`src/app.rs`). Extra-root
+/// files and anything else stay absolute so it is obvious they are not in this
+/// tree. Already-relative paths are left alone.
+pub fn display_jail_path(path: &str, workspace: &str, extra_roots: &[ExtraRoot]) -> String {
+    let path = path.trim();
+    if path.is_empty() {
+        return String::new();
+    }
+    if !path.starts_with('/') {
+        return path.to_string();
+    }
+    if let Some(rel) = strip_dir_prefix(path, workspace) {
+        // A workspace-relative hit wins even if an extra root is a child of
+        // the workspace (unusual). Extra roots that sit *beside* the
+        // workspace keep their full path because this branch does not fire.
+        let _ = extra_roots;
+        return if rel.is_empty() {
+            ".".into()
+        } else {
+            rel
+        };
+    }
+    path.to_string()
+}
+
+fn strip_dir_prefix(path: &str, root: &str) -> Option<String> {
+    let root = root.trim().trim_end_matches('/');
+    if root.is_empty() || !root.starts_with('/') {
+        return None;
+    }
+    if path == root {
+        return Some(String::new());
+    }
+    let prefix = format!("{root}/");
+    path.strip_prefix(&prefix).map(str::to_string)
 }
 
 fn clip_runes(s: &str, max: usize) -> String {
@@ -1809,6 +1888,50 @@ mod tests {
         });
         assert!(tool_denied(&denied));
         assert_eq!(tool_error(&denied), Some("policy: write disabled"));
+    }
+
+    #[test]
+    fn workspace_files_display_relative_extra_roots_stay_absolute() {
+        let ws = "/home/subosito/Code/runner/mowi";
+        let extra = [ExtraRoot {
+            path: "/home/subosito/Code/runner/mow".into(),
+            read_only: false,
+        }];
+        assert_eq!(
+            display_jail_path(&format!("{ws}/src/app.rs"), ws, &extra),
+            "src/app.rs"
+        );
+        assert_eq!(
+            display_jail_path(
+                "/home/subosito/Code/runner/mow/internal/engine/event.go",
+                ws,
+                &extra
+            ),
+            "/home/subosito/Code/runner/mow/internal/engine/event.go"
+        );
+        assert_eq!(
+            tool_progress_label_for(
+                "write",
+                Some(&serde_json::json!({"path": format!("{ws}/src/theme.rs")})),
+                ws,
+                &extra
+            ),
+            "write src/theme.rs"
+        );
+        assert_eq!(
+            tool_progress_label_for(
+                "write /home/subosito/Code/runner/mowi/src/app.rs",
+                None,
+                ws,
+                &extra
+            ),
+            "write src/app.rs"
+        );
+        assert_eq!(
+            display_jail_path("src/already.rs", ws, &extra),
+            "src/already.rs"
+        );
+        assert_eq!(display_jail_path(ws, ws, &extra), ".");
     }
 
     #[test]
