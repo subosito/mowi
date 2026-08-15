@@ -801,6 +801,24 @@ impl Theme {
         }
     }
 
+    /// Old-file line numbers in the shared gutter.
+    pub fn diff_old_no(self) -> Style {
+        if self.colored {
+            Style::default().fg(self.palette.red)
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        }
+    }
+
+    /// New-file line numbers in the shared gutter.
+    pub fn diff_new_no(self) -> Style {
+        if self.colored {
+            Style::default().fg(self.palette.green)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        }
+    }
+
     /// Sign column of an added line: dedicated add accent on the add band.
     pub fn add_sign(self) -> Style {
         if self.colored {

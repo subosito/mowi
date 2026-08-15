@@ -32,6 +32,8 @@ pub enum Error {
     /// Child exited or the reader thread stopped.
     Closed,
     Timeout,
+    /// Operator asked to resume another session; the TUI should respawn.
+    ResumeSession(String),
 }
 
 impl fmt::Display for Error {
@@ -43,6 +45,7 @@ impl fmt::Display for Error {
             Error::Protocol(m) => write!(f, "{m}"),
             Error::Closed => write!(f, "mow rpc connection closed"),
             Error::Timeout => write!(f, "timed out waiting for mow rpc"),
+            Error::ResumeSession(id) => write!(f, "resume session {id}"),
         }
     }
 }

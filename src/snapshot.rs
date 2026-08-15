@@ -93,6 +93,50 @@ pub fn scene_with_theme(name: &str, theme: Theme) -> App {
             app.entries.push(snapshot_user("what changed?"));
             app.overlay = crate::app::Overlay::help();
         }
+        "sessions" => {
+            app.entries.push(snapshot_user("continue yesterday"));
+            app.overlay = crate::app::Overlay::sessions(vec![
+                crate::rpc::SessionSummary {
+                    id: "01J8ZK4M7Q2XN5V9".into(),
+                    updated: "today".into(),
+                    preview: "port the header chips".into(),
+                },
+                crate::rpc::SessionSummary {
+                    id: "01JA12SESSIONS02".into(),
+                    updated: "yesterday".into(),
+                    preview: "fix the exclusive slice".into(),
+                },
+            ]);
+        }
+        "models" => {
+            app.entries.push(snapshot_user("/model"));
+            app.apply_model_list(crate::rpc::ModelList {
+                current: "gpt-5-mini".into(),
+                models: vec![
+                    crate::rpc::ModelInfo {
+                        id: "gpt-5-mini".into(),
+                        current: true,
+                        wire: "openai-responses".into(),
+                    },
+                    crate::rpc::ModelInfo {
+                        id: "claude-sonnet-4".into(),
+                        current: false,
+                        wire: String::new(),
+                    },
+                ],
+            });
+        }
+        "peers" => {
+            app.entries.push(snapshot_user("review in parallel"));
+            app.peers
+                .insert("claude".into(), "reading auth.rs\nlooks clean".into());
+            app.peers
+                .insert("codex".into(), "scanning tests\nfound one flake".into());
+            app.peer_order = vec!["codex".into(), "claude".into()];
+            app.peer_state.insert("codex".into(), "tool".into());
+            app.peer_state.insert("claude".into(), "thought".into());
+            app.overlay = crate::app::Overlay::peer_picker(2, 0);
+        }
         "permission" => {
             app.entries.push(snapshot_user("run the tests"));
             app.entries.push(Entry::Assistant(

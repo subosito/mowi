@@ -115,6 +115,26 @@ fn compact_tokens(n: u64) -> String {
     compact_count(n)
 }
 
+/// Host `context` is tokens / model window. Compact estimates sometimes leak
+/// a raw char count (1.4m against a 500k tok-eq cap → 271%). Convert when
+/// used is implausibly larger than the window.
+fn sanitize_context_usage(mut usage: ContextUsage) -> ContextUsage {
+    if let Some(window) = usage.context_window.filter(|w| *w > 0) {
+        if usage.tokens > window {
+            usage.tokens = (usage.tokens + 2) / 4;
+            if usage.tokens > window {
+                usage.tokens = window;
+            }
+            usage.remaining = Some(window.saturating_sub(usage.tokens));
+            usage.percent = Some((usage.tokens as f64 / window as f64) * 100.0);
+        }
+    }
+    if let Some(pct) = usage.percent {
+        usage.percent = Some(pct.clamp(0.0, 100.0));
+    }
+    usage
+}
+
 /// One painted transcript block.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Entry {
@@ -254,12 +274,10 @@ impl Overlay {
     }
 
     pub(crate) fn help() -> Self {
-        let mut state = TableState::default();
-        state.select(Some(0));
-        Overlay::Help(state)
+        Overlay::Help(select_table(1, 0))
     }
 
-    fn sessions(items: Vec<SessionSummary>) -> Self {
+    pub(crate) fn sessions(items: Vec<SessionSummary>) -> Self {
         Overlay::Sessions {
             state: select_list(items.len(), 0),
             items,
@@ -310,6 +328,14 @@ impl Overlay {
 
 fn select_list(len: usize, idx: usize) -> ListState {
     let mut state = ListState::default();
+    if len > 0 {
+        state.select(Some(idx.min(len - 1)));
+    }
+    state
+}
+
+fn select_table(len: usize, idx: usize) -> TableState {
+    let mut state = TableState::default();
     if len > 0 {
         state.select(Some(idx.min(len - 1)));
     }
@@ -461,6 +487,10 @@ pub struct App {
     pub queue: VecDeque<String>,
     pub search_term: String,
     pub search_hits: Vec<usize>,
+    /// Typeahead filter for the open overlay picker.
+    pub overlay_query: String,
+    /// Session id to resume by respawning `mow rpc --session`.
+    pub pending_resume: Option<String>,
     pub search_cursor: usize,
     pub last_copy: String,
     /// Tool calls of the turn currently running, grouped so a busy turn does
@@ -570,6 +600,8 @@ impl Default for App {
             queue: VecDeque::new(),
             search_term: String::new(),
             search_hits: Vec::new(),
+            overlay_query: String::new(),
+            pending_resume: None,
             search_cursor: 0,
             last_copy: String::new(),
             live_tools: Vec::new(),
@@ -731,7 +763,7 @@ impl App {
         if !list.current.is_empty() {
             self.session.model = list.current.clone();
         }
-        self.overlay = Overlay::models(list);
+        self.open_overlay(Overlay::models(list));
     }
 
     /// Apply a `model.set` result to the header chip.
@@ -750,7 +782,7 @@ impl App {
         if !list.current.is_empty() {
             self.effort = list.current.clone();
         }
-        self.overlay = Overlay::efforts(list);
+        self.open_overlay(Overlay::efforts(list));
     }
 
     /// Apply an `effort.set` result to the status bar.
@@ -830,7 +862,7 @@ impl App {
 
     /// Store a `context` result for the used/window chip.
     pub fn apply_context(&mut self, usage: &ContextUsage) {
-        self.ctx = Some(usage.clone());
+        self.ctx = Some(sanitize_context_usage(usage.clone()));
     }
 
     /// Keep the newest batch per path and paint one summary line — not every finding.
@@ -1256,8 +1288,7 @@ impl App {
         // Context pressure earns a footer slot only once it starts to matter:
         // the header size chip covers the normal case, and a percentage that is
         // always on screen stops being read.
-        if let Some(ctx) = &self.ctx
-            && let Some(pct) = ctx.percent
+        if let Some(pct) = self.context_percent()
             && pct >= CTX_FOOTER_PCT
         {
             sep(&mut left);
@@ -2123,7 +2154,7 @@ impl App {
             .unwrap_or(0);
         self.peer_focus = None;
         self.peer_scroll = 0;
-        self.overlay = Overlay::peer_picker(agents.len(), idx);
+        self.open_overlay(Overlay::peer_picker(agents.len(), idx));
     }
 
     fn close_peer_ui(&mut self) {
@@ -2962,14 +2993,30 @@ impl App {
     }
 
     fn overlay_move(&mut self, delta: i32) {
-        let help_len = self.help_rows().len();
-        let peer_len = self.peer_agents().len();
+        let help_len = self.filtered_help_rows().len();
+        let session_len = match &self.overlay {
+            Overlay::Sessions { items, .. } => self.filter_sessions(items).len(),
+            _ => 0,
+        };
+        let model_len = match &self.overlay {
+            Overlay::Models { list, .. } => self.filter_models(list).len(),
+            _ => 0,
+        };
+        let effort_len = match &self.overlay {
+            Overlay::Efforts { list, .. } => self.filter_efforts(list).len(),
+            _ => 0,
+        };
+        let completion_len = match &self.overlay {
+            Overlay::Completions { items, .. } => self.filter_completions(items).len(),
+            _ => 0,
+        };
+        let peer_len = self.filter_peers(&self.peer_agents()).len();
         match &mut self.overlay {
             Overlay::Help(state) => step_table(state, help_len, delta),
-            Overlay::Sessions { items, state } => step_list(state, items.len(), delta),
-            Overlay::Models { list, state } => step_list(state, list.models.len(), delta),
-            Overlay::Efforts { list, state } => step_list(state, list.efforts.len(), delta),
-            Overlay::Completions { items, state } => step_list(state, items.len(), delta),
+            Overlay::Sessions { state, .. } => step_list(state, session_len, delta),
+            Overlay::Models { state, .. } => step_list(state, model_len, delta),
+            Overlay::Efforts { state, .. } => step_list(state, effort_len, delta),
+            Overlay::Completions { state, .. } => step_list(state, completion_len, delta),
             Overlay::PeerPicker { state } => step_list(state, peer_len, delta),
             Overlay::Peer => {
                 if delta < 0 {
@@ -2983,21 +3030,180 @@ impl App {
     }
 
     /// Selected id in a picker overlay, if any.
+    pub(crate) fn open_overlay(&mut self, overlay: Overlay) {
+        self.overlay_query.clear();
+        self.overlay = overlay;
+    }
+
     pub fn overlay_selection(&self) -> Option<String> {
         match &self.overlay {
             Overlay::Sessions { items, state } => {
-                items.get(state.selected()?).map(|s| s.id.clone())
+                let idx = *self.filter_sessions(items).get(state.selected()?)?;
+                items.get(idx).map(|s| s.id.clone())
             }
             Overlay::Models { list, state } => {
-                list.models.get(state.selected()?).map(|m| m.id.clone())
+                let idx = *self.filter_models(list).get(state.selected()?)?;
+                list.models.get(idx).map(|m| m.id.clone())
             }
             Overlay::Efforts { list, state } => {
-                list.efforts.get(state.selected()?).map(|e| e.id.clone())
+                let idx = *self.filter_efforts(list).get(state.selected()?)?;
+                list.efforts.get(idx).map(|e| e.id.clone())
             }
-            Overlay::Completions { items, state } => items.get(state.selected()?).cloned(),
-            Overlay::PeerPicker { state } => self.peer_agents().get(state.selected()?).cloned(),
+            Overlay::Completions { items, state } => {
+                let idx = *self.filter_completions(items).get(state.selected()?)?;
+                items.get(idx).cloned()
+            }
+            Overlay::PeerPicker { state } => {
+                let agents = self.peer_agents();
+                let idx = *self.filter_peers(&agents).get(state.selected()?)?;
+                agents.get(idx).cloned()
+            }
             _ => None,
         }
+    }
+
+    fn query_matches(&self, haystack: &str) -> bool {
+        let query = self.overlay_query.trim();
+        if query.is_empty() {
+            return true;
+        }
+        haystack.to_lowercase().contains(&query.to_lowercase())
+    }
+
+    fn filtered_help_rows(&self) -> Vec<(String, String)> {
+        self.help_rows()
+            .into_iter()
+            .filter(|(key, what)| self.query_matches(&format!("{key} {what}")))
+            .collect()
+    }
+
+    fn filter_sessions(&self, items: &[SessionSummary]) -> Vec<usize> {
+        items
+            .iter()
+            .enumerate()
+            .filter(|(_, session)| {
+                self.query_matches(&format!(
+                    "{} {} {}",
+                    session.id, session.updated, session.preview
+                ))
+            })
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    fn filter_models(&self, list: &ModelList) -> Vec<usize> {
+        list.models
+            .iter()
+            .enumerate()
+            .filter(|(_, model)| self.query_matches(&format!("{} {}", model.id, model.wire)))
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    fn filter_efforts(&self, list: &EffortList) -> Vec<usize> {
+        list.efforts
+            .iter()
+            .enumerate()
+            .filter(|(_, effort)| self.query_matches(&effort.id))
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    fn filter_completions(&self, items: &[String]) -> Vec<usize> {
+        items
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| self.query_matches(name))
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    fn filter_peers(&self, agents: &[String]) -> Vec<usize> {
+        agents
+            .iter()
+            .enumerate()
+            .filter(|(_, agent)| self.query_matches(&self.peer_picker_label(agent)))
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    fn overlay_filter_push(&mut self, ch: char) {
+        if ch.is_control() || ch == '\n' || ch == '\t' {
+            return;
+        }
+        self.overlay_query.push(ch);
+        self.sync_overlay_filter();
+    }
+
+    fn overlay_filter_pop(&mut self) {
+        if self.overlay_query.pop().is_some() {
+            self.sync_overlay_filter();
+        }
+    }
+
+    fn overlay_filter_clear(&mut self) {
+        self.overlay_query.clear();
+        self.sync_overlay_filter();
+    }
+
+    fn sync_overlay_filter(&mut self) {
+        let help_len = self.filtered_help_rows().len();
+        let session_len = match &self.overlay {
+            Overlay::Sessions { items, .. } => self.filter_sessions(items).len(),
+            _ => 0,
+        };
+        let model_len = match &self.overlay {
+            Overlay::Models { list, .. } => self.filter_models(list).len(),
+            _ => 0,
+        };
+        let effort_len = match &self.overlay {
+            Overlay::Efforts { list, .. } => self.filter_efforts(list).len(),
+            _ => 0,
+        };
+        let completion_len = match &self.overlay {
+            Overlay::Completions { items, .. } => self.filter_completions(items).len(),
+            _ => 0,
+        };
+        let peer_len = self.filter_peers(&self.peer_agents()).len();
+        match &mut self.overlay {
+            Overlay::Help(state) => *state = select_table(help_len, 0),
+            Overlay::Sessions { state, .. } => *state = select_list(session_len, 0),
+            Overlay::Models { state, .. } => *state = select_list(model_len, 0),
+            Overlay::Efforts { state, .. } => *state = select_list(effort_len, 0),
+            Overlay::Completions { state, .. } => *state = select_list(completion_len, 0),
+            Overlay::PeerPicker { state } => *state = select_list(peer_len, 0),
+            Overlay::Peer | Overlay::None => {}
+        }
+    }
+
+    fn overlay_filter_note(&self, shown: usize, total: usize) -> String {
+        if self.overlay_query.is_empty() {
+            return String::new();
+        }
+        format!("{} · {shown}/{total}", self.overlay_query)
+    }
+
+    /// Enter on `/sessions` asks the run loop to respawn against this id.
+    pub fn request_session_resume(&mut self) -> bool {
+        let Some(id) = self.overlay_selection() else {
+            self.status = "no matching session".into();
+            return false;
+        };
+        if self.busy {
+            self.status = "finish the turn before switching session".into();
+            return false;
+        }
+        if !id.is_empty() && id == self.session.session_id {
+            self.status = "already on this session".into();
+            self.overlay = Overlay::None;
+            self.overlay_query.clear();
+            return false;
+        }
+        self.pending_resume = Some(id);
+        self.overlay = Overlay::None;
+        self.overlay_query.clear();
+        self.status = "switching session…".into();
+        true
     }
 
     fn complete_slash(&mut self) {
@@ -3009,7 +3215,7 @@ impl App {
         match matches.len() {
             0 => self.status = "no matching command".into(),
             1 => self.set_input(format!("/{} ", matches[0])),
-            _ => self.overlay = Overlay::completions(matches),
+            _ => self.open_overlay(Overlay::completions(matches)),
         }
     }
 
@@ -3060,6 +3266,7 @@ impl App {
             } else {
                 self.overlay = Overlay::None;
             }
+            self.overlay_query.clear();
             return true;
         }
         false
@@ -3805,16 +4012,96 @@ fn overlay_block(app: &App, title: &str) -> Block<'static> {
         ))
 }
 
+/// One key/action pair on an overlay rail. Keys use the chip role; verbs stay quiet.
+struct OverlayHint {
+    key: &'static str,
+    action: &'static str,
+}
+
+const HINT_SCROLL: OverlayHint = OverlayHint {
+    key: "↑↓",
+    action: "scroll",
+};
+const HINT_SELECT: OverlayHint = OverlayHint {
+    key: "↑↓",
+    action: "select",
+};
+const HINT_ENTER_SET: OverlayHint = OverlayHint {
+    key: "enter",
+    action: "set",
+};
+const HINT_ENTER_OPEN: OverlayHint = OverlayHint {
+    key: "enter",
+    action: "open",
+};
+const HINT_ENTER_RUN: OverlayHint = OverlayHint {
+    key: "enter",
+    action: "run",
+};
+const HINT_ENTER_RESUME: OverlayHint = OverlayHint {
+    key: "enter",
+    action: "resume",
+};
+const HINT_ESC_CLOSE: OverlayHint = OverlayHint {
+    key: "esc",
+    action: "close",
+};
+const HINT_ESC_BACK: OverlayHint = OverlayHint {
+    key: "esc",
+    action: "back",
+};
+const HINT_TAB_PEERS: OverlayHint = OverlayHint {
+    key: "tab",
+    action: "peers",
+};
+
 /// Modal chrome with the hint text parked on the bottom rail instead of buried
 /// in the title. Titles name the thing; the rail names the keys.
-fn overlay_block_hint(app: &App, title: &str, hint: &str) -> Block<'static> {
-    overlay_block(app, title).title_bottom(
-        Line::from(vec![Span::styled(
-            format!(" {hint} "),
-            app.theme.note().patch(app.theme.overlay()),
-        )])
-        .alignment(Alignment::Right),
-    )
+fn overlay_block_hint(app: &App, title: &str, hints: &[OverlayHint], note: &str) -> Block<'static> {
+    overlay_block(app, title).title_bottom(overlay_hint_line(app, hints, note))
+}
+
+/// Footer-style key language: the chord is a chip, the verb is muted.
+fn overlay_hint_line(app: &App, hints: &[OverlayHint], note: &str) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = vec![Span::raw(" ")];
+    let sep = app.theme.chrome().patch(app.theme.overlay());
+    let key = app.theme.chip().patch(app.theme.overlay());
+    let action = app.theme.note().patch(app.theme.overlay());
+    for (i, hint) in hints.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", sep));
+        }
+        spans.push(Span::styled(hint.key, key));
+        if !hint.action.is_empty() {
+            spans.push(Span::styled(format!(" {}", hint.action), action));
+        }
+    }
+    if !note.is_empty() {
+        if !hints.is_empty() {
+            spans.push(Span::styled(" · ", sep));
+        }
+        spans.push(Span::styled(note.to_string(), action));
+    }
+    spans.push(Span::raw(" "));
+    Line::from(spans).alignment(Alignment::Right)
+}
+
+/// Size a picker to its rows instead of filling the document.
+fn overlay_list_spot(area: Rect, rows: u16, min_w: u16, max_w: u16, max_h: u16) -> Rect {
+    let width = if area.width <= MIN_WIDTH + 8 {
+        area.width.saturating_sub(2).max(24.min(area.width))
+    } else {
+        area.width
+            .saturating_sub(4)
+            .min(max_w)
+            .max(min_w.min(area.width.saturating_sub(2)))
+    };
+    let height = rows
+        .saturating_add(2)
+        .max(3)
+        .min(max_h)
+        .min(area.height.max(1));
+    centered(area, Constraint::Length(width), Constraint::Length(height))
 }
 
 /// Help chrome: title left, full session id right, keys on the bottom rail.
@@ -3822,10 +4109,10 @@ fn overlay_block_hint(app: &App, title: &str, hint: &str) -> Block<'static> {
 /// The id is identity, not a key row — putting it on the title keeps the
 /// card from growing a header line. The title shortens to `help` when the
 /// long name plus the id would collide.
-fn overlay_block_help(app: &App, width: u16, hint: &str) -> Block<'static> {
+fn overlay_block_help(app: &App, width: u16, note: &str) -> Block<'static> {
     let id = app.session.session_id.as_str();
     let title = help_card_title(width, id);
-    let mut block = overlay_block_hint(app, title, hint);
+    let mut block = overlay_block_hint(app, title, &[HINT_SCROLL, HINT_ESC_CLOSE], note);
     if id.is_empty() {
         return block;
     }
@@ -4515,30 +4802,50 @@ fn help_geometry(rows: &[(String, String)], area: Rect, session_id: &str) -> (Re
 }
 
 fn draw_help(frame: &mut Frame<'_>, app: &App, state: &mut TableState, area: Rect) {
-    let rows_data = app.help_rows();
+    let rows_data = app.filtered_help_rows();
     let (spot, key_w) = help_geometry(&rows_data, area, &app.session.session_id);
     frame.render_widget(Clear, spot);
-    let rows: Vec<Row<'static>> = rows_data
-        .into_iter()
-        .map(|(key, what)| {
-            Row::new(vec![
-                Cell::from(Span::styled(key, app.theme.chip())),
-                Cell::from(Span::styled(what, app.theme.note())),
-            ])
-        })
-        .collect();
+    let rows: Vec<Row<'static>> = if rows_data.is_empty() {
+        vec![Row::new(vec![
+            Cell::from(Span::styled(
+                "no matches",
+                app.theme.note().patch(app.theme.overlay()),
+            )),
+            Cell::from(""),
+        ])]
+    } else {
+        rows_data
+            .into_iter()
+            .map(|(key, what)| {
+                let key_style = if key.starts_with('/') {
+                    app.theme.accent()
+                } else {
+                    app.theme.chip()
+                };
+                Row::new(vec![
+                    Cell::from(Span::styled(key, key_style.patch(app.theme.overlay()))),
+                    Cell::from(Span::styled(
+                        what,
+                        app.theme.note().patch(app.theme.overlay()),
+                    )),
+                ])
+            })
+            .collect()
+    };
+    let note = app.overlay_filter_note(app.filtered_help_rows().len(), app.help_rows().len());
     let table = Table::new(rows, [Constraint::Length(key_w), Constraint::Fill(1)])
         .header(
-            Row::new(vec!["key", "action"]).style(app.theme.accent().add_modifier(Modifier::BOLD)),
+            Row::new(vec!["keys", ""]).style(
+                app.theme
+                    .note()
+                    .add_modifier(Modifier::BOLD)
+                    .patch(app.theme.overlay()),
+            ),
         )
         .column_spacing(1)
         .row_highlight_style(app.theme.selected())
         .highlight_symbol("▸ ")
-        .block(overlay_block_help(
-            app,
-            spot.width,
-            "↑↓/jk scroll · esc close",
-        ));
+        .block(overlay_block_help(app, spot.width, &note));
     frame.render_stateful_widget(table, spot, state);
 }
 
@@ -4549,38 +4856,69 @@ fn draw_sessions(
     state: &mut ListState,
     area: Rect,
 ) {
-    let spot = centered(
-        area,
-        Constraint::Length(area.width.saturating_sub(4).min(72)),
-        Constraint::Length(area.height.saturating_sub(2)),
-    );
+    let shown = app.filter_sessions(sessions);
+    let rows = if shown.is_empty() {
+        1
+    } else {
+        (shown.len() as u16).saturating_mul(2)
+    };
+    let spot = overlay_list_spot(area, rows, 40, 72, 18);
     frame.render_widget(Clear, spot);
+    let inner_w = spot.width.saturating_sub(6).max(8) as usize;
     let items: Vec<ListItem<'static>> = if sessions.is_empty() {
         vec![ListItem::new(Line::styled(
             "no stored sessions",
-            app.theme.note(),
+            app.theme.note().patch(app.theme.overlay()),
+        ))]
+    } else if shown.is_empty() {
+        vec![ListItem::new(Line::styled(
+            "no matches",
+            app.theme.note().patch(app.theme.overlay()),
         ))]
     } else {
-        sessions
+        shown
             .iter()
+            .filter_map(|idx| sessions.get(*idx))
             .map(|session| {
+                let preview = clip_display(&session.preview, inner_w.saturating_sub(2));
                 ListItem::new(vec![
                     Line::from(vec![
-                        Span::styled(session.id.clone(), app.theme.chip()),
-                        Span::styled(format!("  {}", session.updated), app.theme.note()),
+                        Span::styled(
+                            session.id.clone(),
+                            app.theme.chip().patch(app.theme.overlay()),
+                        ),
+                        Span::styled(
+                            format!("  {}", session.updated),
+                            app.theme.note().patch(app.theme.overlay()),
+                        ),
                     ]),
-                    Line::styled(format!("  {}", session.preview), app.theme.context()),
+                    Line::styled(
+                        format!("  {preview}"),
+                        app.theme.context().patch(app.theme.overlay()),
+                    ),
                 ])
             })
             .collect()
     };
+    let title = if sessions.is_empty() {
+        "sessions".to_string()
+    } else {
+        format!("sessions · {}", sessions.len())
+    };
+    let note = app.overlay_filter_note(shown.len(), sessions.len());
+    let hint_note = if note.is_empty() {
+        "enter resumes here".to_string()
+    } else {
+        note
+    };
     let list = List::new(items)
         .highlight_symbol("▸ ")
-        .highlight_style(app.theme.accent().add_modifier(Modifier::BOLD))
+        .highlight_style(app.theme.selected())
         .block(overlay_block_hint(
             app,
-            "sessions",
-            "enter resume · mowi --session <id> · esc close",
+            &title,
+            &[HINT_ENTER_RESUME, HINT_ESC_CLOSE],
+            &hint_note,
         ));
     frame.render_stateful_widget(list, spot, state);
 }
@@ -4597,17 +4935,28 @@ fn draw_models(
     } else {
         format!("models · {}", list.current)
     };
-    let spot = centered(
-        area,
-        Constraint::Length(area.width.saturating_sub(4).min(64)),
-        Constraint::Length(area.height.saturating_sub(2)),
-    );
+    let shown = app.filter_models(list);
+    let rows = if shown.is_empty() {
+        1
+    } else {
+        shown.len() as u16
+    };
+    let spot = overlay_list_spot(area, rows, 36, 64, 16);
     frame.render_widget(Clear, spot);
     let items: Vec<ListItem<'static>> = if list.models.is_empty() {
-        vec![ListItem::new(Line::styled("no models", app.theme.note()))]
+        vec![ListItem::new(Line::styled(
+            "no models",
+            app.theme.note().patch(app.theme.overlay()),
+        ))]
+    } else if shown.is_empty() {
+        vec![ListItem::new(Line::styled(
+            "no matches",
+            app.theme.note().patch(app.theme.overlay()),
+        ))]
     } else {
-        list.models
+        shown
             .iter()
+            .filter_map(|idx| list.models.get(*idx))
             .map(|model| {
                 let active = model.current || model.id == list.current;
                 let mut spans = vec![
@@ -4618,9 +4967,12 @@ fn draw_models(
                     Span::styled(
                         model.id.clone(),
                         if active {
-                            app.theme.text().add_modifier(Modifier::BOLD)
+                            app.theme
+                                .text()
+                                .add_modifier(Modifier::BOLD)
+                                .patch(app.theme.overlay())
                         } else {
-                            app.theme.text()
+                            app.theme.text().patch(app.theme.overlay())
                         },
                     ),
                 ];
@@ -4635,13 +4987,20 @@ fn draw_models(
             })
             .collect()
     };
+    let note = app.overlay_filter_note(shown.len(), list.models.len());
+    let hint_note = if note.is_empty() {
+        "/model <id>".to_string()
+    } else {
+        note
+    };
     let widget = List::new(items)
         .highlight_symbol("▸ ")
-        .highlight_style(app.theme.accent().add_modifier(Modifier::BOLD))
+        .highlight_style(app.theme.selected())
         .block(overlay_block_hint(
             app,
             &title,
-            "enter set · /model <id> · esc close",
+            &[HINT_ENTER_SET, HINT_ESC_CLOSE],
+            &hint_note,
         ));
     frame.render_stateful_widget(widget, spot, state);
 }
@@ -4658,17 +5017,28 @@ fn draw_efforts(
     } else {
         format!("reasoning effort · {}", list.current)
     };
-    let spot = centered(
-        area,
-        Constraint::Length(area.width.saturating_sub(4).min(48)),
-        Constraint::Length(area.height.saturating_sub(2).min(16)),
-    );
+    let shown = app.filter_efforts(list);
+    let rows = if shown.is_empty() {
+        1
+    } else {
+        shown.len() as u16
+    };
+    let spot = overlay_list_spot(area, rows, 28, 48, 14);
     frame.render_widget(Clear, spot);
     let items: Vec<ListItem<'static>> = if list.efforts.is_empty() {
-        vec![ListItem::new(Line::styled("no efforts", app.theme.note()))]
+        vec![ListItem::new(Line::styled(
+            "no efforts",
+            app.theme.note().patch(app.theme.overlay()),
+        ))]
+    } else if shown.is_empty() {
+        vec![ListItem::new(Line::styled(
+            "no matches",
+            app.theme.note().patch(app.theme.overlay()),
+        ))]
     } else {
-        list.efforts
+        shown
             .iter()
+            .filter_map(|idx| list.efforts.get(*idx))
             .map(|effort| {
                 let active = effort.current || effort.id == list.current;
                 ListItem::new(Line::from(vec![
@@ -4679,19 +5049,28 @@ fn draw_efforts(
                     Span::styled(
                         effort.id.clone(),
                         if active {
-                            app.theme.text().add_modifier(Modifier::BOLD)
+                            app.theme
+                                .text()
+                                .add_modifier(Modifier::BOLD)
+                                .patch(app.theme.overlay())
                         } else {
-                            app.theme.text()
+                            app.theme.text().patch(app.theme.overlay())
                         },
                     ),
                 ]))
             })
             .collect()
     };
+    let note = app.overlay_filter_note(shown.len(), list.efforts.len());
     let widget = List::new(items)
+        .highlight_style(app.theme.selected())
         .highlight_symbol("▸ ")
-        .highlight_style(app.theme.accent().add_modifier(Modifier::BOLD))
-        .block(overlay_block_hint(app, &title, "enter set · esc close"));
+        .block(overlay_block_hint(
+            app,
+            &title,
+            &[HINT_ENTER_SET, HINT_ESC_CLOSE],
+            &note,
+        ));
     frame.render_stateful_widget(widget, spot, state);
 }
 
@@ -4702,20 +5081,37 @@ fn draw_completions(
     state: &mut ListState,
     area: Rect,
 ) {
-    let spot = centered(
-        area,
-        Constraint::Length(area.width.saturating_sub(4).min(40)),
-        Constraint::Length(area.height.saturating_sub(2).min(14)),
-    );
+    let shown = app.filter_completions(items);
+    let rows = shown.len().max(1) as u16;
+    let spot = overlay_list_spot(area, rows, 24, 40, 14);
     frame.render_widget(Clear, spot);
-    let rows: Vec<ListItem<'static>> = items
-        .iter()
-        .map(|name| ListItem::new(Line::styled(format!("/{name}"), app.theme.chip())))
-        .collect();
+    let rows: Vec<ListItem<'static>> = if shown.is_empty() {
+        vec![ListItem::new(Line::styled(
+            "no matches",
+            app.theme.note().patch(app.theme.overlay()),
+        ))]
+    } else {
+        shown
+            .iter()
+            .filter_map(|idx| items.get(*idx))
+            .map(|name| {
+                ListItem::new(Line::styled(
+                    format!("/{name}"),
+                    app.theme.accent().patch(app.theme.overlay()),
+                ))
+            })
+            .collect()
+    };
+    let note = app.overlay_filter_note(shown.len(), items.len());
     let widget = List::new(rows)
         .highlight_symbol("▸ ")
-        .highlight_style(app.theme.accent().add_modifier(Modifier::BOLD))
-        .block(overlay_block_hint(app, "commands", "enter run · esc close"));
+        .highlight_style(app.theme.selected())
+        .block(overlay_block_hint(
+            app,
+            "commands",
+            &[HINT_ENTER_RUN, HINT_ESC_CLOSE],
+            &note,
+        ));
     frame.render_stateful_widget(widget, spot, state);
 }
 
@@ -4759,18 +5155,19 @@ fn draw_peer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         String::new()
     };
-    let hint = if app.peer_agents().len() > 1 {
-        "↑↓ scroll · ←→/tab peers · esc back"
+    let (hints, note) = if app.peer_agents().len() > 1 {
+        ([HINT_SCROLL, HINT_TAB_PEERS, HINT_ESC_BACK].as_slice(), "")
     } else {
-        "↑↓ scroll · esc close"
+        ([HINT_SCROLL, HINT_ESC_CLOSE].as_slice(), "")
     };
     frame.render_widget(
         Paragraph::new(visible)
-            .style(app.theme.context())
+            .style(app.theme.context().patch(app.theme.overlay()))
             .block(overlay_block_hint(
                 app,
                 &format!("⇄ {agent}{position}"),
-                hint,
+                hints,
+                note,
             )),
         spot,
     );
@@ -4778,8 +5175,10 @@ fn draw_peer(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn draw_peer_picker(frame: &mut Frame<'_>, app: &App, state: &mut ListState, area: Rect) {
     let agents = app.peer_agents();
-    let labels: Vec<String> = agents
+    let shown = app.filter_peers(&agents);
+    let labels: Vec<String> = shown
         .iter()
+        .filter_map(|idx| agents.get(*idx))
         .map(|agent| app.peer_picker_label(agent))
         .collect();
     let natural = labels
@@ -4790,7 +5189,7 @@ fn draw_peer_picker(frame: &mut Frame<'_>, app: &App, state: &mut ListState, are
         .saturating_add(6);
     let max_w = area.width.saturating_sub(2).min(72);
     let width = natural.clamp(32.min(max_w), max_w.max(1));
-    let wanted_h = (agents.len() as u16).saturating_add(2).max(3);
+    let wanted_h = (shown.len().max(1) as u16).saturating_add(2).max(3);
     let height = wanted_h.min(18).min(area.height.max(1));
     let spot = centered(area, Constraint::Length(width), Constraint::Length(height));
     frame.render_widget(Clear, spot);
@@ -4800,9 +5199,15 @@ fn draw_peer_picker(frame: &mut Frame<'_>, app: &App, state: &mut ListState, are
             "no peer output",
             app.theme.note(),
         ))]
+    } else if shown.is_empty() {
+        vec![ListItem::new(Line::styled(
+            "no matches",
+            app.theme.note().patch(app.theme.overlay()),
+        ))]
     } else {
-        agents
+        shown
             .iter()
+            .filter_map(|idx| agents.get(*idx))
             .map(|agent| {
                 let line = app.peer_picker_line(agent);
                 let clipped = clip_display(&app.peer_picker_label(agent), inner_w);
@@ -4814,13 +5219,15 @@ fn draw_peer_picker(frame: &mut Frame<'_>, app: &App, state: &mut ListState, are
             })
             .collect()
     };
+    let note = app.overlay_filter_note(shown.len(), agents.len());
     let widget = List::new(items)
         .highlight_symbol("▸ ")
-        .highlight_style(app.theme.accent().add_modifier(Modifier::BOLD))
+        .highlight_style(app.theme.selected())
         .block(overlay_block_hint(
             app,
             "peers",
-            "↑↓ select · enter open · esc close",
+            &[HINT_SELECT, HINT_ENTER_OPEN, HINT_ESC_CLOSE],
+            &note,
         ));
     frame.render_stateful_widget(widget, spot, state);
 }
@@ -4924,6 +5331,9 @@ pub fn run<B: Backend>(
             terminal.draw(|f| draw(f, app)).map_err(Error::Io)?;
             flush_clipboard(app);
             dirty = false;
+        }
+        if let Some(id) = app.pending_resume.take() {
+            return Err(Error::ResumeSession(id));
         }
         if poll_input(client, app, &mut turn, &mut slash_rx)? {
             dirty = true;
@@ -5444,8 +5854,8 @@ fn handle_view_key(app: &mut App, key: KeyEvent) {
             app.toggle_peer_expand();
         }
         // ctrl+/ arrives as Char('/') with CONTROL on most terminals.
-        KeyCode::Char('/') if ctrl => app.overlay = Overlay::help(),
-        KeyCode::Char('?') if app.input.is_empty() => app.overlay = Overlay::help(),
+        KeyCode::Char('/') if ctrl => app.open_overlay(Overlay::help()),
+        KeyCode::Char('?') if app.input.is_empty() => app.open_overlay(Overlay::help()),
         KeyCode::Backspace => app.backspace_char(),
         KeyCode::Delete => app.delete_char(),
         KeyCode::Home => app.cursor_home(),
@@ -5498,36 +5908,77 @@ fn handle_overlay_keys(app: &mut App, key: KeyEvent) -> OverlayAction {
             }
             OverlayAction::Handled
         }
-        KeyCode::Esc | KeyCode::Char('q') => {
+        KeyCode::Esc => {
+            if !app.overlay_query.is_empty() {
+                app.overlay_filter_clear();
+            } else {
+                app.dismiss_overlay();
+            }
+            OverlayAction::Handled
+        }
+        KeyCode::Char('q') if app.overlay_query.is_empty() => {
             app.dismiss_overlay();
             OverlayAction::Handled
         }
-        KeyCode::Char('?') => {
+        KeyCode::Char('?') if app.overlay_query.is_empty() => {
             if app.overlay.is_peer_ui() {
                 app.close_peer_ui();
             } else {
                 app.overlay = Overlay::None;
             }
+            app.overlay_query.clear();
             OverlayAction::Handled
         }
         KeyCode::Char('c') if ctrl => OverlayAction::Quit,
-        KeyCode::Up | KeyCode::Char('k') => {
+        KeyCode::Backspace => {
+            app.overlay_filter_pop();
+            OverlayAction::Handled
+        }
+        KeyCode::Up => {
             app.overlay_move(-1);
             OverlayAction::Handled
         }
-        KeyCode::Down | KeyCode::Char('j') => {
+        KeyCode::Down => {
             app.overlay_move(1);
             OverlayAction::Handled
         }
+        KeyCode::PageUp => {
+            app.overlay_move(-10);
+            OverlayAction::Handled
+        }
+        KeyCode::PageDown => {
+            app.overlay_move(10);
+            OverlayAction::Handled
+        }
+        KeyCode::Home => {
+            app.overlay_move(i32::MIN / 2);
+            OverlayAction::Handled
+        }
+        KeyCode::End => {
+            app.overlay_move(i32::MAX / 2);
+            OverlayAction::Handled
+        }
         KeyCode::Left | KeyCode::BackTab => {
-            app.cycle_peer(-1);
+            if app.overlay.is_peer_ui() {
+                app.cycle_peer(-1);
+            }
             OverlayAction::Handled
         }
         KeyCode::Right | KeyCode::Tab => {
-            app.cycle_peer(1);
+            if app.overlay.is_peer_ui() {
+                app.cycle_peer(1);
+            }
             OverlayAction::Handled
         }
         KeyCode::Enter => OverlayAction::Activate,
+        KeyCode::Char(c) if !ctrl => {
+            if app.overlay_query.is_empty() && matches!(c, 'j' | 'k') {
+                app.overlay_move(if c == 'j' { 1 } else { -1 });
+            } else {
+                app.overlay_filter_push(c);
+            }
+            OverlayAction::Handled
+        }
         _ => OverlayAction::Handled,
     }
 }
@@ -5553,12 +6004,7 @@ fn overlay_activate(
     match picker {
         "close" => app.overlay = Overlay::None,
         "session" => {
-            if let Some(id) = selection {
-                app.status = format!("resume with: mowi --session {id}");
-                app.entries
-                    .push(Entry::Note(format!("resume with: mowi --session {id}")));
-            }
-            app.overlay = Overlay::None;
+            app.request_session_resume();
         }
         "model" => {
             app.overlay = Overlay::None;
@@ -5745,7 +6191,7 @@ fn handle_slash(
             start_rewind(client, app, slash_rx, turn, "rewind.retry")?;
         }
         "help" => {
-            app.overlay = Overlay::help();
+            app.open_overlay(Overlay::help());
         }
         "clear" => {
             app.clear_transcript();
@@ -5753,12 +6199,15 @@ fn handle_slash(
         "sessions" | "resume" => {
             if canonical_slash(name) == "resume" && !args.is_empty() {
                 let id = &args[0];
-                app.status = format!("resume with: mowi --session {id}");
-                app.entries
-                    .push(Entry::Note(format!("resume with: mowi --session {id}")));
+                if app.busy {
+                    app.status = "finish the turn before switching session".into();
+                } else {
+                    app.pending_resume = Some(id.clone());
+                    app.status = "switching session…".into();
+                }
             } else {
                 let sessions = client.sessions(Duration::from_secs(20))?;
-                app.overlay = Overlay::sessions(sessions);
+                app.open_overlay(Overlay::sessions(sessions));
             }
         }
         "transcript" => {
@@ -6343,7 +6792,7 @@ mod tests {
         let mut app = App::new(SessionInfo::default());
         app.theme = Theme::plain(ThemeName::CatppuccinMocha);
         app.entries.push(Entry::user("hello there"));
-        app.overlay = Overlay::help();
+        app.open_overlay(Overlay::help());
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| draw(f, &mut app)).unwrap();
         let buf = terminal.backend().buffer();
@@ -6448,7 +6897,7 @@ mod tests {
         app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         app.input.push_str("draft text");
         app.cursor = app.input.chars().count();
-        app.overlay = Overlay::help();
+        app.open_overlay(Overlay::help());
         let out = render(&mut app, 80, 24);
         // The modal must not swallow the thing the operator was typing.
         assert!(out.contains("draft text"), "{out}");
@@ -7165,7 +7614,7 @@ mod tests {
         assert!(news.contains('?'), "{news}");
         assert!(!news.contains("20260814"), "{news}");
 
-        app.overlay = Overlay::help();
+        app.open_overlay(Overlay::help());
         let help = render(&mut app, 80, 24);
         assert!(
             help.contains("20260814abcdef"),
@@ -7282,7 +7731,7 @@ mod tests {
             exclusive: true,
             aliases: vec![],
         });
-        app.overlay = Overlay::help();
+        app.open_overlay(Overlay::help());
         let out = render(&mut app, 80, 24);
         assert!(out.contains("help") || out.contains("keyboard"), "{out}");
         assert!(
@@ -7363,7 +7812,7 @@ mod tests {
             session_id: "01J8ZK4M7Q2XN5V9".into(),
             ..Default::default()
         });
-        app.overlay = Overlay::help();
+        app.open_overlay(Overlay::help());
         let n = app.help_rows().len() as u16;
 
         // A 30-row frame has room for the default table: the card must close
@@ -7420,15 +7869,25 @@ mod tests {
     #[test]
     fn sessions_overlay_lists_rows_and_resume_hint() {
         let mut app = App::new(SessionInfo::default());
-        app.overlay = Overlay::sessions(vec![SessionSummary {
+        app.open_overlay(Overlay::sessions(vec![SessionSummary {
             id: "s-42".into(),
             updated: "today".into(),
             preview: "port the header".into(),
-        }]);
+        }]));
         let out = render(&mut app, 72, 16);
         assert!(out.contains("s-42"), "{out}");
         assert!(out.contains("port the header"), "{out}");
-        assert!(out.contains("mowi --session <id>"), "{out}");
+        assert!(out.contains("enter resumes here"), "{out}");
+        overlay_key(&mut app, KeyCode::Char('h'));
+        assert_eq!(app.overlay_selection().as_deref(), Some("s-42"));
+        overlay_key(&mut app, KeyCode::Char('z'));
+        assert_eq!(app.overlay_selection(), None);
+        overlay_key(&mut app, KeyCode::Esc);
+        assert_eq!(app.overlay_query, "");
+        assert_eq!(app.overlay_selection().as_deref(), Some("s-42"));
+        assert!(app.request_session_resume());
+        assert_eq!(app.pending_resume.as_deref(), Some("s-42"));
+        assert_eq!(app.overlay, Overlay::None);
     }
 
     #[test]
@@ -7979,6 +8438,21 @@ mod tests {
         });
         assert_eq!(app.context_chip().as_deref(), Some("500/1k ctx"));
         assert_eq!(app.context_percent(), Some(50.0));
+    }
+
+    #[test]
+    fn context_chip_does_not_treat_chars_as_tokens() {
+        let mut app = App::new(SessionInfo::default());
+        app.apply_context(&ContextUsage {
+            tokens: 1_355_000,
+            context_window: Some(500_000),
+            percent: Some(271.0),
+            remaining: Some(0),
+        });
+        assert_eq!(app.context_chip().as_deref(), Some("339k/500k ctx"));
+        let pct = app.context_percent().expect("pct");
+        assert!(pct > 60.0 && pct <= 100.0, "{pct}");
+        assert!(app.context_summary().contains("68%"), "{}", app.context_summary());
     }
 
     fn goal_event(kind: &str, id: &str, status: &str, step: u64, max_steps: u64) -> Notification {
@@ -8997,7 +9471,7 @@ mod tests {
     fn overlay_escape_cannot_fall_through_to_cancel() {
         let mut app = App::new(SessionInfo::default());
         app.busy = true;
-        app.overlay = Overlay::help();
+        app.open_overlay(Overlay::help());
         overlay_key(&mut app, KeyCode::Esc);
         assert_eq!(app.overlay, Overlay::None);
         app.overlay_closed_at = Some(Instant::now());
@@ -9055,7 +9529,7 @@ mod tests {
         handle_mouse(&mut app, MouseEventKind::ScrollDown);
         assert_eq!(app.input, "keep me", "wheel down must not rewrite input");
 
-        app.overlay = Overlay::help();
+        app.open_overlay(Overlay::help());
         app.follow = true;
         handle_mouse(&mut app, MouseEventKind::ScrollUp);
         assert!(app.follow, "wheel is ignored while an overlay is open");
@@ -9789,9 +10263,9 @@ mod tests {
         let started = Instant::now();
         for _ in 0..20 {
             let n = app.visible_transcript_lines().0.len();
-            assert!(n <= bound, "2k-entry window {n} > {bound}");
+            assert!(n <= bound);
         }
-        let ms = started.elapsed().as_millis();
-        assert!(ms < 50, "2k-entry visible_transcript_lines x20 took {ms}ms");
+        let elapsed = started.elapsed().as_millis();
+        assert!(elapsed < 50);
     }
 }

@@ -236,7 +236,11 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let ping_only = cli.no_tui || matches!(cli.command, Some(Command::Ping));
-    let res = if ping_only { ping(&cli) } else { tui(&cli) };
+    let res = if ping_only {
+        ping(&cli)
+    } else {
+        tui_loop(&cli)
+    };
     match res {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -288,13 +292,57 @@ fn ping(cli: &Cli) -> Result<(), rpc::Error> {
     Ok(())
 }
 
-fn tui(cli: &Cli) -> Result<(), rpc::Error> {
-    let (mut client, session, version) = connect(cli)?;
+fn tui_loop(cli: &Cli) -> Result<(), rpc::Error> {
+    let mut session = cli.session.clone();
+    loop {
+        match tui(cli, session.as_deref()) {
+            Err(rpc::Error::ResumeSession(id)) => session = Some(id),
+            other => return other,
+        }
+    }
+}
+
+fn connect_with_session(
+    cli: &Cli,
+    resume: Option<&str>,
+) -> Result<(Client, rpc::SessionInfo, rpc::VersionInfo), rpc::Error> {
+    Client::spawn(&cli.mow_bin, &engine_flags_for(cli, resume)).and_then(|mut client| {
+        let (version, session) = client.handshake(HANDSHAKE_TIMEOUT)?;
+        Ok((client, session, version))
+    })
+}
+
+fn engine_flags_for(cli: &Cli, resume: Option<&str>) -> Vec<String> {
+    let Some(id) = resume else {
+        return cli.engine_flags();
+    };
+    let original = cli.engine_flags();
+    let mut flags = Vec::with_capacity(original.len() + 2);
+    let mut i = 0;
+    while i < original.len() {
+        if original[i] == "--session" {
+            i += 2;
+            continue;
+        }
+        if original[i] == "--continue" {
+            i += 1;
+            continue;
+        }
+        flags.push(original[i].clone());
+        i += 1;
+    }
+    flags.push("--session".into());
+    flags.push(id.to_string());
+    flags
+}
+
+fn tui(cli: &Cli, resume: Option<&str>) -> Result<(), rpc::Error> {
+    let (mut client, session, version) = connect_with_session(cli, resume)?;
     let user = resolve_user_sources(cli).map_err(rpc::Error::Protocol)?;
     let pack = load_mowi_config(&mut client, &version);
     let resolved = resolve_config(&user, &pack);
     client.perm_set(resolved.permission_mode.as_str(), HANDSHAKE_TIMEOUT)?;
-    let resuming = cli.session.is_some() || cli.continue_session;
+    let resuming = resume.is_some() || cli.session.is_some() || cli.continue_session;
     let mut app = if resuming {
         let messages = client.transcript(HANDSHAKE_TIMEOUT)?;
         App::from_transcript(session, messages)
@@ -355,6 +403,20 @@ mod tests {
     fn theme_flag_accepts_full_names() {
         let cli = Cli::parse_from(["mowi", "--theme", "gruvbox-dark"]);
         assert_eq!(cli.theme, Some(ThemeName::GruvboxDark));
+    }
+
+    #[test]
+    fn engine_flags_for_replaces_session_and_continue() {
+        let cli = Cli::parse_from(["mowi", "--continue", "--allow-write"]);
+        assert_eq!(
+            engine_flags_for(&cli, Some("s-99")),
+            vec!["--allow-write", "--session", "s-99"]
+        );
+        let cli = Cli::parse_from(["mowi", "--session", "old", "--model", "gpt-5-mini"]);
+        assert_eq!(
+            engine_flags_for(&cli, Some("new")),
+            vec!["--model", "gpt-5-mini", "--session", "new"]
+        );
     }
 
     #[test]

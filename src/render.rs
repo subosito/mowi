@@ -609,13 +609,14 @@ fn git_diff_path(rest: &str) -> Option<String> {
 /// Render a unified diff as flashdiff-style full-width bands.
 ///
 /// `width` is the transcript pane width: add/del rows are padded so the wash
-/// is a rectangle rather than a ragged stripe. Hunk and file headers stay
-/// muted meta; context rows carry no wash. When a `-` row is followed by a
+/// is a rectangle rather than a ragged stripe. File and hunk headers (`---`,
+/// `+++`, `@@`, `diff --git`) stay out of the body — the card title already
+/// names the file. Context rows carry no wash. When a `-` row is followed by a
 /// `+` row, the changed span of each is inverted as a word chip.
 pub fn diff_lines(text: &str, theme: Theme, width: u16) -> Vec<Line<'static>> {
     let rows: Vec<String> = text.lines().map(|row| expand_tabs(row, 0)).collect();
     let number_width = diff_number_width(&rows);
-    let gutter_width = number_width * 2 + 4; // old + space + new + " │ "
+    let gutter_width = number_width + 3; // number + " │ "
     let body_width = width.saturating_sub(gutter_width as u16).max(1);
     let mut old_line: Option<usize> = None;
     let mut new_line: Option<usize> = None;
@@ -628,21 +629,25 @@ pub fn diff_lines(text: &str, theme: Theme, width: u16) -> Vec<Line<'static>> {
             continue;
         }
         if row.starts_with("@@") {
-            if let Some((old, new)) = parse_hunk_starts(row) {
+            if let Some((old, new, _, _)) = parse_hunk(row) {
+                if !out.is_empty() {
+                    let skipped = hunk_gap(old_line, new_line, old, new);
+                    if skipped > 0 {
+                        out.push(hunk_gap_line(skipped, theme));
+                    }
+                }
                 old_line = Some(old);
                 new_line = Some(new);
             }
-            out.push(Line::from(Span::styled(row.to_string(), theme.diff_meta())));
             index += 1;
             continue;
         }
         if row.starts_with("+++") || row.starts_with("---") || row.starts_with("diff --git") {
-            out.push(Line::from(Span::styled(row.to_string(), theme.diff_meta())));
             index += 1;
             continue;
         }
         if row.starts_with("\\ No newline") {
-            out.push(numbered_context(None, None, row, number_width, theme));
+            out.push(numbered_context(None, row, number_width, theme));
             index += 1;
             continue;
         }
@@ -666,40 +671,34 @@ pub fn diff_lines(text: &str, theme: Theme, width: u16) -> Vec<Line<'static>> {
                             None => (None, None),
                         };
                         out.push(numbered_band(
-                            old_no,
-                            None,
+                            (old_no, theme.diff_old_no()),
                             '−',
                             old_body,
                             old_chip,
                             del_style,
                             number_width,
                             body_width,
-                            theme,
                         ));
                         out.push(numbered_band(
-                            None,
-                            new_no,
+                            (new_no, theme.diff_new_no()),
                             '+',
                             new_body,
                             new_chip,
                             add_style,
                             number_width,
                             body_width,
-                            theme,
                         ));
                         index += 2;
                     }
                     None => {
                         out.push(numbered_band(
-                            old_no,
-                            None,
+                            (old_no, theme.diff_old_no()),
                             '−',
                             old_body,
                             None,
                             del_style,
                             number_width,
                             body_width,
-                            theme,
                         ));
                         index += 1;
                     }
@@ -709,15 +708,13 @@ pub fn diff_lines(text: &str, theme: Theme, width: u16) -> Vec<Line<'static>> {
                 let new_no = new_line;
                 new_line = new_line.map(|n| n + 1);
                 out.push(numbered_band(
-                    None,
-                    new_no,
+                    (new_no, theme.diff_new_no()),
                     '+',
                     new_body,
                     None,
                     add_style,
                     number_width,
                     body_width,
-                    theme,
                 ));
                 index += 1;
             }
@@ -727,7 +724,12 @@ pub fn diff_lines(text: &str, theme: Theme, width: u16) -> Vec<Line<'static>> {
                 let new_no = new_line;
                 old_line = old_line.map(|n| n + 1);
                 new_line = new_line.map(|n| n + 1);
-                out.push(numbered_context(old_no, new_no, body, number_width, theme));
+                out.push(numbered_context(
+                    old_no.or(new_no),
+                    body,
+                    number_width,
+                    theme,
+                ));
                 index += 1;
             }
         }
@@ -736,81 +738,92 @@ pub fn diff_lines(text: &str, theme: Theme, width: u16) -> Vec<Line<'static>> {
 }
 
 fn parse_hunk_starts(row: &str) -> Option<(usize, usize)> {
+    parse_hunk(row).map(|(old, new, _, _)| (old, new))
+}
+
+/// `@@ -old,old_count +new,new_count @@` — counts default to 1.
+fn parse_hunk(row: &str) -> Option<(usize, usize, usize, usize)> {
     let mut fields = row.split_whitespace();
     (fields.next()? == "@@").then_some(())?;
-    let old = fields
-        .next()?
-        .strip_prefix('-')?
-        .split(',')
-        .next()?
-        .parse()
-        .ok()?;
-    let new = fields
-        .next()?
-        .strip_prefix('+')?
-        .split(',')
-        .next()?
-        .parse()
-        .ok()?;
-    Some((old, new))
+    let (old, old_count) = parse_hunk_side(fields.next()?, '-')?;
+    let (new, new_count) = parse_hunk_side(fields.next()?, '+')?;
+    Some((old, new, old_count, new_count))
+}
+
+fn parse_hunk_side(field: &str, sign: char) -> Option<(usize, usize)> {
+    let field = field.strip_prefix(sign)?;
+    let mut parts = field.split(',');
+    let start = parts.next()?.parse().ok()?;
+    let count = parts.next().map(|n| n.parse().ok()).unwrap_or(Some(1))?;
+    Some((start, count))
+}
+
+fn hunk_last_line(start: usize, count: usize) -> usize {
+    start.saturating_add(count.saturating_sub(1).max(0))
+}
+
+fn hunk_gap(old_line: Option<usize>, new_line: Option<usize>, old: usize, new: usize) -> usize {
+    match (old_line, new_line) {
+        (Some(prev_old), Some(prev_new)) => old.saturating_sub(prev_old).max(new.saturating_sub(prev_new)),
+        (Some(prev_old), None) => old.saturating_sub(prev_old),
+        (None, Some(prev_new)) => new.saturating_sub(prev_new),
+        _ => 0,
+    }
+}
+
+fn hunk_gap_line(skipped: usize, theme: Theme) -> Line<'static> {
+    let noun = if skipped == 1 { "line" } else { "lines" };
+    Line::from(Span::styled(
+        format!("… {skipped} unchanged {noun}"),
+        theme.diff_meta(),
+    ))
 }
 
 fn diff_number_width(rows: &[String]) -> usize {
     let mut max_no = 1usize;
     for row in rows {
-        if let Some((old, new)) = parse_hunk_starts(row) {
-            max_no = max_no.max(old).max(new);
+        if let Some((old, new, old_count, new_count)) = parse_hunk(row) {
+            max_no = max_no
+                .max(hunk_last_line(old, old_count))
+                .max(hunk_last_line(new, new_count));
         }
     }
     max_no.to_string().len().max(2)
 }
 
-fn gutter_spans(
-    old: Option<usize>,
-    new: Option<usize>,
-    digits: usize,
-    theme: Theme,
-) -> Vec<Span<'static>> {
-    let number =
-        |n: Option<usize>| n.map_or_else(|| " ".repeat(digits), |n| format!("{n:>digits$}"));
+fn gutter_spans(number: Option<usize>, digits: usize, style: Style) -> Vec<Span<'static>> {
+    let text = number.map_or_else(|| " ".repeat(digits), |n| format!("{n:>digits$}"));
     vec![
-        Span::styled(number(old), theme.diff_meta()),
-        Span::styled(" ", theme.chrome()),
-        Span::styled(number(new), theme.diff_meta()),
-        Span::styled(" │ ", theme.chrome()),
+        Span::styled(text, style),
+        Span::styled(" │ ", Style::default()),
     ]
 }
 
 fn numbered_context(
-    old: Option<usize>,
-    new: Option<usize>,
+    number: Option<usize>,
     body: &str,
     digits: usize,
     theme: Theme,
 ) -> Line<'static> {
-    let mut spans = gutter_spans(old, new, digits, theme);
+    let mut spans = gutter_spans(number, digits, theme.diff_meta());
     spans.push(Span::styled(body.to_string(), theme.context()));
     Line::from(spans)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn numbered_band(
-    old: Option<usize>,
-    new: Option<usize>,
+    number: (Option<usize>, Style),
     sign: char,
     body: &str,
     chip: Option<Range<usize>>,
     styles: (Style, Style, Style),
     digits: usize,
     width: u16,
-    theme: Theme,
 ) -> Line<'static> {
-    let mut spans = gutter_spans(old, new, digits, theme);
+    let mut spans = gutter_spans(number.0, digits, number.1);
     spans.extend(band(sign, body, chip, styles, width).spans);
     Line::from(spans)
 }
 
-/// Replace tabs with spaces at tabstops of 8, starting at `col`.
 fn expand_tabs(text: &str, mut col: usize) -> String {
     const TAB: usize = 8;
     let mut out = String::with_capacity(text.len());
@@ -831,10 +844,6 @@ fn clip_cols(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
-/// One washed diff row: sign column, body, and padding out to `width`.
-///
-/// `styles` is `(band, sign, chip)`. `chip` marks the changed byte range of a
-/// word-level edit; `None` renders a plain band.
 fn band(
     sign: char,
     body: &str,
@@ -1016,13 +1025,12 @@ mod tests {
         let lines = diff_lines("@@ -1 +1 @@\n\n-old\n+new", theme, 20);
         assert_eq!(
             lines.len(),
-            3,
+            2,
             "{:?}",
             lines.iter().map(plain).collect::<Vec<_>>()
         );
-        assert!(plain(&lines[0]).starts_with("@@"));
-        assert!(plain(&lines[1]).contains('−'));
-        assert!(plain(&lines[2]).contains('+'));
+        assert!(plain(&lines[0]).contains('−'));
+        assert!(plain(&lines[1]).contains('+'));
     }
 
     fn plain(line: &Line<'_>) -> String {
@@ -1201,13 +1209,13 @@ mod tests {
     fn add_and_del_rows_are_padded_into_full_width_bands() {
         let theme = Theme::colored(ThemeName::CatppuccinMocha);
         let lines = diff_lines("@@ -1 +1 @@\n-old\n+new", theme, 20);
-        // hunk header, del band, add band
-        assert_eq!(lines.len(), 3);
-        for row in &lines[1..] {
+        // del band, add band — hunk header is omitted
+        assert_eq!(lines.len(), 2);
+        for row in &lines {
             assert_eq!(plain(row).chars().count(), 20, "{:?}", plain(row));
         }
         // Padding carries the band background, not a default style.
-        let tail = lines[1].spans.last().unwrap();
+        let tail = lines[0].spans.last().unwrap();
         assert_eq!(tail.style.bg, theme.del().bg);
         assert!(
             tail.content.chars().all(|ch| ch == ' '),
@@ -1220,8 +1228,8 @@ mod tests {
     fn tab_indented_rows_expand_and_stay_within_width() {
         let theme = Theme::colored(ThemeName::CatppuccinMocha);
         let lines = diff_lines("@@ -1 +1 @@\n-\ttimeout := 30\n+\ttimeout := 60", theme, 24);
-        assert_eq!(lines.len(), 3);
-        for row in &lines[1..] {
+        assert_eq!(lines.len(), 2);
+        for row in &lines {
             let text = plain(row);
             assert!(!text.contains('\t'), "{text:?}");
             assert_eq!(text.chars().count(), 24, "{text:?}");
@@ -1230,19 +1238,19 @@ mod tests {
         // A word-chip on the add row is still add-family, never the del band.
         let add_family = [theme.add().bg, theme.add_sign().bg, theme.add_chip().bg];
         assert!(
-            lines[2]
+            lines[1]
                 .spans
                 .iter()
                 .all(|span| span.style.bg.is_none() || add_family.contains(&span.style.bg)),
             "add row leaked another band: {:?}",
-            lines[2]
+            lines[1]
                 .spans
                 .iter()
                 .map(|span| span.style.bg)
                 .collect::<Vec<_>>()
         );
         assert!(
-            !lines[2]
+            !lines[1]
                 .spans
                 .iter()
                 .any(|span| span.style.bg == theme.del().bg)
@@ -1253,21 +1261,24 @@ mod tests {
     fn context_rows_are_not_padded_or_washed() {
         let theme = Theme::colored(ThemeName::CatppuccinMocha);
         let lines = diff_lines("@@ -1 +1 @@\n unchanged", theme, 30);
-        assert!(plain(&lines[1]).ends_with("unchanged"));
-        assert_eq!(lines[1].spans[0].style.bg, None);
+        assert!(plain(&lines[0]).ends_with("unchanged"));
+        assert_eq!(lines[0].spans[0].style.bg, None);
     }
 
     #[test]
-    fn hunk_and_file_headers_are_meta_not_add_or_del() {
+    fn hunk_and_file_headers_are_omitted_from_the_body() {
         let theme = Theme::colored(ThemeName::CatppuccinMocha);
         let lines = diff_lines("--- a/x\n+++ b/x\n@@ -1,2 +1,2 @@\n+added", theme, 40);
-        for row in &lines[..3] {
-            assert_eq!(row.spans[0].style, theme.diff_meta(), "{:?}", plain(row));
-            assert_ne!(row.spans[0].style, theme.add());
-        }
+        let text: Vec<String> = lines.iter().map(plain).collect();
+        assert!(
+            text.iter()
+                .all(|row| !row.contains("---") && !row.contains("+++") && !row.contains("@@")),
+            "{text:?}"
+        );
+        assert_eq!(lines.len(), 1);
         // The real add row still gets the wash.
         assert!(
-            lines[3]
+            lines[0]
                 .spans
                 .iter()
                 .any(|span| span.style == theme.add_sign())
@@ -1278,23 +1289,23 @@ mod tests {
     fn signs_use_minus_and_survive_no_color() {
         let theme = Theme::plain(ThemeName::CatppuccinMocha);
         let lines = diff_lines("@@ -1 +1 @@\n-old\n+new", theme, 12);
-        assert!(plain(&lines[1]).contains('−'), "want U+2212 minus");
-        assert!(plain(&lines[2]).contains('+'));
+        assert!(plain(&lines[0]).contains('−'), "want U+2212 minus");
+        assert!(plain(&lines[1]).contains('+'));
         // No RGB when colour is off.
-        assert!(lines[1].spans.iter().all(|span| span.style.bg.is_none()));
+        assert!(lines[0].spans.iter().all(|span| span.style.bg.is_none()));
     }
 
     #[test]
     fn paired_edit_inverts_only_the_changed_span() {
         let theme = Theme::colored(ThemeName::CatppuccinMocha);
         let lines = diff_lines("@@ -1 +1 @@\n-let x = 1;\n+let x = 2;", theme, 40);
-        let del: Vec<&str> = lines[1]
+        let del: Vec<&str> = lines[0]
             .spans
             .iter()
             .filter(|span| span.style == theme.del_chip())
             .map(|span| span.content.as_ref())
             .collect();
-        let add: Vec<&str> = lines[2]
+        let add: Vec<&str> = lines[1]
             .spans
             .iter()
             .filter(|span| span.style == theme.add_chip())
@@ -1309,10 +1320,46 @@ mod tests {
         let theme = Theme::colored(ThemeName::CatppuccinMocha);
         let lines = diff_lines("@@ -1 +1 @@\n-alpha\n+omega", theme, 20);
         assert!(
-            !lines[1]
+            !lines[0]
                 .spans
                 .iter()
                 .any(|span| span.style == theme.del_chip())
         );
+    }
+
+    #[test]
+    fn later_hunks_insert_an_unchanged_gap() {
+        let theme = Theme::colored(ThemeName::CatppuccinMocha);
+        let lines = diff_lines(
+            "@@ -3,2 +3,2 @@\n one()\n-old_one();\n+new_one();\n@@ -12,2 +12,2 @@\n ctx_two();\n-old_two();\n+new_two();",
+            theme,
+            40,
+        );
+        let text: Vec<String> = lines.iter().map(plain).collect();
+        assert!(
+            text.iter().any(|row| row.contains("… 7 unchanged lines")),
+            "{text:?}"
+        );
+        assert!(
+            text.iter().all(|row| !row.contains("@@")),
+            "{text:?}"
+        );
+        let gap = lines
+            .iter()
+            .find(|row| plain(row).contains("unchanged"))
+            .expect("gap");
+        assert_eq!(gap.spans[0].style, theme.diff_meta());
+    }
+
+    #[test]
+    fn number_gutter_fits_the_last_line_in_a_hunk() {
+        assert_eq!(
+            super::diff_number_width(&[
+                "@@ -98,20 +98,20 @@".into(),
+                " context".into(),
+            ]),
+            3
+        );
+        assert_eq!(super::parse_hunk_starts("@@ -10,4 +12,6 @@"), Some((10, 12)));
     }
 }
