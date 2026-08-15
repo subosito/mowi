@@ -34,7 +34,8 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::config::{PermissionMode, ResolvedConfig};
 use crate::render::{
-    Segment, diff_title, is_unified_diff, markdown_lines, split_markdown_and_diffs,
+    Segment, diff_action_glyph, diff_title, is_unified_diff, markdown_lines, peel_diff_action,
+    split_markdown_and_diffs,
 };
 use crate::rpc::{
     Client, CompactReport, ContextUsage, EVENT_COMPACT, EVENT_COMPACT_START, EVENT_GOAL_BLOCKED,
@@ -1046,21 +1047,58 @@ impl App {
         }
     }
 
-    fn finish_compact(&mut self, note: String) {
+    fn compact_note_line(&self, text: &str, width: usize) -> Line<'static> {
+        let label = clip_display(text, width.saturating_sub(2).max(8));
+        Line::from(vec![
+            Span::styled("▾ ", self.theme.badge(Tone::Muted)),
+            Span::styled(label, self.theme.note()),
+        ])
+    }
+
+    fn finish_compact(&mut self, outcome: CompactOutcome) {
         if self.compacting.take().is_none() {
             if self.pending_compact.is_some() {
                 self.begin_compact(CompactPhase::Queued);
             }
             return;
         }
-        self.entries.push(Entry::Note(note.clone()));
-        if !self.busy {
-            self.status = note;
-        } else if self.status.starts_with("compact") || self.status.starts_with("auto-compact") {
-            self.status.clear();
+        if outcome.record {
+            let repeat = self
+                .entries
+                .iter()
+                .rev()
+                .find_map(|entry| match entry {
+                    Entry::Note(existing) if is_compact_note(existing) => Some(existing.as_str()),
+                    _ => None,
+                })
+                == Some(outcome.note.as_str());
+            if !repeat {
+                self.entries.push(Entry::Note(outcome.note.clone()));
+            }
         }
+        self.status = outcome.note;
         if self.pending_compact.is_some() {
             self.begin_compact(CompactPhase::Queued);
+        }
+    }
+
+    /// Scale the ctx chip from compact char counts so the header reflects
+    /// the projection immediately, not after the next usage report.
+    fn apply_compact_projection(&mut self, chars_before: i64, chars_after: i64) {
+        if chars_before <= 0 || chars_after < 0 {
+            return;
+        }
+        let Some(ctx) = self.ctx.as_mut() else {
+            return;
+        };
+        if ctx.tokens == 0 {
+            return;
+        }
+        let scaled = ((ctx.tokens as u128) * (chars_after as u128) / (chars_before as u128)) as u64;
+        ctx.tokens = scaled.max(1);
+        if let Some(window) = ctx.context_window.filter(|w| *w > 0) {
+            ctx.remaining = Some(window.saturating_sub(ctx.tokens));
+            ctx.percent = Some((ctx.tokens as f64) * 100.0 / window as f64);
         }
     }
 
@@ -1286,7 +1324,7 @@ impl App {
     pub fn header_line(&self, width: u16) -> Line<'static> {
         let safety = if self.select_mode {
             format!(
-                "{} · {} · ⛶ select",
+                "{} · {} · ▦ select",
                 self.capability_chip(),
                 self.mode_chip()
             )
@@ -1361,13 +1399,6 @@ impl App {
         // Session identity lives in the help overlay, not here.
         if self.busy {
             left.extend(self.live_clock_spans());
-            if let Some(compact) = self.compact_chip_text() {
-                sep(&mut left);
-                left.push(Span::styled(
-                    compact,
-                    self.theme.badge(self.compact_chip_tone()),
-                ));
-            }
         } else if self.compacting.is_some() {
             left.push(Span::styled(
                 format!("{} ", self.spinner_frame()),
@@ -1430,10 +1461,6 @@ impl App {
                 format!("ctx {pct:.0}%"),
                 self.theme.ctx_style(pct),
             ));
-        }
-        if let Some(lsp) = self.lsp_chip_text() {
-            sep(&mut left);
-            left.push(Span::styled(lsp, self.theme.badge(Tone::Warn)));
         }
 
         let hints = self.footer_hints();
@@ -1517,7 +1544,11 @@ impl App {
             Entry::User { text, at } => self.user_lines(text, *at),
             Entry::Assistant(t) => self.assistant_lines(t),
             Entry::Note(t) => {
-                wrap_styled_line(Line::styled(t.to_string(), self.theme.note()), width)
+                if is_compact_note(t) {
+                    vec![self.compact_note_line(t, width)]
+                } else {
+                    wrap_styled_line(Line::styled(t.to_string(), self.theme.note()), width)
+                }
             }
             Entry::Tool { name, duration_ms } => self.tool_row_lines(name, *duration_ms),
             Entry::Tools { tools, expanded } => {
@@ -1525,28 +1556,7 @@ impl App {
                 // so a busy turn stays readable. Expanded: a header plus one
                 // row per call, same visual language as a plain Tool entry.
                 if tools.len() <= 1 || *expanded {
-                    let mut out = wrap_styled_line(
-                        Line::styled(format!("⚙ {} tool calls", tools.len()), self.theme.tool()),
-                        width,
-                    );
-                    for (name, duration_ms) in tools {
-                        let (verb, rest) = tool_label(name);
-                        let mut spans = vec![
-                            Span::styled("✓ ", self.theme.badge(Tone::Ok).patch(self.theme.base())),
-                            Span::styled(verb, self.theme.tool()),
-                        ];
-                        if !rest.is_empty() {
-                            spans.push(Span::styled(format!(" {rest}"), self.theme.note()));
-                        }
-                        if let Some(ms) = duration_ms {
-                            spans.push(Span::styled(
-                                format!("  {:.1}s", *ms as f64 / 1000.0),
-                                self.theme.timing(),
-                            ));
-                        }
-                        out.extend(wrap_styled_line(Line::from(spans), width));
-                    }
-                    out
+                    self.expanded_tool_group_lines(tools, width)
                 } else {
                     let text = collapsed_tool_group_text(tools, width);
                     wrap_styled_line(Line::styled(text, self.theme.note()), width)
@@ -1579,12 +1589,11 @@ impl App {
 
     fn user_band_row(&self, body: &str, width: usize, stamp: Option<&str>) -> Line<'static> {
         let mut spans = Vec::new();
-        // A saturated one-column rail on the left edge. This is the only
-        // full-height accent in the transcript, so scanning up the pane the
-        // eye can find "where did I last speak" without reading a word.
-        if self.theme.colored {
-            spans.push(Span::styled("▎", self.theme.user_rail()));
-        }
+        // A one-column rail on the left edge. This is the only full-height
+        // accent in the transcript, so scanning up the pane the eye can find
+        // "where did I last speak" without reading a word. The glyph stays
+        // even under NO_COLOR — the band fill is what we drop, not the landmark.
+        spans.push(Span::styled("▎", self.theme.user_rail()));
         let used: usize = spans.iter().map(Span::width).sum();
         let room = width.saturating_sub(used);
         let text = if body.is_empty() {
@@ -1650,14 +1659,18 @@ impl App {
     /// rectangles rather than ragged stripes.
     fn diff_card(&self, text: &str) -> Vec<Line<'static>> {
         let width = self.last_view_w.max(8);
-        let title = diff_title(text);
-        let head = format!("─ {title} ");
+        let (action, body) = peel_diff_action(text);
+        let title = diff_title(body);
+        let head = match action {
+            Some(action) => format!("─ {} {title} ", diff_action_glyph(action)),
+            None => format!("─ {title} "),
+        };
         let fill = (width as usize).saturating_sub(head.chars().count());
         let mut out = vec![Line::styled(
             format!("{head}{}", "─".repeat(fill)),
             self.theme.chrome(),
         )];
-        out.extend(crate::render::diff_lines(text, self.theme, width));
+        out.extend(crate::render::diff_lines(body, self.theme, width));
         out.push(Line::styled(
             "─".repeat(width as usize),
             self.theme.chrome(),
@@ -1689,6 +1702,35 @@ impl App {
             None => spans.push(Span::styled("  running", self.theme.timing())),
         }
         wrap_styled_line(Line::from(spans), width)
+    }
+
+    fn expanded_tool_group_lines(
+        &self,
+        tools: &[(String, Option<u64>)],
+        width: usize,
+    ) -> Vec<Line<'static>> {
+        let mut out = wrap_styled_line(
+            Line::styled(format!("› {} tool calls", tools.len()), self.theme.tool()),
+            width,
+        );
+        for (name, duration_ms) in tools {
+            let (verb, rest) = tool_label(name);
+            let mut spans = vec![
+                Span::styled("✓ ", self.theme.badge(Tone::Ok).patch(self.theme.base())),
+                Span::styled(verb, self.theme.tool()),
+            ];
+            if !rest.is_empty() {
+                spans.push(Span::styled(format!(" {rest}"), self.theme.note()));
+            }
+            if let Some(ms) = duration_ms {
+                spans.push(Span::styled(
+                    format!("  {:.1}s", *ms as f64 / 1000.0),
+                    self.theme.timing(),
+                ));
+            }
+            out.extend(wrap_styled_line(Line::from(spans), width));
+        }
+        out
     }
 
     /// Live answer plus the bounded in-transcript progress block.
@@ -1968,34 +2010,31 @@ impl App {
                 estimated_wrapped_lines(&user_display_text(text, *at), width.saturating_sub(3)) + 2
             }
             Entry::Assistant(text) => estimated_wrapped_lines(text, width),
-            Entry::Note(text) => estimated_wrapped_lines(text, width),
+            Entry::Note(text) => {
+                if is_compact_note(text) {
+                    1
+                } else {
+                    estimated_wrapped_lines(text, width)
+                }
+            }
             Entry::Tool { name, duration_ms } => {
                 // Estimate against the *label*, not the raw name: the label is
                 // what gets painted, and it is bounded by TOOL_ARG_COLS.
                 let (verb, rest) = tool_label(name);
                 let suffix = match duration_ms {
-                    Some(_) => 8,
-                    None => 10,
+                    Some(ms) => format!("  {:.1}s", *ms as f64 / 1000.0),
+                    None => String::new(),
                 };
-                let cols = verb.width() + rest.width() + suffix + 3;
-                cols.div_ceil(width.max(1))
+                let text = if rest.is_empty() {
+                    format!("{verb}{suffix}")
+                } else {
+                    format!("{verb} {rest}{suffix}")
+                };
+                estimated_wrapped_lines(&text, width.saturating_sub(2))
             }
             Entry::Tools { tools, expanded } => {
                 if tools.len() <= 1 || *expanded {
-                    // Header row plus one label row per call; each label is
-                    // bounded by TOOL_ARG_COLS and carries the same chrome as
-                    // a plain Tool entry (glyph + verb + rest + timing).
-                    1 + tools
-                        .iter()
-                        .map(|(name, duration_ms)| {
-                            let (verb, rest) = tool_label(name);
-                            let cols = verb.width()
-                                + rest.width()
-                                + 3
-                                + usize::from(duration_ms.is_some()) * 8;
-                            cols.div_ceil(width.max(1))
-                        })
-                        .sum::<usize>()
+                    self.expanded_tool_group_lines(tools, width).len()
                 } else {
                     // The collapsed summary is fitted to `width` (whole tokens
                     // only). Count the same string the painter emits so the
@@ -2234,7 +2273,8 @@ impl App {
         let frame = self.spinner_frame();
         self.peer_agents()
             .into_iter()
-            .map(|agent| {
+            .enumerate()
+            .map(|(i, agent)| {
                 let preview =
                     last_visible_line(self.peers.get(&agent).map(String::as_str).unwrap_or(""));
                 let preview = if preview.is_empty() {
@@ -2242,14 +2282,17 @@ impl App {
                 } else {
                     preview
                 };
-                Line::from(vec![
+                let mut spans = vec![
                     Span::styled(format!("{frame} "), self.theme.spinner()),
                     Span::styled("⇄ ", self.theme.peer()),
                     Span::styled(agent, self.theme.peer()),
                     Span::styled(" · ", self.theme.chrome()),
                     Span::styled(preview, self.theme.note()),
-                    Span::styled("  (ctrl+p)", self.theme.timing()),
-                ])
+                ];
+                if i == 0 {
+                    spans.push(Span::styled("  (ctrl+p)", self.theme.timing()));
+                }
+                Line::from(spans)
             })
             .collect()
     }
@@ -2537,7 +2580,24 @@ impl App {
                     .get("over_budget")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
-                self.finish_compact(compact_done_note(auto, before, after, layer, over));
+                let chars_before = params
+                    .get("chars_before")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let chars_after = params
+                    .get("chars_after")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                self.apply_compact_projection(chars_before, chars_after);
+                self.finish_compact(compact_done_note(
+                    auto,
+                    before,
+                    after,
+                    layer,
+                    over,
+                    chars_before,
+                    chars_after,
+                ));
             }
             k if k == EVENT_LSP_DIAGNOSTICS || k.ends_with("lsp.diagnostics") => {
                 if let Some(problems) = decode_lsp_diagnostics(params) {
@@ -3932,13 +3992,13 @@ fn tool_group_summary_for_width(tools: &[(String, Option<u64>)], max: usize) -> 
     })
 }
 
-/// Collapsed group row: gear, width-fitted counts, optional total elapsed.
+/// Collapsed group row: mark, width-fitted counts, optional total elapsed.
 ///
 /// Timing stays when it fits beside a real summary. If the duration suffix
 /// would leave only an ellipsis, drop the clock so a verb can survive.
 fn collapsed_tool_group_text(tools: &[(String, Option<u64>)], width: usize) -> String {
     let total_ms: u64 = tools.iter().filter_map(|(_, d)| *d).sum();
-    let prefix = "⚙ ";
+    let prefix = "› ";
     let suffix = if total_ms > 0 {
         format!(" · {:.1}s", total_ms as f64 / 1000.0)
     } else {
@@ -4515,27 +4575,94 @@ fn draw_scrim(frame: &mut Frame<'_>, app: &App, area: Rect) {
 /// counting characters overruns the pane and shears any background band that
 /// was padded to match.
 fn wrap_cols(text: &str, width: usize) -> Vec<String> {
+    wrap_plain_cols(text, width)
+}
+
+/// Soft-wrap on word boundaries. A token wider than `width` still hard-breaks
+/// on display columns (CJK, URLs, paths) so the pane cannot overflow.
+fn wrap_plain_cols(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![text.to_string()];
+    }
+    if text.is_empty() {
+        return vec![String::new()];
     }
     let mut rows = Vec::new();
     let mut current = String::new();
     let mut col = 0usize;
+    let mut word = String::new();
+    let mut word_w = 0usize;
+
+    let flush_word = |rows: &mut Vec<String>,
+                      current: &mut String,
+                      col: &mut usize,
+                      word: &mut String,
+                      word_w: &mut usize| {
+        if word.is_empty() {
+            return;
+        }
+        if *col > 0 && *col + *word_w > width {
+            while current.ends_with(' ') {
+                current.pop();
+            }
+            rows.push(std::mem::take(current));
+            *col = 0;
+        }
+        if *word_w <= width {
+            current.push_str(word);
+            *col += *word_w;
+        } else {
+            for ch in word.chars() {
+                let cw = ch.width().unwrap_or(0);
+                if *col > 0 && *col + cw > width {
+                    rows.push(std::mem::take(current));
+                    *col = 0;
+                }
+                current.push(ch);
+                *col += cw;
+            }
+        }
+        word.clear();
+        *word_w = 0;
+    };
+
     for ch in text.chars() {
-        let cw = ch.width().unwrap_or(0);
-        if col + cw > width && !current.is_empty() {
+        if ch == '\n' {
+            flush_word(&mut rows, &mut current, &mut col, &mut word, &mut word_w);
             rows.push(std::mem::take(&mut current));
             col = 0;
+            continue;
         }
-        current.push(ch);
-        col += cw;
+        if ch.is_whitespace() {
+            flush_word(&mut rows, &mut current, &mut col, &mut word, &mut word_w);
+            let cw = ch.width().unwrap_or(0);
+            if col > 0 && col + cw > width {
+                rows.push(std::mem::take(&mut current));
+                col = 0;
+            }
+            // Drop leading spaces on a freshly wrapped line so the next word
+            // starts in column 0 instead of looking indented.
+            if col == 0 && ch == ' ' {
+                continue;
+            }
+            current.push(ch);
+            col += cw;
+            continue;
+        }
+        word.push(ch);
+        word_w += ch.width().unwrap_or(0);
     }
+    flush_word(&mut rows, &mut current, &mut col, &mut word, &mut word_w);
     rows.push(current);
     rows
 }
 
 /// Wrap a styled line to `width` without using Paragraph wrap, so space-padded
 /// bands keep their background instead of being reflowed into a hole.
+///
+/// Same word-boundary rule as [`wrap_plain_cols`]: break before a word that
+/// would overflow; only split mid-token when the token itself is wider than
+/// the pane.
 fn wrap_styled_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
     if width == 0 {
         return vec![line];
@@ -4546,6 +4673,10 @@ fn wrap_styled_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
     let mut buf = String::new();
     let mut style = Style::default();
     let mut col = 0usize;
+    let mut word = String::new();
+    let mut word_style = Style::default();
+    let mut word_w = 0usize;
+    let mut word_armed = false;
 
     let flush_span = |spans: &mut Vec<Span<'static>>, buf: &mut String, style: Style| {
         if !buf.is_empty() {
@@ -4553,23 +4684,152 @@ fn wrap_styled_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
         }
     };
 
-    for span in line.spans {
-        if span.style != style {
-            flush_span(&mut spans, &mut buf, style);
-            style = span.style;
-        }
-        for ch in span.content.chars() {
-            let cw = ch.width().unwrap_or(0);
-            // Wrap on display columns so double-width glyphs do not overrun
-            // the pane and shear the padded band behind them.
-            if col + cw > width && col > 0 {
-                flush_span(&mut spans, &mut buf, style);
-                rows.push(Line::from(std::mem::take(&mut spans)).style(line_style));
-                col = 0;
+    let start_row = |rows: &mut Vec<Line<'static>>,
+                     spans: &mut Vec<Span<'static>>,
+                     buf: &mut String,
+                     style: Style,
+                     line_style: Style,
+                     col: &mut usize| {
+        flush_span(spans, buf, style);
+        while let Some(last) = spans.last_mut() {
+            let trimmed = last.content.trim_end_matches(' ');
+            if trimmed.len() == last.content.len() {
+                break;
             }
-            buf.push(ch);
-            col += cw;
+            if trimmed.is_empty() {
+                spans.pop();
+                continue;
+            }
+            last.content = trimmed.to_string().into();
+            break;
         }
+        rows.push(Line::from(std::mem::take(spans)).style(line_style));
+        *col = 0;
+    };
+
+    let flush_word = |rows: &mut Vec<Line<'static>>,
+                      spans: &mut Vec<Span<'static>>,
+                      buf: &mut String,
+                      style: &mut Style,
+                      col: &mut usize,
+                      word: &mut String,
+                      word_style: Style,
+                      word_w: usize,
+                      line_style: Style| {
+        if word.is_empty() {
+            return;
+        }
+        if *col > 0 && *col + word_w > width {
+            start_row(rows, spans, buf, *style, line_style, col);
+        }
+        if word_style != *style {
+            flush_span(spans, buf, *style);
+            *style = word_style;
+        }
+        if word_w <= width {
+            buf.push_str(word);
+            *col += word_w;
+        } else {
+            for ch in word.chars() {
+                let cw = ch.width().unwrap_or(0);
+                if *col > 0 && *col + cw > width {
+                    start_row(rows, spans, buf, *style, line_style, col);
+                    *style = word_style;
+                }
+                buf.push(ch);
+                *col += cw;
+            }
+        }
+        word.clear();
+    };
+
+    for span in line.spans {
+        for ch in span.content.chars() {
+            if ch == '\n' {
+                if word_armed {
+                    flush_word(
+                        &mut rows,
+                        &mut spans,
+                        &mut buf,
+                        &mut style,
+                        &mut col,
+                        &mut word,
+                        word_style,
+                        word_w,
+                        line_style,
+                    );
+                    word_armed = false;
+                    word_w = 0;
+                }
+                start_row(&mut rows, &mut spans, &mut buf, style, line_style, &mut col);
+                continue;
+            }
+            if ch.is_whitespace() {
+                if word_armed {
+                    flush_word(
+                        &mut rows,
+                        &mut spans,
+                        &mut buf,
+                        &mut style,
+                        &mut col,
+                        &mut word,
+                        word_style,
+                        word_w,
+                        line_style,
+                    );
+                    word_armed = false;
+                    word_w = 0;
+                }
+                let cw = ch.width().unwrap_or(0);
+                if col > 0 && col + cw > width {
+                    start_row(&mut rows, &mut spans, &mut buf, style, line_style, &mut col);
+                }
+                if col == 0 && ch == ' ' {
+                    continue;
+                }
+                if span.style != style {
+                    flush_span(&mut spans, &mut buf, style);
+                    style = span.style;
+                }
+                buf.push(ch);
+                col += cw;
+                continue;
+            }
+            if word_armed && span.style != word_style {
+                flush_word(
+                    &mut rows,
+                    &mut spans,
+                    &mut buf,
+                    &mut style,
+                    &mut col,
+                    &mut word,
+                    word_style,
+                    word_w,
+                    line_style,
+                );
+                word_armed = false;
+                word_w = 0;
+            }
+            if !word_armed {
+                word_style = span.style;
+                word_armed = true;
+            }
+            word.push(ch);
+            word_w += ch.width().unwrap_or(0);
+        }
+    }
+    if word_armed {
+        flush_word(
+            &mut rows,
+            &mut spans,
+            &mut buf,
+            &mut style,
+            &mut col,
+            &mut word,
+            word_style,
+            word_w,
+            line_style,
+        );
     }
     flush_span(&mut spans, &mut buf, style);
     rows.push(Line::from(spans).style(line_style));
@@ -5158,10 +5418,16 @@ fn draw_help(frame: &mut Frame<'_>, app: &App, state: &mut TableState, area: Rec
                 } else {
                     app.theme.chip()
                 };
+                let action_w = spot
+                    .width
+                    .saturating_sub(4)
+                    .saturating_sub(key_w)
+                    .saturating_sub(1)
+                    .max(8) as usize;
                 Row::new(vec![
                     Cell::from(Span::styled(key, key_style.patch(app.theme.overlay()))),
                     Cell::from(Span::styled(
-                        what,
+                        clip_display(&what, action_w),
                         app.theme.note().patch(app.theme.overlay()),
                     )),
                 ])
@@ -5297,7 +5563,7 @@ fn draw_models(
                 let active = model.current || model.id == list.current;
                 let mut spans = vec![
                     Span::styled(
-                        if active { "● " } else { "  " },
+                        if active { "• " } else { "  " },
                         app.theme.badge(Tone::Ok).patch(app.theme.overlay()),
                     ),
                     Span::styled(
@@ -5379,7 +5645,7 @@ fn draw_efforts(
                 let active = effort.current || effort.id == list.current;
                 ListItem::new(Line::from(vec![
                     Span::styled(
-                        if active { "● " } else { "  " },
+                        if active { "• " } else { "  " },
                         app.theme.badge(Tone::Ok).patch(app.theme.overlay()),
                     ),
                     Span::styled(
@@ -6543,29 +6809,62 @@ fn compact_status(phase: CompactPhase) -> &'static str {
     }
 }
 
-fn compact_done_note(auto: bool, before: i64, after: i64, layer: &str, over: bool) -> String {
-    if before == 0 && after == 0 && layer.is_empty() {
-        return "nothing to compact".into();
+fn compact_done_note(
+    auto: bool,
+    before: i64,
+    after: i64,
+    layer: &str,
+    over: bool,
+    chars_before: i64,
+    chars_after: i64,
+) -> CompactOutcome {
+    if before == 0 && after == 0 && layer.is_empty() && chars_before == 0 && chars_after == 0 {
+        return CompactOutcome {
+            note: "nothing to compact".into(),
+            record: false,
+        };
     }
     let verb = if auto { "auto-compacted" } else { "compacted" };
-    let mut note = format!("{verb} · {before} → {after}");
+    let shrunk = after > 0 && before > after;
+    let mut note = if chars_before > 0 && chars_after > 0 && chars_before != chars_after {
+        format!("{verb} {chars_before}→{chars_after}ch")
+    } else {
+        format!("{verb} {before}→{after}")
+    };
+    let layer = layer.trim();
     if !layer.is_empty() {
-        note.push_str(" · ");
+        note.push(' ');
         note.push_str(layer);
     }
     if over {
-        note.push_str(" · still over budget");
+        note.push_str(" over");
     }
-    note
+    CompactOutcome {
+        note,
+        record: shrunk,
+    }
+}
+
+struct CompactOutcome {
+    note: String,
+    record: bool,
+}
+
+fn is_compact_note(text: &str) -> bool {
+    let t = text.trim();
+    t.starts_with("compacted") || t.starts_with("auto-compacted") || t == "nothing to compact"
 }
 
 fn apply_compact_report(app: &mut App, rep: &CompactReport, auto: bool) {
+    app.apply_compact_projection(rep.chars_before, rep.chars_after);
     app.finish_compact(compact_done_note(
         auto,
         rep.messages_before,
         rep.messages_after,
         &rep.layer,
         rep.over_budget,
+        rep.chars_before,
+        rep.chars_after,
     ));
 }
 
@@ -7417,6 +7716,49 @@ mod tests {
         let rows = wrap_cols("日本語文字", 8);
         assert_eq!(rows[0], "日本語文");
         assert_eq!(rows[1], "字");
+    }
+
+    #[test]
+    fn wrap_cols_breaks_on_words_not_letters() {
+        assert_eq!(
+            wrap_cols("hello world", 8),
+            vec!["hello", "world"]
+        );
+        assert_eq!(
+            wrap_cols("recommending. Now let me inspect the overlay chrome.", 20),
+            vec!["recommending. Now", "let me inspect the", "overlay chrome."]
+        );
+        // A token wider than the pane still hard-breaks so it cannot overflow.
+        assert_eq!(wrap_cols("abcdefghij", 4), vec!["abcd", "efgh", "ij"]);
+        // Leading space after a wrap is dropped so the next word is flush.
+        let rows = wrap_cols("one two three", 3);
+        assert_eq!(rows, vec!["one", "two", "thr", "ee"]);
+    }
+
+    #[test]
+    fn no_color_user_band_keeps_the_rail_glyph() {
+        let mut app = App::new(SessionInfo::default());
+        app.theme = Theme::plain(ThemeName::CatppuccinMocha);
+        app.entries.push(Entry::user("hi"));
+        let out = render(&mut app, 60, 16);
+        assert!(
+            out.contains('▎'),
+            "rail is the NO_COLOR user landmark:\n{out}"
+        );
+    }
+
+    #[test]
+    fn peer_ctrl_p_hint_appears_once() {
+        let mut app = App::new(SessionInfo::default());
+        peer_chunk(&mut app, "cursor", "one");
+        peer_chunk(&mut app, "kimi", "two");
+        let n = app
+            .peer_lines()
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| span.content.contains("ctrl+p"))
+            .count();
+        assert_eq!(n, 1, "one hint for N peers");
     }
 
     #[test]
@@ -8461,7 +8803,7 @@ mod tests {
         assert!(out.contains("gpt-5-mini"), "{out}");
         // Current model: named in the title, dotted in the list.
         assert!(out.contains("models · gpt-5-mini"), "{out}");
-        assert!(out.contains("● gpt-5-mini"), "{out}");
+        assert!(out.contains("• gpt-5-mini"), "{out}");
         assert!(out.contains("claude-sonnet-4"), "{out}");
         assert!(out.contains("/model"), "{out}");
     }
@@ -8507,7 +8849,7 @@ mod tests {
         assert!(out.contains("high"), "{out}");
         // The active effort is marked with a dot and named in the title.
         assert!(out.contains("reasoning effort · none"), "{out}");
-        assert!(out.contains("● none"), "{out}");
+        assert!(out.contains("• none"), "{out}");
 
         app.apply_effort_set("high");
         assert_eq!(app.effort, "high");
@@ -8856,7 +9198,7 @@ mod tests {
         press_ctrl_key(&mut app, 's');
         assert!(app.select_mode);
         assert!(app.mouse_mode_dirty);
-        assert!(app.header_line(100).to_string().contains("⛶ select"));
+        assert!(app.header_line(100).to_string().contains("▦ select"));
     }
 
     #[test]
@@ -9400,7 +9742,10 @@ mod tests {
         let head = header_text(&app, 80);
         assert!(head.contains("2 problems"), "{head}");
         let foot = footer_text(&app, 80);
-        assert!(foot.contains("2 problems"), "{foot}");
+        assert!(
+            !foot.contains("2 problems"),
+            "N problems chip lives in the header: {foot}"
+        );
     }
 
     #[test]
@@ -9479,35 +9824,45 @@ mod tests {
         app.busy = true;
         app.activity_started = Some(Instant::now());
         app.compacting = Some(CompactPhase::Queued);
+        let header = app
+            .header_line(120)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(header.contains("compact queued"), "{header}");
         let footer = app.footer();
-        assert!(footer.contains("compact queued"), "{footer}");
+        assert!(
+            !footer.contains("compact queued"),
+            "queued compact is a header chip: {footer}"
+        );
         assert!(app.activity().contains('●'), "{}", app.activity());
     }
 
     #[test]
     fn compact_done_and_empty_notes() {
-        assert_eq!(
-            compact_done_note(false, 12, 5, "drop", false),
-            "compacted · 12 → 5 · drop"
-        );
-        assert_eq!(
-            compact_done_note(true, 20, 8, "snip", true),
-            "auto-compacted · 20 → 8 · snip · still over budget"
-        );
-        assert_eq!(compact_done_note(false, 0, 0, "", false), "nothing to compact");
+        let drop = compact_done_note(false, 12, 5, "drop", false, 0, 0);
+        assert_eq!(drop.note, "compacted 12→5 drop");
+        assert!(drop.record);
+        let over = compact_done_note(true, 20, 8, "snip", true, 0, 0);
+        assert_eq!(over.note, "auto-compacted 20→8 snip over");
+        assert!(over.record);
+        let empty = compact_done_note(false, 0, 0, "", false, 0, 0);
+        assert_eq!(empty.note, "nothing to compact");
+        assert!(!empty.record);
 
         let mut app = App::new(SessionInfo::default());
         app.begin_compact(CompactPhase::Manual);
-        app.finish_compact(compact_done_note(false, 12, 5, "drop", false));
+        app.finish_compact(compact_done_note(false, 12, 5, "drop", false, 0, 0));
         assert!(app.compacting.is_none());
-        assert_eq!(app.status, "compacted · 12 → 5 · drop");
+        assert_eq!(app.status, "compacted 12→5 drop");
         assert!(
             app.entries
                 .iter()
-                .any(|e| matches!(e, Entry::Note(n) if n == "compacted · 12 → 5 · drop"))
+                .any(|e| matches!(e, Entry::Note(n) if n == "compacted 12→5 drop"))
         );
         // Second finish is a no-op (event + RPC must not double-note).
-        app.finish_compact("compacted · 12 → 5 · drop".into());
+        app.finish_compact(compact_done_note(false, 12, 5, "drop", false, 0, 0));
         let notes: Vec<_> = app
             .entries
             .iter()
@@ -9516,7 +9871,102 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(notes, ["compacted · 12 → 5 · drop"]);
+        assert_eq!(notes, ["compacted 12→5 drop"]);
+
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
+        app.animate = false;
+        let painted = app.entry_lines(&Entry::Note("auto-compacted 30→12 drop".into()));
+        assert_eq!(painted.len(), 1, "{painted:?}");
+        let text: String = painted[0]
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect();
+        assert!(text.contains("auto-compacted 30→12 drop"), "{text}");
+        assert!(!text.contains('\n'), "{text:?}");
+    }
+
+    #[test]
+    fn identical_auto_compact_notes_are_not_repeated() {
+        let mut app = App::new(SessionInfo::default());
+        app.busy = true;
+        app.on_notification(&compact_event(EVENT_COMPACT_START, true, 0, 0));
+        app.on_notification(&compact_event(EVENT_COMPACT, true, 30, 12));
+        app.entries.push(Entry::user("next turn"));
+        app.on_notification(&compact_event(EVENT_COMPACT_START, true, 0, 0));
+        app.on_notification(&compact_event(EVENT_COMPACT, true, 30, 12));
+        let notes: Vec<_> = app
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Note(n) => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notes, ["auto-compacted 30→12 drop"]);
+    }
+
+    #[test]
+    fn noop_snip_stays_on_the_status_bar_and_scales_ctx() {
+        let mut app = App::new(SessionInfo::default());
+        app.ctx = Some(ContextUsage {
+            tokens: 80_000,
+            context_window: Some(200_000),
+            remaining: Some(120_000),
+            percent: Some(40.0),
+        });
+        app.busy = true;
+        app.on_notification(&Notification {
+            method: "event".into(),
+            params: serde_json::json!({
+                "type": EVENT_COMPACT_START,
+                "auto": true,
+            }),
+        });
+        app.on_notification(&Notification {
+            method: "event".into(),
+            params: serde_json::json!({
+                "type": EVENT_COMPACT,
+                "auto": true,
+                "messages_before": 1004,
+                "messages_after": 1004,
+                "layer": "snip",
+                "chars_before": 200_000,
+                "chars_after": 100_000,
+            }),
+        });
+        assert_eq!(app.ctx.as_ref().unwrap().tokens, 40_000);
+        assert_eq!(app.ctx.as_ref().unwrap().percent, Some(20.0));
+        assert!(app.status.contains("auto-compacted"));
+        assert!(
+            app.entries.iter().all(|e| !matches!(e, Entry::Note(_))),
+            "message-count no-op must not become a transcript row"
+        );
+
+        app.on_notification(&Notification {
+            method: "event".into(),
+            params: serde_json::json!({
+                "type": EVENT_COMPACT_START,
+                "auto": true,
+            }),
+        });
+        app.on_notification(&Notification {
+            method: "event".into(),
+            params: serde_json::json!({
+                "type": EVENT_COMPACT,
+                "auto": true,
+                "messages_before": 1004,
+                "messages_after": 1004,
+                "layer": "snip",
+                "chars_before": 100_000,
+                "chars_after": 100_000,
+            }),
+        });
+        assert!(
+            app.entries.iter().all(|e| !matches!(e, Entry::Note(_))),
+            "true no-op stays off the transcript"
+        );
+        assert!(app.status.contains("1004→1004"), "{}", app.status);
     }
 
     #[test]
@@ -9526,14 +9976,25 @@ mod tests {
         app.on_notification(&compact_event(EVENT_COMPACT_START, true, 0, 0));
         assert_eq!(app.compacting, Some(CompactPhase::Auto));
         assert_eq!(app.compact_chip_text().as_deref(), Some("auto-compact…"));
-        assert!(app.footer().contains("auto-compact…"));
+        let header = app
+            .header_line(120)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(header.contains("auto-compact…"), "{header}");
+        assert!(
+            !app.footer().contains("auto-compact…"),
+            "busy footer keeps the turn clock: {}",
+            app.footer()
+        );
 
         app.on_notification(&compact_event(EVENT_COMPACT, true, 30, 12));
         assert!(app.compacting.is_none());
         assert!(
             app.entries
                 .iter()
-                .any(|e| matches!(e, Entry::Note(n) if n == "auto-compacted · 30 → 12 · drop"))
+                .any(|e| matches!(e, Entry::Note(n) if n == "auto-compacted 30→12 drop"))
         );
     }
 
@@ -9985,8 +10446,13 @@ mod tests {
             "write path in live progress:\n{writing}"
         );
         assert!(
-            writing.contains("─ src/app.rs") || writing.contains("src/app.rs"),
-            "diff card from tool.end result:\n{writing}"
+            writing.contains("─ ✎ src/app.rs") || writing.contains("─ src/app.rs"),
+            "diff card header owns the path:\n{writing}"
+        );
+        let edited_hits = writing.matches("edited src/app.rs").count();
+        assert_eq!(
+            edited_hits, 0,
+            "do not repeat edited path under the card:\n{writing}"
         );
         assert!(
             writing.contains("old") && writing.contains("+ new"),
@@ -10407,7 +10873,7 @@ mod tests {
                 .iter()
                 .map(|s| s.content.as_ref())
                 .collect();
-            let body = text.strip_prefix("⚙ ").unwrap_or(&text);
+            let body = text.strip_prefix("› ").unwrap_or(&text);
             let summary = match body.rsplit_once(" · ") {
                 Some((head, tail))
                     if tail.ends_with('s') && tail.trim_end_matches('s').parse::<f64>().is_ok() =>

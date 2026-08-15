@@ -642,13 +642,17 @@ impl Theme {
     }
 
     /// Filling up — 70–84%. Peach from the active palette, not a mocha hex.
+    /// Under NO_COLOR, underline so the tripwire is still visible (bold alone
+    /// matches ctx_ok).
     pub fn ctx_warn(self) -> Style {
         if self.colored {
             Style::default()
                 .fg(self.palette.peach)
                 .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().add_modifier(Modifier::BOLD)
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::UNDERLINED)
         }
     }
 
@@ -1123,6 +1127,16 @@ mod tests {
             assert_eq!(t.ctx_style(150.0).bg, t.ctx_hot().bg, "{name}");
             assert_ne!(t.ctx_warn().fg, t.badge(Tone::Error).fg, "{name}");
         }
+
+        let plain = Theme::plain(ThemeName::CatppuccinMocha);
+        assert!(
+            plain
+                .ctx_warn()
+                .add_modifier
+                .contains(Modifier::UNDERLINED),
+            "NO_COLOR ctx_warn must differ from ctx_ok"
+        );
+        assert!(!plain.ctx_ok().add_modifier.contains(Modifier::UNDERLINED));
     }
 
     #[test]

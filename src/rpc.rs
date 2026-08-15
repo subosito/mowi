@@ -129,6 +129,8 @@ impl ContextUsage {
 pub struct CompactReport {
     pub layer: String,
     pub chars_saved: i64,
+    pub chars_before: i64,
+    pub chars_after: i64,
     pub messages_before: i64,
     pub messages_after: i64,
     pub over_budget: bool,
@@ -1320,6 +1322,14 @@ impl Client {
                 .to_string(),
             chars_saved: value
                 .get("chars_saved")
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+            chars_before: value
+                .get("chars_before")
+                .and_then(Value::as_i64)
+                .unwrap_or(0),
+            chars_after: value
+                .get("chars_after")
                 .and_then(Value::as_i64)
                 .unwrap_or(0),
             messages_before: value

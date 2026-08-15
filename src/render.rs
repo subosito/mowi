@@ -46,6 +46,8 @@ pub fn is_unified_diff(text: &str) -> bool {
 /// surrounding prose stays markdown. With no such fence, a bare unified diff
 /// (see [`is_unified_diff`]) is one Diff; everything else is one Md.
 pub fn split_markdown_and_diffs(text: &str) -> Vec<Segment> {
+    let (action, body) = peel_diff_action(text);
+    let text = if action.is_some() { body } else { text };
     let lines: Vec<&str> = text.lines().collect();
     let mut out: Vec<Segment> = Vec::new();
     let mut md: Vec<&str> = Vec::new();
@@ -586,6 +588,53 @@ pub fn diff_title(text: &str) -> String {
     diff_file(text).unwrap_or_else(|| "hunk".to_string())
 }
 
+/// Leading host line (`edited src/app.rs`) plus the unified-diff body.
+///
+/// Write/edit results often prefix the hunk with the same path the card
+/// header already shows. Peel that verb off so the body is not a second
+/// path row.
+pub fn peel_diff_action(text: &str) -> (Option<&'static str>, &str) {
+    let trimmed = text.trim_start_matches('\n');
+    let Some((first, rest)) = trimmed.split_once('\n') else {
+        return (None, text);
+    };
+    let first = first.trim();
+    let Some((verb, path)) = first.split_once(char::is_whitespace) else {
+        return (None, text);
+    };
+    let verb = verb.to_ascii_lowercase();
+    let action = match verb.as_str() {
+        "edit" | "edited" | "update" | "updated" => Some("edit"),
+        "write" | "wrote" | "create" | "created" => Some("write"),
+        "delete" | "deleted" | "remove" | "removed" => Some("delete"),
+        _ => None,
+    };
+    let Some(action) = action else {
+        return (None, text);
+    };
+    let path = path.trim();
+    if path.is_empty() {
+        return (None, text);
+    }
+    // Only peel when the rest is (or contains) a unified diff — a lone
+    // "edited notes.txt" note should stay prose.
+    if !is_unified_diff(rest) && !rest.lines().any(|line| line.starts_with("@@") || line.starts_with("---") || line.starts_with("+++"))
+    {
+        return (None, text);
+    }
+    let _ = path;
+    (Some(action), rest.trim_start_matches('\n'))
+}
+
+/// Header glyph for a peeled write/edit verb. Path stays on the title rail.
+pub fn diff_action_glyph(action: &str) -> &'static str {
+    match action {
+        "write" => "✦",
+        "delete" => "✕",
+        _ => "✎",
+    }
+}
+
 fn clean_diff_path(path: &str) -> Option<String> {
     let path = path.split('\t').next().unwrap_or(path).trim();
     let path = path
@@ -622,6 +671,7 @@ pub fn diff_lines(text: &str, theme: Theme, width: u16) -> Vec<Line<'static>> {
     let mut new_line: Option<usize> = None;
     let mut out = Vec::with_capacity(rows.len());
     let mut index = 0;
+    let mut pending_context: Vec<(Option<usize>, String)> = Vec::new();
     while index < rows.len() {
         let row = rows[index].as_str();
         if row.is_empty() {
@@ -629,6 +679,7 @@ pub fn diff_lines(text: &str, theme: Theme, width: u16) -> Vec<Line<'static>> {
             continue;
         }
         if row.starts_with("@@") {
+            flush_context(&mut pending_context, &mut out, number_width, theme);
             if let Some((old, new, _, _)) = parse_hunk(row) {
                 if !out.is_empty() {
                     let skipped = hunk_gap(old_line, new_line, old, new);
@@ -640,6 +691,29 @@ pub fn diff_lines(text: &str, theme: Theme, width: u16) -> Vec<Line<'static>> {
                 new_line = Some(new);
             }
             index += 1;
+            let mut hunk: Vec<String> = Vec::new();
+            while index < rows.len() {
+                let next = rows[index].as_str();
+                if next.starts_with("@@")
+                    || next.starts_with("diff --git")
+                    || next.starts_with("+++")
+                    || next.starts_with("---")
+                {
+                    break;
+                }
+                hunk.push(rows[index].clone());
+                index += 1;
+            }
+            paint_hunk(
+                &hunk,
+                &mut old_line,
+                &mut new_line,
+                &mut pending_context,
+                &mut out,
+                number_width,
+                body_width,
+                theme,
+            );
             continue;
         }
         if row.starts_with("+++") || row.starts_with("---") || row.starts_with("diff --git") {
@@ -647,6 +721,7 @@ pub fn diff_lines(text: &str, theme: Theme, width: u16) -> Vec<Line<'static>> {
             continue;
         }
         if row.starts_with("\\ No newline") {
+            flush_context(&mut pending_context, &mut out, number_width, theme);
             out.push(numbered_context(None, row, number_width, theme));
             index += 1;
             continue;
@@ -655,6 +730,7 @@ pub fn diff_lines(text: &str, theme: Theme, width: u16) -> Vec<Line<'static>> {
         let add_style = (theme.add(), theme.add_sign(), theme.add_chip());
         match (row.strip_prefix('-'), row.strip_prefix('+')) {
             (Some(old_body), None) => {
+                flush_context(&mut pending_context, &mut out, number_width, theme);
                 let new_body = rows
                     .get(index + 1)
                     .map(|s| s.as_str())
@@ -663,6 +739,14 @@ pub fn diff_lines(text: &str, theme: Theme, width: u16) -> Vec<Line<'static>> {
                 let old_no = old_line;
                 old_line = old_line.map(|n| n + 1);
                 match new_body {
+                    Some(new_body) if new_body == old_body => {
+                        // Host often emits `-same` / `+same` for alignment.
+                        // That is context, not a change — do not paint both signs.
+                        let no = old_no.or(new_line);
+                        new_line = new_line.map(|n| n + 1);
+                        pending_context.push((no, old_body.to_string()));
+                        index += 2;
+                    }
                     Some(new_body) => {
                         let new_no = new_line;
                         new_line = new_line.map(|n| n + 1);
@@ -708,6 +792,7 @@ pub fn diff_lines(text: &str, theme: Theme, width: u16) -> Vec<Line<'static>> {
                 }
             }
             (None, Some(new_body)) => {
+                flush_context(&mut pending_context, &mut out, number_width, theme);
                 let new_no = new_line;
                 new_line = new_line.map(|n| n + 1);
                 out.push(numbered_band(
@@ -728,17 +813,252 @@ pub fn diff_lines(text: &str, theme: Theme, width: u16) -> Vec<Line<'static>> {
                 let new_no = new_line;
                 old_line = old_line.map(|n| n + 1);
                 new_line = new_line.map(|n| n + 1);
-                out.push(numbered_context(
-                    old_no.or(new_no),
-                    body,
-                    number_width,
-                    theme,
-                ));
+                pending_context.push((old_no.or(new_no), body.to_string()));
                 index += 1;
             }
         }
     }
+    flush_context(&mut pending_context, &mut out, number_width, theme);
     out
+}
+
+fn flush_context(
+    pending: &mut Vec<(Option<usize>, String)>,
+    out: &mut Vec<Line<'static>>,
+    number_width: usize,
+    theme: Theme,
+) {
+    const KEEP: usize = 2;
+    if pending.len() > KEEP * 2 {
+        let skipped = pending.len() - KEEP * 2;
+        let head: Vec<_> = pending.drain(..KEEP).collect();
+        let tail: Vec<_> = pending.split_off(pending.len().saturating_sub(KEEP));
+        pending.clear();
+        for (no, body) in head {
+            out.push(numbered_context(no, &body, number_width, theme));
+        }
+        out.push(hunk_gap_line(skipped, theme));
+        for (no, body) in tail {
+            out.push(numbered_context(no, &body, number_width, theme));
+        }
+    } else {
+        for (no, body) in pending.drain(..) {
+            out.push(numbered_context(no, &body, number_width, theme));
+        }
+    }
+}
+
+fn paint_hunk(
+    hunk: &[String],
+    old_line: &mut Option<usize>,
+    new_line: &mut Option<usize>,
+    pending_context: &mut Vec<(Option<usize>, String)>,
+    out: &mut Vec<Line<'static>>,
+    number_width: usize,
+    body_width: u16,
+    theme: Theme,
+) {
+    let mut old_rows = Vec::new();
+    let mut new_rows = Vec::new();
+    let flush_change = |old_rows: &mut Vec<String>,
+                        new_rows: &mut Vec<String>,
+                        old_line: &mut Option<usize>,
+                        new_line: &mut Option<usize>,
+                        pending_context: &mut Vec<(Option<usize>, String)>,
+                        out: &mut Vec<Line<'static>>| {
+        replay_ops(
+            align_lines(old_rows, new_rows),
+            old_line,
+            new_line,
+            pending_context,
+            out,
+            number_width,
+            body_width,
+            theme,
+        );
+        old_rows.clear();
+        new_rows.clear();
+    };
+    for row in hunk {
+        if row.starts_with('\\') {
+            continue;
+        }
+        if let Some(body) = row.strip_prefix('-') {
+            old_rows.push(body.to_string());
+        } else if let Some(body) = row.strip_prefix('+') {
+            new_rows.push(body.to_string());
+        } else {
+            flush_change(
+                &mut old_rows,
+                &mut new_rows,
+                old_line,
+                new_line,
+                pending_context,
+                out,
+            );
+            let body = row.strip_prefix(' ').unwrap_or(row.as_str()).to_string();
+            let no = *old_line;
+            *old_line = old_line.map(|n| n + 1);
+            *new_line = new_line.map(|n| n + 1);
+            pending_context.push((no.or(*new_line), body));
+        }
+    }
+    flush_change(
+        &mut old_rows,
+        &mut new_rows,
+        old_line,
+        new_line,
+        pending_context,
+        out,
+    );
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AlignKind {
+    Equal,
+    Del,
+    Add,
+}
+
+fn align_lines(old: &[String], new: &[String]) -> Vec<(AlignKind, String)> {
+    let n = old.len();
+    let m = new.len();
+    if n == 0 && m == 0 {
+        return Vec::new();
+    }
+    // LCS — same idea as mow filediff.go / sergi go-diff. Hunks are small.
+    if n.saturating_mul(m) > 80_000 {
+        let mut ops = Vec::with_capacity(n + m);
+        for row in old {
+            ops.push((AlignKind::Del, row.clone()));
+        }
+        for row in new {
+            ops.push((AlignKind::Add, row.clone()));
+        }
+        return ops;
+    }
+    let mut lcs = vec![vec![0u16; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            lcs[i][j] = if old[i] == new[j] {
+                lcs[i + 1][j + 1].saturating_add(1)
+            } else {
+                lcs[i + 1][j].max(lcs[i][j + 1])
+            };
+        }
+    }
+    let mut ops = Vec::new();
+    let (mut i, mut j) = (0usize, 0usize);
+    while i < n && j < m {
+        if old[i] == new[j] {
+            ops.push((AlignKind::Equal, old[i].clone()));
+            i += 1;
+            j += 1;
+        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+            ops.push((AlignKind::Del, old[i].clone()));
+            i += 1;
+        } else {
+            ops.push((AlignKind::Add, new[j].clone()));
+            j += 1;
+        }
+    }
+    while i < n {
+        ops.push((AlignKind::Del, old[i].clone()));
+        i += 1;
+    }
+    while j < m {
+        ops.push((AlignKind::Add, new[j].clone()));
+        j += 1;
+    }
+    ops
+}
+
+fn replay_ops(
+    ops: Vec<(AlignKind, String)>,
+    old_line: &mut Option<usize>,
+    new_line: &mut Option<usize>,
+    pending_context: &mut Vec<(Option<usize>, String)>,
+    out: &mut Vec<Line<'static>>,
+    number_width: usize,
+    body_width: u16,
+    theme: Theme,
+) {
+    let del_style = (theme.del(), theme.del_sign(), theme.del_chip());
+    let add_style = (theme.add(), theme.add_sign(), theme.add_chip());
+    let mut i = 0;
+    while i < ops.len() {
+        match ops[i].0 {
+            AlignKind::Equal => {
+                let no = *old_line;
+                *old_line = old_line.map(|n| n + 1);
+                *new_line = new_line.map(|n| n + 1);
+                pending_context.push((no.or(*new_line), ops[i].1.clone()));
+                i += 1;
+            }
+            AlignKind::Del => {
+                flush_context(pending_context, out, number_width, theme);
+                let old_no = *old_line;
+                *old_line = old_line.map(|n| n + 1);
+                if i + 1 < ops.len() && ops[i + 1].0 == AlignKind::Add {
+                    let new_no = *new_line;
+                    *new_line = new_line.map(|n| n + 1);
+                    let (old_chip, new_chip) = match changed_span(&ops[i].1, &ops[i + 1].1) {
+                        Some((a, b)) => (Some(a), Some(b)),
+                        None => (None, None),
+                    };
+                    out.push(numbered_band(
+                        (old_no, theme.diff_old_no()),
+                        '−',
+                        &ops[i].1,
+                        old_chip,
+                        del_style,
+                        number_width,
+                        body_width,
+                        theme,
+                    ));
+                    out.push(numbered_band(
+                        (new_no, theme.diff_new_no()),
+                        '+',
+                        &ops[i + 1].1,
+                        new_chip,
+                        add_style,
+                        number_width,
+                        body_width,
+                        theme,
+                    ));
+                    i += 2;
+                } else {
+                    out.push(numbered_band(
+                        (old_no, theme.diff_old_no()),
+                        '−',
+                        &ops[i].1,
+                        None,
+                        del_style,
+                        number_width,
+                        body_width,
+                        theme,
+                    ));
+                    i += 1;
+                }
+            }
+            AlignKind::Add => {
+                flush_context(pending_context, out, number_width, theme);
+                let new_no = *new_line;
+                *new_line = new_line.map(|n| n + 1);
+                out.push(numbered_band(
+                    (new_no, theme.diff_new_no()),
+                    '+',
+                    &ops[i].1,
+                    None,
+                    add_style,
+                    number_width,
+                    body_width,
+                    theme,
+                ));
+                i += 1;
+            }
+        }
+    }
 }
 
 /// `@@ -old,old_count +new,new_count @@` — counts default to 1.
@@ -811,6 +1131,9 @@ fn numbered_context(
     theme: Theme,
 ) -> Line<'static> {
     let mut spans = gutter_spans(number, digits, theme.diff_meta(), theme);
+    // Same two-cell sign gutter as add/del (`+ ` / `− `), but empty so
+    // surrounding text does not look like a change.
+    spans.push(Span::styled("  ", theme.context()));
     spans.push(Span::styled(body.to_string(), theme.context()));
     Line::from(spans)
 }
@@ -1026,6 +1349,30 @@ mod tests {
     }
 
     #[test]
+    fn peel_edited_path_off_a_write_result() {
+        let raw =
+            "edited src/app.rs\n--- src/app.rs\n+++ src/app.rs\n@@ -1 +1 @@\n-old\n+new\n";
+        assert_eq!(
+            super::peel_diff_action(raw),
+            (
+                Some("edit"),
+                "--- src/app.rs\n+++ src/app.rs\n@@ -1 +1 @@\n-old\n+new\n"
+            )
+        );
+        assert_eq!(super::diff_action_glyph("edit"), "✎");
+        assert_eq!(
+            split_markdown_and_diffs(raw),
+            vec![Segment::Diff(
+                "--- src/app.rs\n+++ src/app.rs\n@@ -1 +1 @@\n-old\n+new\n".into()
+            )]
+        );
+        assert_eq!(
+            super::peel_diff_action("edited notes.txt"),
+            (None, "edited notes.txt")
+        );
+    }
+
+    #[test]
     fn empty_source_lines_inside_a_hunk_are_not_painted() {
         let theme = Theme::colored(ThemeName::CatppuccinMocha);
         let lines = diff_lines("@@ -1 +1 @@\n\n-old\n+new", theme, 20);
@@ -1194,20 +1541,26 @@ mod tests {
         );
         let text: Vec<String> = lines.iter().map(plain).collect();
         assert!(
-            text.iter().any(|row| row.contains("10 10 │ keep before")),
+            text.iter().any(|row| row.contains("10 │   keep before")),
             "{text:?}"
         );
         assert!(
-            text.iter().any(|row| row.contains("11    │ − old value")),
+            text.iter().any(|row| row.contains("│ − old value")),
             "{text:?}"
         );
         assert!(
-            text.iter().any(|row| row.contains("   11 │ + new value")),
+            text.iter().any(|row| row.contains("│ + new value")),
             "{text:?}"
         );
         assert!(
-            text.iter().any(|row| row.contains("12 12 │ keep after")),
+            text.iter().any(|row| row.contains("12 │   keep after")),
             "{text:?}"
+        );
+        assert!(
+            text.iter().all(|row| {
+                !row.contains("keep before") || (!row.contains('+') && !row.contains('−'))
+            }),
+            "context must not carry a change sign: {text:?}"
         );
     }
 
@@ -1355,6 +1708,59 @@ mod tests {
             .find(|row| plain(row).contains("unchanged"))
             .expect("gap");
         assert_eq!(gap.spans[0].style, theme.diff_meta());
+    }
+
+    #[test]
+    fn long_context_runs_collapse_to_an_unchanged_gap() {
+        let theme = Theme::plain(ThemeName::CatppuccinMocha);
+        let ctx = (0..8)
+            .map(|i| format!(" keep{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lines = diff_lines(
+            &format!("@@ -1,10 +1,10 @@\n{ctx}\n-old\n+new"),
+            theme,
+            40,
+        );
+        let text: Vec<String> = lines.iter().map(plain).collect();
+        assert!(
+            text.iter().any(|row| row.contains("… 4 unchanged lines")),
+            "{text:?}"
+        );
+        assert!(
+            text.iter().any(|row| row.contains("keep0")),
+            "keep the first context rows: {text:?}"
+        );
+        assert!(
+            text.iter().any(|row| row.contains("keep7")),
+            "keep the last context rows: {text:?}"
+        );
+        assert!(
+            text.iter().all(|row| !row.contains("keep3")),
+            "middle context should collapse: {text:?}"
+        );
+    }
+
+    #[test]
+    fn identical_minus_plus_pair_paints_as_context() {
+        let theme = Theme::plain(ThemeName::CatppuccinMocha);
+        let lines = diff_lines(
+            "@@ -1,3 +1,3 @@\n same()\n-old();\n+old();\n keep()\n",
+            theme,
+            40,
+        );
+        let text: Vec<String> = lines.iter().map(plain).collect();
+        assert!(
+            text.iter().any(|row| {
+                row.contains("old();") && !row.contains('−') && !row.contains('+')
+            }),
+            "identical pair must be context: {text:?}"
+        );
+        assert!(
+            text.iter()
+                .all(|row| !row.contains("− old();") && !row.contains("+ old();")),
+            "{text:?}"
+        );
     }
 
     #[test]

@@ -156,8 +156,10 @@ dedicated `DiffPalette` (sage/rose washes, theme-text body, accent on the
 sign and word chip) so they do not share ok/error green/red. Historical
 user text is theme `text` on the user band. Identity is the surface0
 band plus the lavender rail — not a peach paragraph. Peach is reserved
-for `ctx_warn`. Inline `` `code` `` is theme `text` on surface0 (the chip
-is the ground). Header and footer grounds
+for `ctx_warn` (underlined under `NO_COLOR`). Inline `` `code` `` is theme `text` on surface0 (the chip
+is the ground). The user `▎` rail stays in monochrome. Tool groups use `›` (not the
+emoji gear); select-mode is `▦`; pickers mark the current item with `•`
+so `●` stays a status light. Header and footer grounds
 are `Color::Reset` (the terminal default).
 
 Every role must degrade under `NO_COLOR` to modifiers only. This is enforced
