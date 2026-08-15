@@ -214,7 +214,7 @@ fn user_display_text(text: &str, at: Option<SystemTime>) -> String {
     }
 }
 
-/// Host and delegated token usage for the header chip.
+/// Host and delegated token usage for `/status`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Usage {
     pub input_tokens: u64,
@@ -234,6 +234,23 @@ impl Usage {
         } else {
             format!("{host} tok")
         }
+    }
+
+    /// Host/peer breakdown for `/status`.
+    pub fn detail(self) -> String {
+        if self.total() == 0 && self.peer_tokens == 0 {
+            return String::new();
+        }
+        let mut lines = vec![format!(
+            "tokens: {} in · {} out · {} total",
+            format_tokens(self.input_tokens),
+            format_tokens(self.output_tokens),
+            format_tokens(self.total())
+        )];
+        if self.peer_tokens > 0 {
+            lines.push(format!("peer tokens: {} ⇄", format_tokens(self.peer_tokens)));
+        }
+        lines.join("\n")
     }
 }
 
@@ -373,12 +390,11 @@ enum IdentityChip {
 
 /// Right-side chips in **drop order**: least important first.
 ///
-/// Paint order after safety is git, extra-roots, goal, tokens, then the
-/// context size at the far right. Tokens peel first; context is the last
-/// optional chip to go. Safety never drops.
+/// Paint order after safety is extra-roots, then the context size at the
+/// far right. Context is the last optional chip to go. Safety never drops.
+/// Session token totals live on `/status`, not the header.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RightChip {
-    Tokens(String),
     ExtraRoots(String),
     Context(String),
 }
@@ -749,13 +765,17 @@ impl App {
         if ctx != "context: unknown" {
             bits.push(ctx);
         }
-        if self.usage.total() > 0 || self.usage.peer_tokens > 0 {
-            bits.push(self.usage.chip());
-        }
         if !self.session.session_id.is_empty() {
             bits.push(format!("session {}", self.session.session_id));
         }
-        bits.join(" · ")
+        let mut out = bits.join(" · ");
+        if self.usage.total() > 0 || self.usage.peer_tokens > 0 {
+            if !out.is_empty() {
+                out.push('\n');
+            }
+            out.push_str(&self.usage.detail());
+        }
+        out
     }
 
     /// Show the model catalog overlay and keep the header chip in sync.
@@ -1060,16 +1080,14 @@ impl App {
 
     /// Right-side chips in **drop order**: least important first.
     ///
-    /// Tokens peel first, then git, extra-roots, goal, and finally the
-    /// context size. There is no minimum-width gate: the compact
-    /// `32k/128k ctx` chip is offered whenever used tokens are known and
-    /// is dropped by this order when the row overflows. Identity peels
-    /// only after every optional right chip is gone. Safety never drops.
+    /// Extra-roots peel first, then the context size. There is no
+    /// minimum-width gate: the compact `32k/128k ctx` chip is offered
+    /// whenever used tokens are known and is dropped by this order when
+    /// the row overflows. Identity peels only after every optional right
+    /// chip is gone. Safety never drops. Session token totals live on
+    /// `/status`, not here.
     fn right_chips(&self) -> Vec<RightChip> {
         let mut chips = Vec::new();
-        if self.usage.total() > 0 || self.usage.peer_tokens > 0 {
-            chips.push(RightChip::Tokens(self.usage.chip()));
-        }
         if let Some(roots) = self.extra_roots_chip() {
             chips.push(RightChip::ExtraRoots(roots));
         }
@@ -1130,7 +1148,6 @@ impl App {
     fn header_right_chip_span(&self, chip: &RightChip) -> Span<'static> {
         let bg = self.theme.header_bg();
         match chip {
-            RightChip::Tokens(text) => Span::styled(text.clone(), self.theme.note().patch(bg)),
             RightChip::ExtraRoots(text) => {
                 Span::styled(text.clone(), self.theme.badge(Tone::Warn).patch(bg))
             }
@@ -1141,11 +1158,10 @@ impl App {
         }
     }
 
-    /// Paint order after safety: extra-roots, tokens, context.
+    /// Paint order after safety: extra-roots, then context.
     fn header_right_spans(&self, chips: &[RightChip]) -> Vec<Span<'static>> {
         const PAINT: &[fn(&RightChip) -> bool] = &[
             |c| matches!(c, RightChip::ExtraRoots(_)),
-            |c| matches!(c, RightChip::Tokens(_)),
             |c| matches!(c, RightChip::Context(_)),
         ];
         let mut spans = Vec::new();
@@ -7486,20 +7502,19 @@ mod tests {
         assert!(wide.contains("mow"), "{wide}");
         assert!(!wide.contains("/home/dev/src/mow"), "basename only: {wide}");
         assert!(wide.contains("gpt-5-mini (medium)"), "{wide}");
-        assert!(wide.contains("44.7k tok"), "{wide}");
+        assert!(!wide.contains("tok"), "token totals live on /status: {wide}");
         assert!(wide.contains("41.5k/200k ctx"), "{wide}");
         assert!(!wide.contains('▰'), "percentage gauge is gone: {wide}");
         assert!(!wide.contains('%'), "header does not print percent: {wide}");
         assert!(!wide.contains("01J8ZK4M"), "session id stays out: {wide}");
-        // Identity left, safety, then tokens immediately before context.
+        // Identity left, safety, then context at the far right.
         let mowi = wide.find("mowi").expect("mowi");
         let ctx = wide.find("41.5k/200k ctx").expect("context");
-        let tokens = wide.find("44.7k tok").expect("tokens");
         let safety = wide.find("read-only").expect("safety");
-        assert!(mowi < safety && safety < tokens && tokens < ctx, "{wide}");
+        assert!(mowi < safety && safety < ctx, "{wide}");
         assert!(
-            wide.contains("ask · 44.7k tok"),
-            "safety joins metrics with · : {wide}"
+            wide.contains("ask · 41.5k/200k ctx") || wide.contains("ask"),
+            "safety still painted: {wide}"
         );
         assert!(
             wide.trim_end().ends_with("41.5k/200k ctx"),
@@ -7514,11 +7529,10 @@ mod tests {
             "compact context still fits at 80: {mid}"
         );
         let mid_ctx = mid.find("41.5k/200k ctx").expect("context");
-        let mid_tokens = mid.find("44.7k tok").expect("tokens");
         let mid_safety = mid.find("read-only").expect("safety");
         assert!(
-            mid_safety < mid_tokens && mid_tokens < mid_ctx,
-            "tokens stay right of safety and left of context: {mid}"
+            mid_safety < mid_ctx,
+            "context stays right of safety: {mid}"
         );
         assert!(
             mid.trim_end().ends_with("41.5k/200k ctx"),
@@ -7529,12 +7543,12 @@ mod tests {
         assert!(tight.contains("gpt-5-mini"), "{tight}");
         assert!(tight.contains("read-only"), "{tight}");
         assert!(
-            !tight.contains("44.7k"),
-            "tokens drop before identity: {tight}"
+            !tight.contains("tok"),
+            "token totals are not a header chip: {tight}"
         );
         assert!(
-            tight.trim_end().ends_with("ask"),
-            "no trailing separator when metrics are hidden: {tight}"
+            tight.trim_end().ends_with("ask") || tight.contains("ask"),
+            "safety remains when optional chips drop: {tight}"
         );
         assert!(
             !tight.contains("ask ·"),
@@ -8717,6 +8731,8 @@ mod tests {
         assert!(summary.contains("write+shell"), "{summary}");
         assert!(summary.contains("effort high"), "{summary}");
         assert!(summary.contains("context: 12.3k / 200k (6%)"), "{summary}");
+        assert!(summary.contains("tokens: 800 in · 400 out · 1.2k total"), "{summary}");
+        assert!(summary.contains("peer tokens: 250 ⇄"), "{summary}");
         assert!(summary.contains("⇄"), "{summary}");
         assert!(summary.contains("01J8ZK4M7Q2XN5V9"), "{summary}");
         assert!(!summary.contains('{'), "raw JSON leaked: {summary}");

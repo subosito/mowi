@@ -737,10 +737,6 @@ pub fn diff_lines(text: &str, theme: Theme, width: u16) -> Vec<Line<'static>> {
     out
 }
 
-fn parse_hunk_starts(row: &str) -> Option<(usize, usize)> {
-    parse_hunk(row).map(|(old, new, _, _)| (old, new))
-}
-
 /// `@@ -old,old_count +new,new_count @@` — counts default to 1.
 fn parse_hunk(row: &str) -> Option<(usize, usize, usize, usize)> {
     let mut fields = row.split_whitespace();
@@ -1360,6 +1356,6 @@ mod tests {
             ]),
             3
         );
-        assert_eq!(super::parse_hunk_starts("@@ -10,4 +12,6 @@"), Some((10, 12)));
+        assert_eq!(super::parse_hunk("@@ -10,4 +12,6 @@"), Some((10, 12, 4, 6)));
     }
 }

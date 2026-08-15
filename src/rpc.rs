@@ -559,12 +559,12 @@ pub fn extract_thinking(s: &str) -> (String, String, bool) {
         }
         match index_close_tag(after_open, close_tag) {
             None => {
-                think.push_str(after_open);
+                push_think_chunk(&mut think, after_open);
                 unclosed = true;
                 break;
             }
             Some(close_idx) => {
-                think.push_str(&after_open[..close_idx]);
+                push_think_chunk(&mut think, &after_open[..close_idx]);
                 rest = &after_open[close_idx + close_tag.len()..];
                 if let Some(stripped) = rest.strip_prefix("\r\n") {
                     rest = stripped;
@@ -588,6 +588,25 @@ pub fn extract_thinking(s: &str) -> (String, String, bool) {
         }
     }
     (vis, think, unclosed)
+}
+
+fn push_think_chunk(think: &mut String, chunk: &str) {
+    if chunk.is_empty() {
+        return;
+    }
+    if !think.is_empty()
+        && !think
+            .as_bytes()
+            .last()
+            .is_some_and(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+        && !chunk
+            .as_bytes()
+            .first()
+            .is_some_and(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r'))
+    {
+        think.push(' ');
+    }
+    think.push_str(chunk);
 }
 
 fn earliest_think_open(s: &str) -> Option<(usize, usize, &'static str)> {
@@ -1769,6 +1788,11 @@ mod tests {
         let (vis, _, _) = extract_thinking("<THINK>SECRET</THINK>ok");
         assert_eq!(vis, "ok");
         assert!(!vis.to_lowercase().contains("secret"));
+
+        let (_, think, _) =
+            extract_thinking("<think>each other.</think>visible<think>I'll finish</think>");
+        assert!(think.contains("each other. I'll finish"), "{think}");
+        assert!(!think.contains("other.I'll"), "{think}");
     }
 
     #[test]
