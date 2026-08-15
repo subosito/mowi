@@ -227,15 +227,6 @@ impl Usage {
         self.input_tokens + self.output_tokens
     }
 
-    pub fn chip(self) -> String {
-        let host = format_tokens(self.total());
-        if self.peer_tokens > 0 {
-            format!("{host} tok (⇄ {})", format_tokens(self.peer_tokens))
-        } else {
-            format!("{host} tok")
-        }
-    }
-
     /// Host/peer breakdown for `/status`.
     pub fn detail(self) -> String {
         if self.total() == 0 && self.peer_tokens == 0 {
@@ -1180,10 +1171,10 @@ impl App {
     }
 
     /// Header as spans. Left is identity only. Right is safety, then optional
-    /// extra-roots / tokens, then the context size at the far
-    /// right when shown. A ` · ` joins safety to the first optional chip and
-    /// is omitted when none remain. Optional chips drop before identity.
-    /// Safety never drops. Session id is not painted here.
+    /// extra-roots, then the context size at the far right when shown. A ` · `
+    /// joins safety to the first optional chip and is omitted when none remain.
+    /// Optional chips drop before identity. Safety never drops. Session id is
+    /// not painted here. Session token totals live on `/status`.
     pub fn header_line(&self, width: u16) -> Line<'static> {
         let safety = if self.select_mode {
             format!(
@@ -6878,12 +6869,8 @@ mod tests {
             ..Default::default()
         });
         app.apply_context(&usage(100_000, Some(200_000), Some(50.0)));
-        // Usage must be present: it peels before context, which peels before
-        // the model.
-        app.usage.input_tokens = 41_500;
-        app.usage.output_tokens = 3_200;
 
-        // 48 is below identity+safety+context (~57). Tokens already peeled.
+        // 48 is below identity+safety+context (~57).
         let text: String = app
             .header_line(48)
             .spans
@@ -7457,7 +7444,6 @@ mod tests {
             ..Default::default()
         });
         app.effort = "medium".into();
-        app.usage.input_tokens = 41_500;
 
         let wide = header_text(&app, 160);
         assert!(wide.contains("gpt-5-mini (medium)"), "{wide}");
@@ -7467,7 +7453,7 @@ mod tests {
             "header uses the workspace basename: {wide}"
         );
 
-        // Peel tokens and workspace first; effort goes before the model name.
+        // Workspace peels first; effort goes before the model name.
         // `mowi · gpt-5-mini (medium)` + safety is 41 cols; 40 forces the
         // parenthetical off and keeps the model.
         let mid = header_text(&app, 40);
@@ -8480,7 +8466,7 @@ mod tests {
     }
 
     #[test]
-    fn header_drop_order_peels_tokens_before_context() {
+    fn header_never_paints_session_token_totals() {
         let mut app = App::new(SessionInfo {
             workspace: "/home/dev/src/mow".into(),
             model: "gpt-5-mini".into(),
@@ -8488,33 +8474,24 @@ mod tests {
         });
         app.effort = "medium".into();
         app.usage.input_tokens = 41_500;
+        app.usage.output_tokens = 3_200;
+        app.usage.peer_tokens = 1_200;
         app.apply_context(&usage(32_000, Some(128_000), Some(25.0)));
 
-        let mut saw_ctx_without_tokens = false;
-        let mut min_ctx = u16::MAX;
-        let mut min_tokens = u16::MAX;
+        let mut saw_ctx = false;
         for width in 40..=120 {
             let text = header_text(&app, width);
+            assert!(
+                !text.contains("tok"),
+                "token totals live on /status: width {width}: {text}"
+            );
             if text.contains("32k/128k ctx") {
-                min_ctx = min_ctx.min(width);
-            }
-            if text.contains("tok") {
-                min_tokens = min_tokens.min(width);
-            }
-            if text.contains("32k/128k ctx") && !text.contains("tok") {
-                saw_ctx_without_tokens = true;
+                saw_ctx = true;
             }
             assert!(text.contains("read-only"), "width {width}: {text}");
             assert!(text.contains("ask"), "width {width}: {text}");
         }
-        assert!(
-            min_ctx < min_tokens,
-            "context must survive narrower than tokens: ctx@{min_ctx} tok@{min_tokens}"
-        );
-        assert!(
-            saw_ctx_without_tokens,
-            "tokens peel first so a mid width keeps context alone"
-        );
+        assert!(saw_ctx, "context chip should appear at some width");
         assert!(header_text(&app, 40).contains("gpt-5-mini"));
     }
 
@@ -9740,19 +9717,21 @@ mod tests {
     }
 
     #[test]
-    fn token_chip_includes_peer_usage() {
+    fn status_detail_includes_peer_usage() {
         let mut app = App::new(SessionInfo::default());
         app.usage = Usage {
             input_tokens: 10_000,
             output_tokens: 2_300,
             peer_tokens: 1_200,
         };
-        assert_eq!(app.usage.chip(), "12.3k tok (⇄ 1.2k)");
+        assert_eq!(
+            app.usage.detail(),
+            "tokens: 10k in · 2.3k out · 12.3k total\npeer tokens: 1.2k ⇄"
+        );
         assert!(
-            app.header_line(80)
-                .spans
-                .iter()
-                .any(|span| span.content.contains("12.3k tok"))
+            !header_text(&app, 80).contains("tok"),
+            "token totals live on /status: {}",
+            header_text(&app, 80)
         );
     }
 
