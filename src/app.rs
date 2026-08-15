@@ -7789,9 +7789,10 @@ mod tests {
         assert_eq!(buf[(x, y)].bg, user_bg, "text cell {x},{y}");
         assert_eq!(
             buf[(x, y)].fg,
-            crate::theme::mocha::PEACH,
-            "user text is peach, not blue"
+            crate::theme::mocha::TEXT,
+            "user text is theme text, not peach"
         );
+        assert_ne!(buf[(x, y)].fg, crate::theme::mocha::PEACH);
         assert_ne!(buf[(x, y)].fg, crate::theme::mocha::BLUE);
         // Inner transcript starts at x=1 (left pad); the rail is a lavender
         // glyph on the band ground, not a differently-coloured cell.

@@ -531,12 +531,14 @@ impl Theme {
         }
     }
 
-    /// Historical user prompt. Peach, not blue: blue collided with tool
-    /// chrome and read as a leftover composer artifact on the band.
+    /// Historical user prompt. Theme text on the surface0 band — identity is
+    /// the band plus the lavender rail, not a peach paragraph. Peach stays
+    /// on `ctx_warn` so near-full context can still grab attention. Not blue:
+    /// blue is still tools / spinner / links.
     pub fn user(self) -> Style {
         if self.colored {
             Style::default()
-                .fg(self.palette.peach)
+                .fg(self.palette.text)
                 .patch(self.user_bg())
         } else {
             Style::default().add_modifier(Modifier::BOLD)
@@ -779,11 +781,12 @@ impl Theme {
         self.note().add_modifier(Modifier::CROSSED_OUT)
     }
 
-    /// `` `inline code` `` — tinted ground so it reads as a chip.
+    /// `` `inline code` `` — same recipe as the user band: theme text on
+    /// surface0. The chip is the ground, not peach (peach is `ctx_warn` only).
     pub fn md_code(self) -> Style {
         if self.colored {
             Style::default()
-                .fg(self.palette.peach)
+                .fg(self.palette.text)
                 .bg(self.palette.surface)
         } else {
             Style::default().add_modifier(Modifier::REVERSED)
@@ -1007,8 +1010,12 @@ mod tests {
         assert_eq!(t.header_bg().bg, Some(Color::Reset));
         assert_eq!(t.footer_bg().bg, Some(Color::Reset));
         assert_eq!(t.header().bg, None);
-        assert_eq!(t.user().fg, Some(t.palette.peach));
+        assert_eq!(t.user().fg, Some(t.palette.text));
+        assert_ne!(t.user().fg, Some(t.palette.peach));
         assert_ne!(t.user().fg, Some(t.palette.blue));
+        assert_eq!(t.md_code().fg, Some(t.palette.text));
+        assert_eq!(t.md_code().bg, Some(t.palette.surface));
+        assert_ne!(t.md_code().fg, Some(t.palette.peach));
     }
 
     #[test]
@@ -1088,7 +1095,7 @@ mod tests {
         assert_eq!(t.palette.surface, latte::SURFACE0);
         assert_eq!(t.palette.surface_deep, latte::SURFACE2);
         assert_eq!(t.palette.crust, latte::CRUST);
-        assert_eq!(t.user().fg, Some(t.palette.peach));
+        assert_eq!(t.user().fg, Some(t.palette.text));
         assert_eq!(t.user_rail().fg, Some(t.palette.rail));
         assert_eq!(t.add().bg, Some(t.palette.diff.add_band));
         assert_ne!(t.palette.diff.add_band, mocha::ADD_BAND);
