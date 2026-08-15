@@ -678,6 +678,7 @@ pub fn diff_lines(text: &str, theme: Theme, width: u16) -> Vec<Line<'static>> {
                             del_style,
                             number_width,
                             body_width,
+                            theme,
                         ));
                         out.push(numbered_band(
                             (new_no, theme.diff_new_no()),
@@ -687,6 +688,7 @@ pub fn diff_lines(text: &str, theme: Theme, width: u16) -> Vec<Line<'static>> {
                             add_style,
                             number_width,
                             body_width,
+                            theme,
                         ));
                         index += 2;
                     }
@@ -699,6 +701,7 @@ pub fn diff_lines(text: &str, theme: Theme, width: u16) -> Vec<Line<'static>> {
                             del_style,
                             number_width,
                             body_width,
+                            theme,
                         ));
                         index += 1;
                     }
@@ -715,6 +718,7 @@ pub fn diff_lines(text: &str, theme: Theme, width: u16) -> Vec<Line<'static>> {
                     add_style,
                     number_width,
                     body_width,
+                    theme,
                 ));
                 index += 1;
             }
@@ -787,11 +791,16 @@ fn diff_number_width(rows: &[String]) -> usize {
     max_no.to_string().len().max(2)
 }
 
-fn gutter_spans(number: Option<usize>, digits: usize, style: Style) -> Vec<Span<'static>> {
+fn gutter_spans(
+    number: Option<usize>,
+    digits: usize,
+    style: Style,
+    theme: Theme,
+) -> Vec<Span<'static>> {
     let text = number.map_or_else(|| " ".repeat(digits), |n| format!("{n:>digits$}"));
     vec![
         Span::styled(text, style),
-        Span::styled(" │ ", Style::default()),
+        Span::styled(" │ ", theme.diff_gutter()),
     ]
 }
 
@@ -801,7 +810,7 @@ fn numbered_context(
     digits: usize,
     theme: Theme,
 ) -> Line<'static> {
-    let mut spans = gutter_spans(number, digits, theme.diff_meta());
+    let mut spans = gutter_spans(number, digits, theme.diff_meta(), theme);
     spans.push(Span::styled(body.to_string(), theme.context()));
     Line::from(spans)
 }
@@ -814,8 +823,9 @@ fn numbered_band(
     styles: (Style, Style, Style),
     digits: usize,
     width: u16,
+    theme: Theme,
 ) -> Line<'static> {
-    let mut spans = gutter_spans(number.0, digits, number.1);
+    let mut spans = gutter_spans(number.0, digits, number.1, theme);
     spans.extend(band(sign, body, chip, styles, width).spans);
     Line::from(spans)
 }

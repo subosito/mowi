@@ -54,6 +54,48 @@ pub mod mocha {
     pub const DEL_CHIP: Color = RED;
 }
 
+/// Raw Catppuccin Latte ramp. https://catppuccin.com/palette
+#[allow(dead_code)]
+pub mod latte {
+    use ratatui::style::Color;
+
+    pub const ROSEWATER: Color = Color::Rgb(0xdc, 0x8a, 0x78);
+    pub const FLAMINGO: Color = Color::Rgb(0xdd, 0x78, 0x78);
+    pub const PINK: Color = Color::Rgb(0xea, 0x76, 0xcb);
+    pub const MAUVE: Color = Color::Rgb(0x88, 0x39, 0xef);
+    pub const RED: Color = Color::Rgb(0xd2, 0x0f, 0x39);
+    pub const MAROON: Color = Color::Rgb(0xe6, 0x45, 0x53);
+    pub const PEACH: Color = Color::Rgb(0xfe, 0x64, 0x0b);
+    pub const YELLOW: Color = Color::Rgb(0xdf, 0x8e, 0x1d);
+    pub const GREEN: Color = Color::Rgb(0x40, 0xa0, 0x2b);
+    pub const TEAL: Color = Color::Rgb(0x17, 0x92, 0x99);
+    pub const SKY: Color = Color::Rgb(0x04, 0xa5, 0xe5);
+    pub const SAPPHIRE: Color = Color::Rgb(0x20, 0x9f, 0xb5);
+    pub const BLUE: Color = Color::Rgb(0x1e, 0x66, 0xf5);
+    pub const LAVENDER: Color = Color::Rgb(0x72, 0x87, 0xfd);
+
+    pub const TEXT: Color = Color::Rgb(0x4c, 0x4f, 0x69);
+    pub const SUBTEXT1: Color = Color::Rgb(0x5c, 0x5f, 0x77);
+    pub const SUBTEXT0: Color = Color::Rgb(0x6c, 0x6f, 0x85);
+    pub const OVERLAY2: Color = Color::Rgb(0x7c, 0x7f, 0x93);
+    pub const OVERLAY1: Color = Color::Rgb(0x8c, 0x8f, 0xa1);
+    pub const OVERLAY0: Color = Color::Rgb(0x9c, 0xa0, 0xb0);
+    pub const SURFACE2: Color = Color::Rgb(0xac, 0xb0, 0xbe);
+    pub const SURFACE1: Color = Color::Rgb(0xbc, 0xc0, 0xcc);
+    pub const SURFACE0: Color = Color::Rgb(0xcc, 0xd0, 0xda);
+    pub const BASE: Color = Color::Rgb(0xef, 0xf1, 0xf5);
+    pub const MANTLE: Color = Color::Rgb(0xe6, 0xe9, 0xef);
+    pub const CRUST: Color = Color::Rgb(0xdc, 0xe0, 0xe8);
+
+    pub const DIFF_ADD: Color = GREEN;
+    pub const DIFF_DEL: Color = RED;
+    /// Sage/rose washes from Latte green/red on Latte base — not Mocha constants.
+    pub const ADD_BAND: Color = Color::Rgb(0xdc, 0xee, 0xe0);
+    pub const DEL_BAND: Color = Color::Rgb(0xf6, 0xdc, 0xe1);
+    pub const ADD_CHIP: Color = GREEN;
+    pub const DEL_CHIP: Color = RED;
+}
+
 /// Full theme identifiers accepted by the CLI and `MOW_THEME`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ThemeName {
@@ -183,31 +225,29 @@ impl Palette {
 
     pub const fn latte() -> Self {
         Self {
-            text: Color::Rgb(0x4c, 0x4f, 0x69),
-            muted: Color::Rgb(0x6c, 0x6f, 0x85),
-            overlay: Color::Rgb(0xcc, 0xd0, 0xda),
-            surface: Color::Rgb(0xe6, 0xe9, 0xef),
-            surface_deep: Color::Rgb(0xbc, 0xc0, 0xcc),
-            base: Color::Rgb(0xef, 0xf1, 0xf5),
-            mantle: Color::Rgb(0xe6, 0xe9, 0xef),
-            crust: Color::Rgb(0xdc, 0xde, 0xe4),
-            accent: Color::Rgb(0x88, 0x39, 0x9b),
-            rail: Color::Rgb(0x72, 0x62, 0xc6),
-            blue: Color::Rgb(0x1e, 0x66, 0xf5),
-            cyan: Color::Rgb(0x17, 0x93, 0xa5),
-            peach: Color::Rgb(0xfe, 0x64, 0x0b),
-            yellow: Color::Rgb(0xdf, 0x8e, 0x1d),
-            green: Color::Rgb(0x40, 0xa0, 0x2b),
-            red: Color::Rgb(0xd2, 0x0f, 0x39),
+            text: latte::TEXT,
+            muted: latte::SUBTEXT0,
+            overlay: latte::SURFACE1,
+            surface: latte::SURFACE0,
+            surface_deep: latte::SURFACE2,
+            base: latte::BASE,
+            mantle: latte::MANTLE,
+            crust: latte::CRUST,
+            accent: latte::MAUVE,
+            rail: latte::LAVENDER,
+            blue: latte::BLUE,
+            cyan: latte::TEAL,
+            peach: latte::PEACH,
+            yellow: latte::YELLOW,
+            green: latte::GREEN,
+            red: latte::RED,
             diff: DiffPalette {
-                add: Color::Rgb(0x40, 0xa0, 0x2b),
-                del: Color::Rgb(0xd2, 0x0f, 0x39),
-                add_band: Color::Rgb(0xdc, 0xee, 0xe0),
-                del_band: Color::Rgb(0xf6, 0xdc, 0xe1),
-                // Darker than semantic green so inverted chips meet ~4.5:1
-                // on latte base (`#40a02b` on `#eff1f5` is only ~3:1).
-                add_chip: Color::Rgb(0x25, 0x7a, 0x1d),
-                del_chip: Color::Rgb(0xd2, 0x0f, 0x39),
+                add: latte::DIFF_ADD,
+                del: latte::DIFF_DEL,
+                add_band: latte::ADD_BAND,
+                del_band: latte::DEL_BAND,
+                add_chip: latte::ADD_CHIP,
+                del_chip: latte::DEL_CHIP,
             },
         }
     }
@@ -577,6 +617,55 @@ impl Theme {
         }
     }
 
+    /// Context-fill: quiet until 70%, peach warn through 84%, inverted red at 85%
+    /// (same tripwire grok-build uses for auto-compact).
+    pub const CTX_WARN_PCT: f64 = 70.0;
+    /// Near-full: must grab attention. Aligns with auto-compact at 85%.
+    pub const CTX_HOT_PCT: f64 = 85.0;
+
+    /// Severity for a context-fill percentage. Over 100 stays danger.
+    pub fn ctx_tone(pct: f64) -> Tone {
+        if pct >= Self::CTX_HOT_PCT {
+            Tone::Error
+        } else if pct >= Self::CTX_WARN_PCT {
+            Tone::Warn
+        } else {
+            Tone::Muted
+        }
+    }
+
+    /// Quiet fill — under 70%.
+    pub fn ctx_ok(self) -> Style {
+        self.badge(Tone::Muted)
+    }
+
+    /// Filling up — 70–84%. Peach from the active palette, not a mocha hex.
+    pub fn ctx_warn(self) -> Style {
+        if self.colored {
+            Style::default()
+                .fg(self.palette.peach)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        }
+    }
+
+    /// Near-full / over-full — ≥85%. Inverted so it cannot be skimmed past.
+    pub fn ctx_hot(self) -> Style {
+        self.badge_solid(Tone::Error)
+    }
+
+    /// Header/footer ctx chip style for a fill percentage.
+    pub fn ctx_style(self, pct: f64) -> Style {
+        if pct >= Self::CTX_HOT_PCT {
+            self.ctx_hot()
+        } else if pct >= Self::CTX_WARN_PCT {
+            self.ctx_warn()
+        } else {
+            self.ctx_ok()
+        }
+    }
+
     /// A status badge on the header/status ground (terminal default).
     pub fn badge(self, tone: Tone) -> Style {
         if self.colored {
@@ -819,6 +908,11 @@ impl Theme {
         }
     }
 
+    /// Quiet rule between the line-number gutter and the hunk body.
+    pub fn diff_gutter(self) -> Style {
+        self.chrome()
+    }
+
     /// Sign column of an added line: dedicated add accent on the add band.
     pub fn add_sign(self) -> Style {
         if self.colored {
@@ -888,6 +982,12 @@ mod tests {
             t.del_sign(),
             t.add_chip(),
             t.del_chip(),
+            t.ctx_ok(),
+            t.ctx_warn(),
+            t.ctx_hot(),
+            t.ctx_style(10.0),
+            t.ctx_style(80.0),
+            t.ctx_style(95.0),
         ];
         for style in styles {
             assert!(style.fg.is_none(), "fg leaked with NO_COLOR");
@@ -969,6 +1069,53 @@ mod tests {
         assert_eq!(mocha::ADD_BAND, Color::Rgb(0x33, 0x41, 0x38));
         assert_eq!(mocha::DEL_BAND, Color::Rgb(0x3c, 0x2f, 0x34));
         assert_ne!(t.palette.diff.add, t.palette.diff.del);
+    }
+
+    #[test]
+    fn latte_tokens_match_official_ramp() {
+        assert_eq!(latte::MAUVE, Color::Rgb(0x88, 0x39, 0xef));
+        assert_eq!(latte::LAVENDER, Color::Rgb(0x72, 0x87, 0xfd));
+        assert_eq!(latte::TEAL, Color::Rgb(0x17, 0x92, 0x99));
+        assert_eq!(latte::SURFACE0, Color::Rgb(0xcc, 0xd0, 0xda));
+        assert_eq!(latte::SURFACE1, Color::Rgb(0xbc, 0xc0, 0xcc));
+        assert_eq!(latte::SURFACE2, Color::Rgb(0xac, 0xb0, 0xbe));
+        assert_eq!(latte::CRUST, Color::Rgb(0xdc, 0xe0, 0xe8));
+        let t = Theme::colored(ThemeName::CatppuccinLatte);
+        assert_eq!(t.palette.accent, latte::MAUVE);
+        assert_eq!(t.palette.rail, latte::LAVENDER);
+        assert_eq!(t.palette.cyan, latte::TEAL);
+        assert_eq!(t.palette.overlay, latte::SURFACE1);
+        assert_eq!(t.palette.surface, latte::SURFACE0);
+        assert_eq!(t.palette.surface_deep, latte::SURFACE2);
+        assert_eq!(t.palette.crust, latte::CRUST);
+        assert_eq!(t.user().fg, Some(t.palette.peach));
+        assert_eq!(t.user_rail().fg, Some(t.palette.rail));
+        assert_eq!(t.add().bg, Some(t.palette.diff.add_band));
+        assert_ne!(t.palette.diff.add_band, mocha::ADD_BAND);
+        assert_ne!(t.palette.diff.del_band, mocha::DEL_BAND);
+        assert_eq!(t.palette.diff.add_chip, latte::GREEN);
+    }
+
+    #[test]
+    fn ctx_style_uses_palette_roles_at_seventy_and_eighty_five() {
+        assert_eq!(Theme::ctx_tone(0.0), Tone::Muted);
+        assert_eq!(Theme::ctx_tone(69.9), Tone::Muted);
+        assert_eq!(Theme::ctx_tone(70.0), Tone::Warn);
+        assert_eq!(Theme::ctx_tone(84.9), Tone::Warn);
+        assert_eq!(Theme::ctx_tone(85.0), Tone::Error);
+        assert_eq!(Theme::ctx_tone(100.0), Tone::Error);
+        assert_eq!(Theme::ctx_tone(271.0), Tone::Error);
+
+        for name in ThemeName::ALL {
+            let t = Theme::colored(name.parse().unwrap());
+            assert_eq!(t.ctx_style(10.0).fg, t.ctx_ok().fg, "{name}");
+            assert_eq!(t.ctx_style(70.0).fg, Some(t.palette.peach), "{name}");
+            assert_eq!(t.ctx_style(84.0).fg, t.ctx_warn().fg, "{name}");
+            assert_eq!(t.ctx_style(85.0).bg, t.ctx_hot().bg, "{name}");
+            assert_eq!(t.ctx_style(85.0).fg, Some(t.palette.crust), "{name}");
+            assert_eq!(t.ctx_style(150.0).bg, t.ctx_hot().bg, "{name}");
+            assert_ne!(t.ctx_warn().fg, t.badge(Tone::Error).fg, "{name}");
+        }
     }
 
     #[test]

@@ -37,11 +37,12 @@ use crate::render::{
     Segment, diff_title, is_unified_diff, markdown_lines, split_markdown_and_diffs,
 };
 use crate::rpc::{
-    Client, ContextUsage, EVENT_GOAL_BLOCKED, EVENT_GOAL_DONE, EVENT_GOAL_FAIL, EVENT_GOAL_PARTIAL,
-    EVENT_GOAL_START, EVENT_GOAL_STEP, EVENT_LSP_DIAGNOSTICS, EffortList, Error, ExtraRoot,
-    GoalInfo, LspDiagnostic, LspProblems, ModelList, Notification, PermissionRequest, SessionInfo,
-    SessionSummary, SlashCommand, TranscriptMessage, VersionInfo, decode_extra_roots,
-    decode_goal_event, decode_lsp_diagnostics, decode_rewind, extract_thinking,
+    Client, CompactReport, ContextUsage, EVENT_COMPACT, EVENT_COMPACT_START, EVENT_GOAL_BLOCKED,
+    EVENT_GOAL_DONE, EVENT_GOAL_FAIL, EVENT_GOAL_PARTIAL, EVENT_GOAL_START, EVENT_GOAL_STEP,
+    EVENT_LSP_DIAGNOSTICS, EffortList, Error, ExtraRoot, GoalInfo, LspDiagnostic, LspProblems,
+    ModelList, Notification, PermissionRequest, SessionInfo, SessionSummary, SlashCommand,
+    TranscriptMessage, VersionInfo, decode_extra_roots, decode_goal_event, decode_lsp_diagnostics,
+    decode_rewind, decode_sessions, decode_skill_activate, decode_skill_list, extract_thinking,
     has_extra_roots_field, reasoning_delta, token_delta, tool_args, tool_denied, tool_error,
     tool_name, tool_progress_label, tool_result,
 };
@@ -270,6 +271,10 @@ pub enum Overlay {
         items: Vec<String>,
         state: ListState,
     },
+    Skills {
+        items: Vec<String>,
+        state: ListState,
+    },
     Peer,
     PeerPicker {
         state: ListState,
@@ -318,6 +323,13 @@ impl Overlay {
 
     fn completions(items: Vec<String>) -> Self {
         Overlay::Completions {
+            state: select_list(items.len(), 0),
+            items,
+        }
+    }
+
+    fn skills(items: Vec<String>) -> Self {
+        Overlay::Skills {
             state: select_list(items.len(), 0),
             items,
         }
@@ -387,7 +399,17 @@ enum IdentityChip {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RightChip {
     ExtraRoots(String),
+    Lsp(String),
+    Compact(String),
     Context(String),
+}
+
+/// In-progress compaction chrome. Distinct from a generic busy turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactPhase {
+    Queued,
+    Manual,
+    Auto,
 }
 
 /// Painted lines for one transcript block, reused across the 50ms redraws.
@@ -578,6 +600,8 @@ pub struct App {
     lsp_problems: Vec<LspProblems>,
     /// `/compact` requested while a non-control compact would block the worker.
     pending_compact: Option<i64>,
+    /// Live compact chrome: queued, manual `/compact`, or automatic.
+    compacting: Option<CompactPhase>,
     /// Methods the host answers while a prompt is in flight (empty = unknown).
     control_caps: Vec<String>,
 }
@@ -650,6 +674,7 @@ impl Default for App {
             thinking: false,
             lsp_problems: Vec::new(),
             pending_compact: None,
+            compacting: None,
             control_caps: Vec::new(),
         }
     }
@@ -893,8 +918,13 @@ impl App {
     /// Dump retained batches without replaying an unbounded session transcript.
     fn show_lsp_problems(&mut self) {
         if self.lsp_problems.is_empty() {
-            self.status = "lsp · none".into();
-            self.entries.push(Entry::Note("lsp · none".into()));
+            let msg = if self.feature("lsp") || self.feature("lsp_diagnostics") || self.lsp_seen {
+                "lsp · no diagnostics yet"
+            } else {
+                "lsp · host has not sent diagnostics"
+            };
+            self.status = msg.into();
+            self.entries.push(Entry::Note(msg.into()));
             return;
         }
         let mut lines = 0usize;
@@ -998,13 +1028,51 @@ impl App {
 
     /// Severity of context pressure, so the size chip warns before it truncates.
     pub fn context_tone(&self) -> Tone {
-        let pct = self.context_percent().unwrap_or(0.0);
-        if pct >= 90.0 {
-            Tone::Error
-        } else if pct >= 75.0 {
-            Tone::Warn
-        } else {
-            Tone::Muted
+        Theme::ctx_tone(self.context_percent().unwrap_or(0.0))
+    }
+
+    fn begin_compact(&mut self, phase: CompactPhase) {
+        if matches!(phase, CompactPhase::Queued)
+            && matches!(
+                self.compacting,
+                Some(CompactPhase::Manual | CompactPhase::Auto)
+            )
+        {
+            return;
+        }
+        self.compacting = Some(phase);
+        if !self.busy {
+            self.status = compact_status(phase).into();
+        }
+    }
+
+    fn finish_compact(&mut self, note: String) {
+        if self.compacting.take().is_none() {
+            if self.pending_compact.is_some() {
+                self.begin_compact(CompactPhase::Queued);
+            }
+            return;
+        }
+        self.entries.push(Entry::Note(note.clone()));
+        if !self.busy {
+            self.status = note;
+        } else if self.status.starts_with("compact") || self.status.starts_with("auto-compact") {
+            self.status.clear();
+        }
+        if self.pending_compact.is_some() {
+            self.begin_compact(CompactPhase::Queued);
+        }
+    }
+
+    fn compact_chip_text(&self) -> Option<String> {
+        Some(compact_status(self.compacting?).into())
+    }
+
+    fn compact_chip_tone(&self) -> Tone {
+        match self.compacting {
+            Some(CompactPhase::Queued) => Tone::Warn,
+            Some(CompactPhase::Manual | CompactPhase::Auto) => Tone::Active,
+            None => Tone::Muted,
         }
     }
 
@@ -1082,10 +1150,32 @@ impl App {
         if let Some(roots) = self.extra_roots_chip() {
             chips.push(RightChip::ExtraRoots(roots));
         }
+        if let Some(lsp) = self.lsp_chip_text() {
+            chips.push(RightChip::Lsp(lsp));
+        }
+        if let Some(compact) = self.compact_chip_text() {
+            chips.push(RightChip::Compact(compact));
+        }
         if let Some(ctx) = self.context_chip() {
             chips.push(RightChip::Context(ctx));
         }
         chips
+    }
+
+    fn lsp_problem_count(&self) -> usize {
+        self.lsp_problems.iter().map(|p| p.count.max(0) as usize).sum()
+    }
+
+    fn lsp_chip_text(&self) -> Option<String> {
+        let n = self.lsp_problem_count();
+        if n == 0 {
+            return None;
+        }
+        Some(if n == 1 {
+            "1 problem".into()
+        } else {
+            format!("{n} problems")
+        })
     }
 
     /// Identity side of the header: `mowi · basename · model (effort)`.
@@ -1142,17 +1232,35 @@ impl App {
             RightChip::ExtraRoots(text) => {
                 Span::styled(text.clone(), self.theme.badge(Tone::Warn).patch(bg))
             }
-            RightChip::Context(text) => Span::styled(
+            RightChip::Lsp(text) => {
+                Span::styled(text.clone(), self.theme.badge(Tone::Warn).patch(bg))
+            }
+            RightChip::Compact(text) => Span::styled(
                 text.clone(),
-                self.theme.badge(self.context_tone()).patch(bg),
+                self.theme.badge(self.compact_chip_tone()).patch(bg),
             ),
+            RightChip::Context(text) => {
+                let style = self
+                    .context_percent()
+                    .map(|pct| self.theme.ctx_style(pct))
+                    .unwrap_or_else(|| self.theme.badge(Tone::Muted));
+                // Hot is inverted; don't wash the red pill with the header Reset.
+                let style = if style.bg.is_some() {
+                    style
+                } else {
+                    style.patch(bg)
+                };
+                Span::styled(text.clone(), style)
+            }
         }
     }
 
-    /// Paint order after safety: extra-roots, then context.
+    /// Paint order after safety: extra-roots, then lsp, then context.
     fn header_right_spans(&self, chips: &[RightChip]) -> Vec<Span<'static>> {
         const PAINT: &[fn(&RightChip) -> bool] = &[
             |c| matches!(c, RightChip::ExtraRoots(_)),
+            |c| matches!(c, RightChip::Lsp(_)),
+            |c| matches!(c, RightChip::Compact(_)),
             |c| matches!(c, RightChip::Context(_)),
         ];
         let mut spans = Vec::new();
@@ -1249,9 +1357,27 @@ impl App {
 
         // One live clock, on this row. Busy owns spinner + elapsed + verb
         // (and the typing pulse while tokens land). Idle is a state light.
+        // Compacting is its own chrome — not a generic "busy" turn.
         // Session identity lives in the help overlay, not here.
         if self.busy {
             left.extend(self.live_clock_spans());
+            if let Some(compact) = self.compact_chip_text() {
+                sep(&mut left);
+                left.push(Span::styled(
+                    compact,
+                    self.theme.badge(self.compact_chip_tone()),
+                ));
+            }
+        } else if self.compacting.is_some() {
+            left.push(Span::styled(
+                format!("{} ", self.spinner_frame()),
+                self.theme.spinner(),
+            ));
+            left.push(Span::styled(
+                self.compact_chip_text()
+                    .unwrap_or_else(|| "compacting…".into()),
+                self.theme.badge(self.compact_chip_tone()),
+            ));
         } else {
             left.push(Span::styled("● ", self.theme.badge(Tone::Ok)));
             left.push(Span::styled("idle", self.theme.note()));
@@ -1283,7 +1409,8 @@ impl App {
             ));
         }
         // Idle-only news: while busy the verb already carries status.
-        if !self.status.is_empty() && !self.busy {
+        // Compact chrome owns its own chip, so don't repeat the same word.
+        if !self.status.is_empty() && !self.busy && self.compacting.is_none() {
             sep(&mut left);
             let tone = if self.peers.is_empty() {
                 self.theme.note()
@@ -1299,12 +1426,14 @@ impl App {
             && pct >= CTX_FOOTER_PCT
         {
             sep(&mut left);
-            let style = if pct >= 85.0 {
-                self.theme.warn()
-            } else {
-                self.theme.note()
-            };
-            left.push(Span::styled(format!("ctx {pct:.0}%"), style));
+            left.push(Span::styled(
+                format!("ctx {pct:.0}%"),
+                self.theme.ctx_style(pct),
+            ));
+        }
+        if let Some(lsp) = self.lsp_chip_text() {
+            sep(&mut left);
+            left.push(Span::styled(lsp, self.theme.badge(Tone::Warn)));
         }
 
         let hints = self.footer_hints();
@@ -1689,12 +1818,14 @@ impl App {
                 && hit.bytes == bytes
                 && hit.expanded == expanded
             {
-                push_window_slice_with_sep(out, base, cursor, target, window_end, &hit.lines);
+                let painted = self.highlight_search_hit(index, hit.lines.clone());
+                push_window_slice_with_sep(out, base, cursor, target, window_end, &painted);
                 return;
             }
         }
         let painted = self.entry_lines(&self.entries[index]);
         self.store_entry_paint(index, bytes, expanded, painted.clone());
+        let painted = self.highlight_search_hit(index, painted);
         push_window_slice_with_sep(out, base, cursor, target, window_end, &painted);
     }
 
@@ -2351,6 +2482,11 @@ impl App {
                 // Fold live tools/diffs into the transcript. Idempotent: the
                 // group is consumed, so a later finish_turn has nothing left.
                 self.fold_live_progress();
+                if matches!(self.compacting, Some(CompactPhase::Auto)) {
+                    self.compacting = None;
+                } else if self.pending_compact.is_some() {
+                    self.begin_compact(CompactPhase::Queued);
+                }
             }
             "loop.turn" | "turn" => {
                 // Fallback when the host omitted `loop.token` deltas: the
@@ -2371,6 +2507,32 @@ impl App {
                         self.scroll = u16::MAX;
                     }
                 }
+            }
+            EVENT_COMPACT_START | "compact.start" => {
+                let auto = params.get("auto").and_then(Value::as_bool).unwrap_or(false);
+                if auto {
+                    self.begin_compact(CompactPhase::Auto);
+                } else if !matches!(self.compacting, Some(CompactPhase::Manual)) {
+                    self.begin_compact(CompactPhase::Manual);
+                }
+            }
+            EVENT_COMPACT | "compact" => {
+                let auto = params.get("auto").and_then(Value::as_bool).unwrap_or(false)
+                    || matches!(self.compacting, Some(CompactPhase::Auto));
+                let before = params
+                    .get("messages_before")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let after = params
+                    .get("messages_after")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(0);
+                let layer = params.get("layer").and_then(Value::as_str).unwrap_or("");
+                let over = params
+                    .get("over_budget")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                self.finish_compact(compact_done_note(auto, before, after, layer, over));
             }
             k if k == EVENT_LSP_DIAGNOSTICS || k.ends_with("lsp.diagnostics") => {
                 if let Some(problems) = decode_lsp_diagnostics(params) {
@@ -2904,6 +3066,10 @@ impl App {
 
     pub fn search(&mut self, term: &str) -> Option<(usize, usize)> {
         let term = term.trim();
+        if term.is_empty() && self.search_term.is_empty() {
+            self.status = "usage: /search <term>".into();
+            return None;
+        }
         if !term.is_empty() && term != self.search_term {
             self.search_term = term.to_string();
             self.search_hits = self
@@ -2934,6 +3100,17 @@ impl App {
             .min(u16::MAX as usize) as u16;
         self.status = format!("{}/{}", self.search_cursor + 1, self.search_hits.len());
         Some((self.search_cursor + 1, self.search_hits.len()))
+    }
+
+    fn current_search_hit(&self) -> Option<usize> {
+        self.search_hits.get(self.search_cursor).copied()
+    }
+
+    fn highlight_search_hit(&self, index: usize, lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+        if self.current_search_hit() != Some(index) || self.search_term.is_empty() {
+            return lines;
+        }
+        highlight_term_in_lines(lines, &self.search_term, self.theme.match_hit())
     }
 
     pub fn permission_decision(
@@ -3017,6 +3194,10 @@ impl App {
             Overlay::Completions { items, .. } => self.filter_completions(items).len(),
             _ => 0,
         };
+        let skill_len = match &self.overlay {
+            Overlay::Skills { items, .. } => self.filter_skills(items).len(),
+            _ => 0,
+        };
         let peer_len = self.filter_peers(&self.peer_agents()).len();
         match &mut self.overlay {
             Overlay::Help(state) => step_table(state, help_len, delta),
@@ -3024,6 +3205,7 @@ impl App {
             Overlay::Models { state, .. } => step_list(state, model_len, delta),
             Overlay::Efforts { state, .. } => step_list(state, effort_len, delta),
             Overlay::Completions { state, .. } => step_list(state, completion_len, delta),
+            Overlay::Skills { state, .. } => step_list(state, skill_len, delta),
             Overlay::PeerPicker { state } => step_list(state, peer_len, delta),
             Overlay::Peer => {
                 if delta < 0 {
@@ -3058,6 +3240,10 @@ impl App {
             }
             Overlay::Completions { items, state } => {
                 let idx = *self.filter_completions(items).get(state.selected()?)?;
+                items.get(idx).cloned()
+            }
+            Overlay::Skills { items, state } => {
+                let idx = *self.filter_skills(items).get(state.selected()?)?;
                 items.get(idx).cloned()
             }
             Overlay::PeerPicker { state } => {
@@ -3125,6 +3311,15 @@ impl App {
             .collect()
     }
 
+    fn filter_skills(&self, items: &[String]) -> Vec<usize> {
+        items
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| self.query_matches(name))
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
     fn filter_peers(&self, agents: &[String]) -> Vec<usize> {
         agents
             .iter()
@@ -3171,6 +3366,10 @@ impl App {
             Overlay::Completions { items, .. } => self.filter_completions(items).len(),
             _ => 0,
         };
+        let skill_len = match &self.overlay {
+            Overlay::Skills { items, .. } => self.filter_skills(items).len(),
+            _ => 0,
+        };
         let peer_len = self.filter_peers(&self.peer_agents()).len();
         match &mut self.overlay {
             Overlay::Help(state) => *state = select_table(help_len, 0),
@@ -3178,6 +3377,7 @@ impl App {
             Overlay::Models { state, .. } => *state = select_list(model_len, 0),
             Overlay::Efforts { state, .. } => *state = select_list(effort_len, 0),
             Overlay::Completions { state, .. } => *state = select_list(completion_len, 0),
+            Overlay::Skills { state, .. } => *state = select_list(skill_len, 0),
             Overlay::PeerPicker { state } => *state = select_list(peer_len, 0),
             Overlay::Peer | Overlay::None => {}
         }
@@ -3788,12 +3988,67 @@ fn tool_result_diff(name: &str, result: Option<&str>) -> Option<String> {
 }
 
 fn lsp_diagnostic_text(path: &str, diagnostic: &LspDiagnostic) -> String {
-    let mut text = format!("lsp · {path}:{} {}", diagnostic.line, diagnostic.message);
+    let severity = if diagnostic.severity.is_empty() {
+        String::new()
+    } else {
+        format!("[{}] ", diagnostic.severity)
+    };
+    let mut text = format!(
+        "lsp · {path}:{} {severity}{}",
+        diagnostic.line, diagnostic.message
+    );
     if !diagnostic.source.is_empty() {
         text.push_str(" · ");
         text.push_str(&diagnostic.source);
     }
     text
+}
+
+fn highlight_term_in_lines(
+    lines: Vec<Line<'static>>,
+    term: &str,
+    hit: Style,
+) -> Vec<Line<'static>> {
+    let needle = term.to_lowercase();
+    if needle.is_empty() {
+        return lines;
+    }
+    lines
+        .into_iter()
+        .map(|line| {
+            let style = line.style;
+            let spans: Vec<Span<'static>> = line
+                .spans
+                .into_iter()
+                .flat_map(|span| highlight_term_in_span(span, &needle, hit))
+                .collect();
+            Line::from(spans).style(style)
+        })
+        .collect()
+}
+
+fn highlight_term_in_span(span: Span<'static>, needle: &str, hit: Style) -> Vec<Span<'static>> {
+    let text = span.content.as_ref();
+    let lower = text.to_lowercase();
+    if !lower.contains(needle) {
+        return vec![span];
+    }
+    let mut out = Vec::new();
+    let mut rest = text;
+    let mut rest_lower = lower.as_str();
+    while let Some(at) = rest_lower.find(needle) {
+        if at > 0 {
+            out.push(Span::styled(rest[..at].to_string(), span.style));
+        }
+        let end = at + needle.len();
+        out.push(Span::styled(rest[at..end].to_string(), span.style.patch(hit)));
+        rest = &rest[end..];
+        rest_lower = &rest_lower[end..];
+    }
+    if !rest.is_empty() {
+        out.push(Span::styled(rest.to_string(), span.style));
+    }
+    out
 }
 
 fn entry_text(entry: &Entry) -> String {
@@ -4364,6 +4619,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         Overlay::Models { list, state } => draw_models(frame, app, list, state, doc),
         Overlay::Efforts { list, state } => draw_efforts(frame, app, list, state, doc),
         Overlay::Completions { items, state } => draw_completions(frame, app, items, state, doc),
+        Overlay::Skills { items, state } => draw_skills(frame, app, items, state, doc),
         Overlay::Peer => draw_peer(frame, app, doc),
         Overlay::PeerPicker { state } => draw_peer_picker(frame, app, state, doc),
         Overlay::None => {}
@@ -5122,6 +5378,57 @@ fn draw_completions(
     frame.render_stateful_widget(widget, spot, state);
 }
 
+fn draw_skills(
+    frame: &mut Frame<'_>,
+    app: &App,
+    items: &[String],
+    state: &mut ListState,
+    area: Rect,
+) {
+    let shown = app.filter_skills(items);
+    let rows = shown.len().max(1) as u16;
+    let spot = overlay_list_spot(area, rows, 24, 48, 14);
+    frame.render_widget(Clear, spot);
+    let rows: Vec<ListItem<'static>> = if items.is_empty() {
+        vec![ListItem::new(Line::styled(
+            "no skills in this workspace",
+            app.theme.note().patch(app.theme.overlay()),
+        ))]
+    } else if shown.is_empty() {
+        vec![ListItem::new(Line::styled(
+            "no matches",
+            app.theme.note().patch(app.theme.overlay()),
+        ))]
+    } else {
+        shown
+            .iter()
+            .filter_map(|idx| items.get(*idx))
+            .map(|name| {
+                ListItem::new(Line::styled(
+                    name.clone(),
+                    app.theme.text().patch(app.theme.overlay()),
+                ))
+            })
+            .collect()
+    };
+    let note = app.overlay_filter_note(shown.len(), items.len());
+    let hint_note = if note.is_empty() {
+        "/skills <name>".to_string()
+    } else {
+        note
+    };
+    let widget = List::new(rows)
+        .highlight_symbol("▸ ")
+        .highlight_style(app.theme.selected())
+        .block(overlay_block_hint(
+            app,
+            "skills",
+            &[HINT_ENTER_SET, HINT_ESC_CLOSE],
+            &hint_note,
+        ));
+    frame.render_stateful_widget(widget, spot, state);
+}
+
 fn draw_peer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let agent = app.peer_focus.clone().unwrap_or_else(|| "peer".to_string());
     let raw = app.peers.get(&agent).map(String::as_str).unwrap_or("");
@@ -5442,16 +5749,14 @@ fn poll_slash(
                 match (kind.as_str(), result) {
                     ("compact", Ok(value)) => {
                         let rep = Client::decode_compact(&value);
-                        let saved = if rep.over_budget {
-                            " (still over budget)"
-                        } else {
-                            ""
-                        };
-                        app.entries.push(Entry::Note(format!(
-                            "compacted [{}]: {} -> {} messages, {} chars saved{saved}",
-                            rep.layer, rep.messages_before, rep.messages_after, rep.chars_saved
-                        )));
-                        app.status = format!("compacted · {} tokens · refreshing", rep.tokens);
+                        apply_compact_report(app, &rep, false);
+                        if !app.busy {
+                            app.status = if rep.messages_before == 0 && rep.layer.is_empty() {
+                                "nothing to compact".into()
+                            } else {
+                                format!("compacted · {} tokens · refreshing", rep.tokens)
+                            };
+                        }
                         match client.send("transcript", None) {
                             Ok(rx) => {
                                 *slash_rx = Some(rx);
@@ -5519,7 +5824,9 @@ fn poll_slash(
                                 }
                             }
                             None => {
-                                app.status = rewind_empty_status(follow).into();
+                                let msg = rewind_empty_status(follow);
+                                app.status = msg.into();
+                                app.entries.push(Entry::Note(msg.into()));
                                 *slash_rx = None;
                             }
                         }
@@ -5579,8 +5886,79 @@ fn poll_slash(
                     ("perm.set" | "perm.decide", Ok(_)) => {
                         *slash_rx = None;
                     }
+                    ("sessions", Ok(value)) => {
+                        match decode_sessions(&value) {
+                            Ok(sessions) => {
+                                if sessions.is_empty() {
+                                    app.status = "no sessions".into();
+                                    app.entries.push(Entry::Note("no sessions".into()));
+                                } else {
+                                    app.open_overlay(Overlay::sessions(sessions));
+                                    app.status = "sessions".into();
+                                }
+                            }
+                            Err(error) => {
+                                app.entries.push(Entry::Note(format!("sessions: {error}")));
+                                app.status = "sessions failed".into();
+                            }
+                        }
+                        *slash_rx = None;
+                    }
+                    ("transcript", Ok(value)) => {
+                        match crate::rpc::decode_transcript(&value) {
+                            Ok(messages) => {
+                                let n = messages.len();
+                                app.load_transcript(messages);
+                                let msg = format!("transcript reloaded · {n} message(s)");
+                                app.status = msg.clone();
+                                app.entries.push(Entry::Note(msg));
+                            }
+                            Err(error) => {
+                                app.entries
+                                    .push(Entry::Note(format!("transcript: {error}")));
+                                app.status = "transcript failed".into();
+                            }
+                        }
+                        *slash_rx = None;
+                    }
+                    ("status", Ok(value)) => {
+                        app.apply_status(&value);
+                        app.entries.push(Entry::Note(app.status_summary()));
+                        app.status = "status".into();
+                        *slash_rx = None;
+                    }
+                    ("context", Ok(value)) => {
+                        app.apply_context(&ContextUsage::from_value(&value));
+                        app.entries.push(Entry::Note(app.context_summary()));
+                        app.status = "context".into();
+                        *slash_rx = None;
+                    }
+                    ("skill.list", Ok(value)) => {
+                        let skills = decode_skill_list(&value);
+                        if skills.is_empty() {
+                            app.status = "no skills in this workspace".into();
+                            app.entries
+                                .push(Entry::Note("no skills in this workspace".into()));
+                        } else {
+                            app.open_overlay(Overlay::skills(skills));
+                            app.status = "skills".into();
+                        }
+                        *slash_rx = None;
+                    }
+                    ("skill.activate", Ok(value)) => {
+                        let (activated, unknown) = decode_skill_activate(&value);
+                        let msg = skill_activate_note(&activated, &unknown);
+                        app.status = msg.clone();
+                        app.entries.push(Entry::Note(msg));
+                        *slash_rx = None;
+                    }
                     (_, Err(error)) => {
-                        if kind.ends_with(".transcript") && kind.starts_with("rewind.") {
+                        if kind == "compact" {
+                            app.compacting = None;
+                            let msg = format!("compact failed: {error}");
+                            app.status = msg.clone();
+                            app.entries.push(Entry::Note(msg));
+                        } else if kind.ends_with(".transcript") && kind.starts_with("rewind.") {
                             app.drop_last_turn_entries();
                             apply_rewind_followup(
                                 app,
@@ -5588,14 +5966,18 @@ fn poll_slash(
                                 client,
                                 kind.strip_suffix(".transcript").unwrap_or(&kind),
                             );
+                            app.entries
+                                .push(Entry::Note(format!("operation failed: {error}")));
                         } else if kind.starts_with("rewind.") {
                             app.status = "rewind failed".into();
                             app.rewind_user = None;
+                            app.entries
+                                .push(Entry::Note(format!("operation failed: {error}")));
                         } else {
                             app.status = "operation failed".into();
+                            app.entries
+                                .push(Entry::Note(format!("operation failed: {error}")));
                         }
-                        app.entries
-                            .push(Entry::Note(format!("operation failed: {error}")));
                         *slash_rx = None;
                     }
                     _ => {
@@ -6006,12 +6388,21 @@ fn overlay_activate(
         Overlay::Models { .. } => "model",
         Overlay::Efforts { .. } => "effort",
         Overlay::Completions { .. } => "complete",
+        Overlay::Skills { .. } => "skill",
         Overlay::None => "none",
     };
     match picker {
         "close" => app.overlay = Overlay::None,
         "session" => {
             app.request_session_resume();
+        }
+        "skill" => {
+            app.overlay = Overlay::None;
+            if let Some(name) = selection {
+                *slash_rx = Some(client.request_skill_activate(&[name])?);
+                app.pending_local = Some("skill.activate".into());
+                app.status = "activating skills…".into();
+            }
         }
         "model" => {
             app.overlay = Overlay::None;
@@ -6059,6 +6450,40 @@ fn plan_compact(busy: bool, compact_is_control: bool) -> CompactPlan {
     }
 }
 
+fn compact_status(phase: CompactPhase) -> &'static str {
+    match phase {
+        CompactPhase::Queued => "compact queued",
+        CompactPhase::Manual => "compacting…",
+        CompactPhase::Auto => "auto-compact…",
+    }
+}
+
+fn compact_done_note(auto: bool, before: i64, after: i64, layer: &str, over: bool) -> String {
+    if before == 0 && after == 0 && layer.is_empty() {
+        return "nothing to compact".into();
+    }
+    let verb = if auto { "auto-compacted" } else { "compacted" };
+    let mut note = format!("{verb} · {before} → {after}");
+    if !layer.is_empty() {
+        note.push_str(" · ");
+        note.push_str(layer);
+    }
+    if over {
+        note.push_str(" · still over budget");
+    }
+    note
+}
+
+fn apply_compact_report(app: &mut App, rep: &CompactReport, auto: bool) {
+    app.finish_compact(compact_done_note(
+        auto,
+        rep.messages_before,
+        rep.messages_after,
+        &rep.layer,
+        rep.over_budget,
+    ));
+}
+
 fn start_compact(
     client: &mut Client,
     app: &mut App,
@@ -6068,7 +6493,7 @@ fn start_compact(
     let params = (max_chars > 0).then(|| serde_json::json!({ "max_chars": max_chars }));
     *slash_rx = Some(client.send("compact", params)?);
     app.pending_local = Some("compact".into());
-    app.status = "compacting…".into();
+    app.begin_compact(CompactPhase::Manual);
     Ok(())
 }
 
@@ -6130,9 +6555,6 @@ fn handle_slash(
         return Ok(());
     };
     let args: Vec<String> = words.map(ToString::to_string).collect();
-    if name == "perm" {
-        return handle_perm_slash(&args, client, app, slash_rx);
-    }
     match slash_route(name, &app.slash_commands) {
         SlashRoute::Quit => {
             if app.busy || turn.is_some() {
@@ -6213,13 +6635,15 @@ fn handle_slash(
                     app.status = "switching session…".into();
                 }
             } else {
-                let sessions = client.sessions(Duration::from_secs(20))?;
-                app.open_overlay(Overlay::sessions(sessions));
+                *slash_rx = Some(client.request_sessions()?);
+                app.pending_local = Some("sessions".into());
+                app.status = "listing sessions…".into();
             }
         }
         "transcript" => {
-            let messages = client.transcript(Duration::from_secs(20))?;
-            app.load_transcript(messages);
+            *slash_rx = Some(client.request_transcript()?);
+            app.pending_local = Some("transcript".into());
+            app.status = "reloading transcript…".into();
         }
         "model" => {
             if args.is_empty() {
@@ -6244,17 +6668,20 @@ fn handle_slash(
             }
         }
         "status" => {
-            let status = client.status(Duration::from_secs(20))?;
-            app.apply_status(&status);
-            app.entries.push(Entry::Note(app.status_summary()));
+            *slash_rx = Some(client.request_status()?);
+            app.pending_local = Some("status".into());
+            app.status = "reading status…".into();
         }
         "lsp" => {
             app.show_lsp_problems();
         }
+        "perm" => {
+            return handle_perm_slash(&args, client, app, slash_rx);
+        }
         "context" => {
-            let usage = client.context(Duration::from_secs(20))?;
-            app.apply_context(&usage);
-            app.entries.push(Entry::Note(app.context_summary()));
+            *slash_rx = Some(client.request_context()?);
+            app.pending_local = Some("context".into());
+            app.status = "reading context…".into();
         }
         "compact" => {
             let max_chars = args
@@ -6265,9 +6692,8 @@ fn handle_slash(
             match plan_compact(busy, app.compact_is_control()) {
                 CompactPlan::Defer => {
                     app.pending_compact = Some(max_chars);
-                    let msg = "compact · applies when the turn finishes";
-                    app.status = msg.into();
-                    app.entries.push(Entry::Note(msg.into()));
+                    app.begin_compact(CompactPhase::Queued);
+                    app.entries.push(Entry::Note("compact queued".into()));
                 }
                 CompactPlan::Send => {
                     start_compact(client, app, slash_rx, max_chars)?;
@@ -6279,26 +6705,13 @@ fn handle_slash(
         }
         "skills" => {
             if args.is_empty() {
-                let skills = client.skill_list(Duration::from_secs(20))?;
-                if skills.is_empty() {
-                    app.status = "no skills in this workspace".into();
-                } else {
-                    app.entries
-                        .push(Entry::Note(format!("skills: {}", skills.join(", "))));
-                }
+                *slash_rx = Some(client.request_skill_list()?);
+                app.pending_local = Some("skill.list".into());
+                app.status = "listing skills…".into();
             } else {
-                let (activated, unknown) = client.skill_activate(&args, Duration::from_secs(20))?;
-                let mut msg = String::new();
-                if !activated.is_empty() {
-                    msg.push_str(&format!("activated: {}", activated.join(", ")));
-                }
-                if !unknown.is_empty() {
-                    if !msg.is_empty() {
-                        msg.push_str(" · ");
-                    }
-                    msg.push_str(&format!("unknown: {}", unknown.join(", ")));
-                }
-                app.entries.push(Entry::Note(msg));
+                *slash_rx = Some(client.request_skill_activate(&args)?);
+                app.pending_local = Some("skill.activate".into());
+                app.status = "activating skills…".into();
             }
         }
         "steer" => {
@@ -6337,16 +6750,19 @@ fn start_rewind(
     follow: &str,
 ) -> Result<(), Error> {
     if app.busy || turn.is_some() {
-        app.status = match follow {
+        let msg = match follow {
             "rewind.retry" => "retry · wait for the current turn to finish",
             "rewind.edit" => "edit · wait for the current turn to finish",
             _ => "rewind · wait for the current turn to finish",
-        }
-        .into();
+        };
+        app.status = msg.into();
+        app.entries.push(Entry::Note(msg.into()));
         return Ok(());
     }
     if !app.supports("rewind") {
-        app.status = "rewind is not supported by this host".into();
+        let msg = "rewind is not supported by this host";
+        app.status = msg.into();
+        app.entries.push(Entry::Note(msg.into()));
         return Ok(());
     }
     *slash_rx = Some(client.request_rewind()?);
@@ -6396,6 +6812,24 @@ fn apply_rewind_followup(
             app.status = "rewound — edit and send again".into();
         }
         _ => {}
+    }
+}
+
+fn skill_activate_note(activated: &[String], unknown: &[String]) -> String {
+    let mut msg = String::new();
+    if !activated.is_empty() {
+        msg.push_str(&format!("activated: {}", activated.join(", ")));
+    }
+    if !unknown.is_empty() {
+        if !msg.is_empty() {
+            msg.push_str(" · ");
+        }
+        msg.push_str(&format!("unknown: {}", unknown.join(", ")));
+    }
+    if msg.is_empty() {
+        "no skills activated".into()
+    } else {
+        msg
     }
 }
 
@@ -6517,6 +6951,12 @@ mod tests {
             "effort_set",
             "perm_set",
             "perm_decide",
+            "sessions",
+            "transcript",
+            "status",
+            "context",
+            "skill_list",
+            "skill_activate",
         ] {
             let blocking = format!("client.{method}(");
             assert!(
@@ -7753,13 +8193,14 @@ mod tests {
         );
         assert!(out.contains("pgup / pgdn"), "{out}");
         assert!(out.contains("↑ / ↓"), "{out}");
+        let names: Vec<_> = app.help_rows().into_iter().map(|(name, _)| name).collect();
         assert!(
-            out.contains("/edit"),
-            "last-prompt recall is /edit, not arrow keys: {out}"
+            names.iter().any(|row| row == "/edit"),
+            "last-prompt recall is /edit, not arrow keys: {names:?}"
         );
         assert!(
-            out.contains("/steer"),
-            "steer must be advertised as a local command: {out}"
+            names.iter().any(|row| row == "/steer"),
+            "steer must be advertised as a local command: {names:?}"
         );
         assert!(
             !out.contains("browse prior"),
@@ -7772,10 +8213,14 @@ mod tests {
         }
         let tail = render(&mut app, 70, 24);
         assert!(tail.contains("/review"), "{tail}");
-        assert!(tail.contains("/model"), "{tail}");
-        assert!(tail.contains("/quit"), "{tail}");
-        assert!(tail.contains("/lsp"), "{tail}");
-        assert!(tail.contains("/status"), "{tail}");
+        assert!(tail.contains("/resume"), "{tail}");
+        assert!(tail.contains("/undo"), "{tail}");
+        for name in ["/search", "/copy", "/retry", "/resume", "/edit", "/model"] {
+            assert!(
+                names.iter().any(|row| row == name),
+                "{name} missing from help: {names:?}"
+            );
+        }
         assert!(!out.contains("ctrl+s"), "{out}");
 
         assert!(app.dismiss_overlay());
@@ -7792,8 +8237,11 @@ mod tests {
         assert!(joined.contains("/clear"), "{joined}");
         assert!(joined.contains("/status"), "{joined}");
         assert!(joined.contains("/quit"), "{joined}");
+        assert!(joined.contains("/search"), "{joined}");
+        assert!(joined.contains("/copy"), "{joined}");
         for name in [
             "/steer", "/compact", "/model", "/lsp", "/skills", "/goal", "/btw", "/edit",
+            "/retry", "/resume",
         ] {
             assert!(
                 !names.iter().any(|row| row == name),
@@ -7888,6 +8336,17 @@ mod tests {
         assert!(app.request_session_resume());
         assert_eq!(app.pending_resume.as_deref(), Some("s-42"));
         assert_eq!(app.overlay, Overlay::None);
+    }
+
+    #[test]
+    fn skills_overlay_lists_names() {
+        let mut app = App::new(SessionInfo::default());
+        app.open_overlay(Overlay::skills(vec!["review".into(), "docs".into()]));
+        let out = render(&mut app, 60, 16);
+        assert!(out.contains("review"), "{out}");
+        assert!(out.contains("docs"), "{out}");
+        assert!(out.contains("/skills <name>"), "{out}");
+        assert_eq!(app.overlay_selection().as_deref(), Some("review"));
     }
 
     #[test]
@@ -8354,6 +8813,7 @@ mod tests {
     #[test]
     fn context_chip_paints_its_pressure_tone_in_the_header() {
         let mut app = App::new(SessionInfo::default());
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
         app.ctx = Some(ContextUsage {
             tokens: 9_500,
             context_window: Some(10_000),
@@ -8369,7 +8829,9 @@ mod tests {
         assert!(chip.content.contains("9.5k/10k ctx"), "{}", chip.content);
         assert!(!chip.content.contains('%'), "{}", chip.content);
         // At 95% the size chip must not look like ordinary chrome.
-        assert_eq!(chip.style.fg, app.theme.badge(Tone::Error).fg);
+        let want = app.theme.ctx_style(95.0);
+        assert_eq!(chip.style.fg, want.fg);
+        assert_eq!(chip.style.bg, want.bg);
     }
 
     #[test]
@@ -8396,6 +8858,22 @@ mod tests {
         assert_eq!(app.context_tone(), Tone::Muted);
 
         app.ctx = Some(ContextUsage {
+            tokens: 6_900,
+            context_window: Some(10_000),
+            percent: Some(69.0),
+            remaining: Some(3_100),
+        });
+        assert_eq!(app.context_tone(), Tone::Muted);
+
+        app.ctx = Some(ContextUsage {
+            tokens: 7_000,
+            context_window: Some(10_000),
+            percent: Some(70.0),
+            remaining: Some(3_000),
+        });
+        assert_eq!(app.context_tone(), Tone::Warn);
+
+        app.ctx = Some(ContextUsage {
             tokens: 8_000,
             context_window: Some(10_000),
             percent: Some(80.0),
@@ -8403,6 +8881,14 @@ mod tests {
         });
         assert_eq!(app.context_chip().as_deref(), Some("8k/10k ctx"));
         assert_eq!(app.context_tone(), Tone::Warn);
+
+        app.ctx = Some(ContextUsage {
+            tokens: 8_500,
+            context_window: Some(10_000),
+            percent: Some(85.0),
+            remaining: Some(1_500),
+        });
+        assert_eq!(app.context_tone(), Tone::Error);
 
         app.ctx = Some(ContextUsage {
             tokens: 9_500,
@@ -8780,6 +9266,70 @@ mod tests {
         };
         assert!(last.contains("newest"), "{last}");
         assert!(last.contains("src/app.rs:9"), "{last}");
+        assert!(last.contains("[error]"), "{last}");
+        assert_eq!(app.lsp_chip_text().as_deref(), Some("1 problem"));
+    }
+
+    #[test]
+    fn lsp_empty_dump_says_why() {
+        let mut app = App::new(SessionInfo::default());
+        app.show_lsp_problems();
+        let last = match app.entries.last() {
+            Some(Entry::Note(text)) => text.as_str(),
+            other => panic!("expected note, got {other:?}"),
+        };
+        assert!(
+            last.contains("has not sent diagnostics"),
+            "{last}"
+        );
+
+        app.features.insert("lsp".into(), true);
+        app.show_lsp_problems();
+        let last = match app.entries.last() {
+            Some(Entry::Note(text)) => text.as_str(),
+            other => panic!("expected note, got {other:?}"),
+        };
+        assert!(last.contains("no diagnostics yet"), "{last}");
+    }
+
+    #[test]
+    fn lsp_chip_shows_when_diagnostics_exist() {
+        let mut app = App::new(SessionInfo {
+            model: "gpt-5-mini".into(),
+            ..Default::default()
+        });
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
+        app.on_notification(&Notification {
+            method: "event".into(),
+            params: serde_json::json!({
+                "type": "harness.lsp.diagnostics",
+                "path": "src/app.rs",
+                "count": 2,
+                "diagnostics": [
+                    {"severity": "error", "message": "x", "line": 1}
+                ]
+            }),
+        });
+        assert_eq!(app.lsp_chip_text().as_deref(), Some("2 problems"));
+        let head = header_text(&app, 80);
+        assert!(head.contains("2 problems"), "{head}");
+        let foot = footer_text(&app, 80);
+        assert!(foot.contains("2 problems"), "{foot}");
+    }
+
+    #[test]
+    fn typed_perm_is_host_gated() {
+        let mut app = App::new(SessionInfo::default());
+        assert!(!app.command_offered("perm"));
+        let names: Vec<_> = app.help_rows().into_iter().map(|(name, _)| name).collect();
+        assert!(
+            !names.iter().any(|row| row == "/perm"),
+            "perm leaked: {names:?}"
+        );
+        app.set_capabilities(&["perm.set".into()]);
+        assert!(app.command_offered("perm"));
+        let names: Vec<_> = app.help_rows().into_iter().map(|(name, _)| name).collect();
+        assert!(names.iter().any(|row| row == "/perm"), "{names:?}");
     }
 
     #[test]
@@ -8792,13 +9342,166 @@ mod tests {
         assert!(!app.compact_is_control());
         app.busy = true;
         app.pending_compact = Some(0);
-        let msg = "compact · applies when the turn finishes";
-        app.status = msg.into();
-        app.entries.push(Entry::Note(msg.into()));
+        app.begin_compact(CompactPhase::Queued);
+        app.entries.push(Entry::Note("compact queued".into()));
         assert_eq!(app.pending_compact, Some(0));
+        assert_eq!(app.compact_chip_text().as_deref(), Some("compact queued"));
+        assert!(app.footer().contains("compact queued"));
 
         app.set_control_methods(&["compact".into()]);
         assert!(app.compact_is_control());
+    }
+
+    fn compact_event(kind: &str, auto: bool, before: i64, after: i64) -> Notification {
+        Notification {
+            method: "event".into(),
+            params: serde_json::json!({
+                "type": kind,
+                "auto": auto,
+                "messages_before": before,
+                "messages_after": after,
+                "layer": "drop",
+            }),
+        }
+    }
+
+    #[test]
+    fn compact_in_progress_chrome_is_distinct_from_busy() {
+        let mut app = App::new(SessionInfo::default());
+        app.animate = false;
+        assert!(app.compact_chip_text().is_none());
+        assert!(app.footer().contains("idle"));
+
+        app.begin_compact(CompactPhase::Manual);
+        assert_eq!(app.status, "compacting…");
+        assert_eq!(app.compact_chip_text().as_deref(), Some("compacting…"));
+        let footer = app.footer();
+        assert!(footer.contains("compacting…"), "{footer}");
+        assert!(!footer.contains("idle"), "{footer}");
+        let header = app
+            .header_line(120)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(header.contains("compacting…"), "{header}");
+
+        app.begin_compact(CompactPhase::Auto);
+        assert_eq!(app.compact_chip_text().as_deref(), Some("auto-compact…"));
+        assert!(app.footer().contains("auto-compact…"));
+
+        app.busy = true;
+        app.activity_started = Some(Instant::now());
+        app.compacting = Some(CompactPhase::Queued);
+        let footer = app.footer();
+        assert!(footer.contains("compact queued"), "{footer}");
+        assert!(app.activity().contains('●'), "{}", app.activity());
+    }
+
+    #[test]
+    fn compact_done_and_empty_notes() {
+        assert_eq!(
+            compact_done_note(false, 12, 5, "drop", false),
+            "compacted · 12 → 5 · drop"
+        );
+        assert_eq!(
+            compact_done_note(true, 20, 8, "snip", true),
+            "auto-compacted · 20 → 8 · snip · still over budget"
+        );
+        assert_eq!(compact_done_note(false, 0, 0, "", false), "nothing to compact");
+
+        let mut app = App::new(SessionInfo::default());
+        app.begin_compact(CompactPhase::Manual);
+        app.finish_compact(compact_done_note(false, 12, 5, "drop", false));
+        assert!(app.compacting.is_none());
+        assert_eq!(app.status, "compacted · 12 → 5 · drop");
+        assert!(
+            app.entries
+                .iter()
+                .any(|e| matches!(e, Entry::Note(n) if n == "compacted · 12 → 5 · drop"))
+        );
+        // Second finish is a no-op (event + RPC must not double-note).
+        app.finish_compact("compacted · 12 → 5 · drop".into());
+        let notes: Vec<_> = app
+            .entries
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Note(n) => Some(n.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notes, ["compacted · 12 → 5 · drop"]);
+    }
+
+    #[test]
+    fn compact_start_and_end_events_drive_chrome() {
+        let mut app = App::new(SessionInfo::default());
+        app.busy = true;
+        app.on_notification(&compact_event(EVENT_COMPACT_START, true, 0, 0));
+        assert_eq!(app.compacting, Some(CompactPhase::Auto));
+        assert_eq!(app.compact_chip_text().as_deref(), Some("auto-compact…"));
+        assert!(app.footer().contains("auto-compact…"));
+
+        app.on_notification(&compact_event(EVENT_COMPACT, true, 30, 12));
+        assert!(app.compacting.is_none());
+        assert!(
+            app.entries
+                .iter()
+                .any(|e| matches!(e, Entry::Note(n) if n == "auto-compacted · 30 → 12 · drop"))
+        );
+    }
+
+    #[test]
+    fn context_chip_color_follows_fill_thresholds() {
+        let mut app = App::new(SessionInfo::default());
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
+
+        app.ctx = Some(ContextUsage {
+            tokens: 1_000,
+            context_window: Some(10_000),
+            percent: Some(10.0),
+            remaining: Some(9_000),
+        });
+        let chip = app
+            .header_line(120)
+            .spans
+            .into_iter()
+            .find(|s| s.content.contains("ctx"))
+            .expect("ctx chip");
+        assert_eq!(
+            chip.style.fg,
+            app.theme.ctx_style(10.0).patch(app.theme.header_bg()).fg
+        );
+
+        app.ctx = Some(ContextUsage {
+            tokens: 7_500,
+            context_window: Some(10_000),
+            percent: Some(75.0),
+            remaining: Some(2_500),
+        });
+        let chip = app
+            .header_line(120)
+            .spans
+            .into_iter()
+            .find(|s| s.content.contains("ctx"))
+            .expect("ctx chip");
+        assert_eq!(chip.style.fg, Some(app.theme.palette.peach));
+
+        app.ctx = Some(ContextUsage {
+            tokens: 9_000,
+            context_window: Some(10_000),
+            percent: Some(90.0),
+            remaining: Some(1_000),
+        });
+        let chip = app
+            .header_line(120)
+            .spans
+            .into_iter()
+            .find(|s| s.content.contains("ctx"))
+            .expect("ctx chip");
+        let want = app.theme.ctx_hot();
+        assert_eq!(chip.style.fg, want.fg);
+        assert_eq!(chip.style.bg, want.bg);
     }
 
     #[test]
@@ -8905,6 +9608,47 @@ mod tests {
             add_bg,
             "pad after add text"
         );
+    }
+
+    #[test]
+    fn latte_user_and_add_bands_use_latte_palette() {
+        let mut app = App::new(SessionInfo {
+            model: "gpt-5-mini".into(),
+            ..Default::default()
+        });
+        app.theme = Theme::colored(ThemeName::CatppuccinLatte);
+        app.entries.push(Entry::user("hi"));
+        app.entries.push(Entry::Assistant(
+            "--- a/x.go\n+++ b/x.go\n@@ -1 +1 @@\n-old\n+new".into(),
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let p = app.theme.palette;
+        let header = (0..60)
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect::<String>();
+        let title_x = header.find("mowi").expect("header title") as u16;
+        assert_eq!(buf[(title_x, 0)].fg, p.accent, "header title uses latte mauve");
+        let mut saw_user = false;
+        let mut saw_add = false;
+        for y in 0..16u16 {
+            for x in 0..60u16 {
+                let cell = &buf[(x, y)];
+                if cell.symbol() == "▎" {
+                    assert_eq!(cell.fg, p.rail, "rail");
+                    assert_eq!(cell.bg, p.surface, "user band");
+                    saw_user = true;
+                }
+                if cell.bg == p.diff.add_band {
+                    saw_add = true;
+                }
+            }
+        }
+        assert!(saw_user, "latte user rail not painted");
+        assert!(saw_add, "latte add band not painted");
+        assert_ne!(p.diff.add_band, crate::theme::mocha::ADD_BAND);
+        assert_ne!(p.rail, crate::theme::mocha::LAVENDER);
     }
 
     #[test]
@@ -9780,6 +10524,30 @@ mod tests {
         assert!(app.edit_last_prompt());
         assert_eq!(app.input, "find this");
         assert_eq!(app.last_user_prompt().as_deref(), Some("find this"));
+    }
+
+    #[test]
+    fn search_highlights_the_current_hit() {
+        let mut app = App::new(SessionInfo::default());
+        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
+        app.entries.push(Entry::user("find this"));
+        app.entries.push(Entry::Assistant("other".into()));
+        assert_eq!(app.search("find"), Some((1, 1)));
+        let mut terminal = Terminal::new(TestBackend::new(60, 16)).unwrap();
+        terminal.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let hit = app.theme.match_hit();
+        let mut saw = false;
+        for y in 0..16u16 {
+            for x in 0..60u16 {
+                if buf[(x, y)].bg == hit.bg.unwrap_or(Color::Reset)
+                    && buf[(x, y)].symbol().eq_ignore_ascii_case("f")
+                {
+                    saw = true;
+                }
+            }
+        }
+        assert!(saw, "current search hit was not highlighted");
     }
 
     #[test]

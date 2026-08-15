@@ -160,24 +160,32 @@ const COMPLETIONS: &[&str] = &[
     "exit",
 ];
 
-/// Help text for offered local commands.
+/// Help text for offered local commands. Keep in sync with `COMPLETIONS`
+/// (aliases like `/find` stay off this list; their canonical name is enough).
 pub const LOCAL_HELP: &[(&str, &str)] = &[
+    ("/help", "this help"),
+    ("/search", "find in transcript — repeat to cycle"),
+    ("/copy", "copy last assistant reply"),
     ("/edit", "rewind last turn into the composer"),
+    ("/retry", "rewind and resend the last prompt"),
     ("/steer", "guide the running turn (while busy)"),
     ("/btw", "aside — not added to context"),
     ("/model", "list models, or /model <id> to set"),
     ("/effort", "list efforts, or /effort high to set"),
     ("/clear", "clear transcript (engine history kept)"),
     ("/quit", "quit"),
+    ("/exit", "quit"),
     ("/status", "session summary"),
     ("/lsp", "recent diagnostics"),
     ("/perm", "set ask / auto mode"),
     ("/compact", "compact history"),
     ("/context", "context window usage"),
     ("/sessions", "list resumable sessions"),
+    ("/resume", "resume a session, or /resume <id>"),
     ("/transcript", "reload engine history"),
     ("/skills", "list or activate skills"),
     ("/rewind", "drop the last exchange"),
+    ("/undo", "drop the last exchange"),
 ];
 
 fn available(rule: Availability, host: &HostOffer<'_>) -> bool {
@@ -539,6 +547,18 @@ mod tests {
         assert!(!command_offered("model", &host));
         assert!(!command_offered("lsp", &host));
         assert!(!command_offered("btw", &host));
+    }
+
+    #[test]
+    fn help_lists_every_completion_name() {
+        for name in COMPLETIONS {
+            assert!(
+                LOCAL_HELP
+                    .iter()
+                    .any(|(cmd, _)| cmd.trim_start_matches('/') == *name),
+                "/{name} is offered in completions but missing from LOCAL_HELP"
+            );
+        }
     }
 
     #[test]

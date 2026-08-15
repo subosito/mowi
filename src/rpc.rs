@@ -654,6 +654,8 @@ fn ascii_lower(s: &str) -> String {
 }
 
 /// Frozen host event types for in-session Goal progress (`graph.goal.*`).
+pub const EVENT_COMPACT_START: &str = "loop.compact.start";
+pub const EVENT_COMPACT: &str = "loop.compact";
 pub const EVENT_GOAL_START: &str = "graph.goal.start";
 pub const EVENT_GOAL_STEP: &str = "graph.goal.step";
 pub const EVENT_GOAL_DONE: &str = "graph.goal.done";
@@ -1054,12 +1056,14 @@ impl Client {
     }
 
     /// Return the resumable sessions known to the host.
+    #[allow(dead_code)] // synchronous API retained for non-TUI callers
     pub fn sessions(&mut self, timeout: Duration) -> Result<Vec<SessionSummary>, Error> {
         let value = self.call("sessions", None, timeout)?;
         decode_sessions(&value)
     }
 
     /// Return the stored transcript.
+    #[allow(dead_code)] // synchronous API retained for non-TUI callers
     pub fn transcript(&mut self, timeout: Duration) -> Result<Vec<TranscriptMessage>, Error> {
         let value = self.call("transcript", None, timeout)?;
         decode_transcript(&value)
@@ -1165,6 +1169,7 @@ impl Client {
     }
 
     /// Return the current status object.
+    #[allow(dead_code)] // synchronous API retained for non-TUI callers
     pub fn status(&mut self, timeout: Duration) -> Result<Value, Error> {
         self.call("status", None, timeout)
     }
@@ -1215,6 +1220,7 @@ impl Client {
     }
 
     /// Context-window usage for the header chip. Control method: answered while busy.
+    #[allow(dead_code)] // synchronous API retained for non-TUI callers
     pub fn context(&mut self, timeout: Duration) -> Result<ContextUsage, Error> {
         let value = self.call("context", None, timeout)?;
         Ok(ContextUsage::from_value(&value))
@@ -1283,6 +1289,34 @@ impl Client {
         self.send("transcript", None)
     }
 
+    /// Non-blocking `sessions` list for the picker overlay.
+    pub fn request_sessions(&mut self) -> Result<Receiver<Result<Value, Error>>, Error> {
+        self.send("sessions", None)
+    }
+
+    /// Non-blocking `status` for `/status`.
+    pub fn request_status(&mut self) -> Result<Receiver<Result<Value, Error>>, Error> {
+        self.send("status", None)
+    }
+
+    /// Non-blocking `skill.list`.
+    pub fn request_skill_list(&mut self) -> Result<Receiver<Result<Value, Error>>, Error> {
+        self.send("skill.list", None)
+    }
+
+    /// Non-blocking `skill.activate`.
+    pub fn request_skill_activate(
+        &mut self,
+        names: &[String],
+    ) -> Result<Receiver<Result<Value, Error>>, Error> {
+        if names.is_empty() {
+            return Err(Error::Protocol(
+                "skill.activate needs at least one name".into(),
+            ));
+        }
+        self.send("skill.activate", Some(json!({ "names": names })))
+    }
+
     /// Non-blocking `model.set`.
     pub fn request_model_set(&mut self, id: &str) -> Result<Receiver<Result<Value, Error>>, Error> {
         let id = id.trim();
@@ -1333,21 +1367,14 @@ impl Client {
     }
 
     /// Skills available in this workspace.
+    #[allow(dead_code)] // synchronous API retained for non-TUI callers
     pub fn skill_list(&mut self, timeout: Duration) -> Result<Vec<String>, Error> {
         let value = self.call("skill.list", None, timeout)?;
-        Ok(value
-            .get("skills")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            })
-            .unwrap_or_default())
+        Ok(decode_skill_list(&value))
     }
 
     /// Activate skills by name; returns `(activated, unknown)`.
+    #[allow(dead_code)] // synchronous API retained for non-TUI callers
     pub fn skill_activate(
         &mut self,
         names: &[String],
@@ -1359,19 +1386,7 @@ impl Client {
             ));
         }
         let value = self.call("skill.activate", Some(json!({ "names": names })), timeout)?;
-        let pick = |key: &str| -> Vec<String> {
-            value
-                .get(key)
-                .and_then(Value::as_array)
-                .map(|a| {
-                    a.iter()
-                        .filter_map(Value::as_str)
-                        .map(str::to_string)
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-        Ok((pick("activated"), pick("unknown")))
+        Ok(decode_skill_activate(&value))
     }
 
     /// Start a turn. The result arrives later (the channel stays open while
@@ -1506,6 +1521,35 @@ pub fn decode_sessions(value: &Value) -> Result<Vec<SessionSummary>, Error> {
             })
         })
         .collect()
+}
+
+pub fn decode_skill_list(value: &Value) -> Vec<String> {
+    value
+        .get("skills")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn decode_skill_activate(value: &Value) -> (Vec<String>, Vec<String>) {
+    let pick = |key: &str| -> Vec<String> {
+        value
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    (pick("activated"), pick("unknown"))
 }
 
 pub fn decode_transcript(value: &Value) -> Result<Vec<TranscriptMessage>, Error> {
@@ -1829,6 +1873,21 @@ mod tests {
             }))
             .is_none()
         );
+    }
+
+    #[test]
+    fn decode_skill_list_and_activate() {
+        assert_eq!(
+            decode_skill_list(&serde_json::json!({"skills": ["review", "docs"]})),
+            vec!["review".to_string(), "docs".to_string()]
+        );
+        assert!(decode_skill_list(&serde_json::json!({})).is_empty());
+        let (activated, unknown) = decode_skill_activate(&serde_json::json!({
+            "activated": ["review"],
+            "unknown": ["nope"]
+        }));
+        assert_eq!(activated, vec!["review".to_string()]);
+        assert_eq!(unknown, vec!["nope".to_string()]);
     }
 
     #[test]
