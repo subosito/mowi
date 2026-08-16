@@ -48,7 +48,7 @@ resume with `--session` / `--continue` on the next launch.
 |---|---|---|
 | Role | Native host protocol | Foreign agents / editors |
 | Perm | `perm.ask` + y/n/always with tool args | Peer-defined `session/request_permission` |
-| Slash | `/review`, `/sec` on **this** Engine | Not a thing |
+| Slash | pack names from `slash.list` (`/review`, `/sec`, `/goal`, …) on **this** Engine | Not a thing |
 | Usage | `prompt.usage` + `EventDelegateUsage` | Often omitted by external peers |
 | Who owns peers | Engine | — |
 
@@ -71,12 +71,12 @@ Workspace trust (`mow trust` / `mowi trust` / `mowi --trust`) stays
 out-of-band. mowi shells out to `mow trust` and does not invent a second
 trust store.
 
-`--allow-write` / `--allow-shell` / `--ask` / `--auto` / `--extra-root` are
-**engine flags** passed through to `mow rpc`. `--extra-root` is repeatable
-and uses mow's spec: `PATH`, `PATH:ro`, or explicit `PATH:rw`. `--ask` /
-`--auto` are forwarded only when present on the CLI. After connect,
-`perm.set` mirrors the resolved mode (CLI > `$MOW_PERMISSION_MODE` >
-`extensions.mowi` > ask) so the UI and Engine agree.
+`--allow-write` / `--allow-shell` / `--extra-root` are **engine flags** passed
+through to `mow rpc`. `--extra-root` is repeatable and uses mow's spec: `PATH`,
+`PATH:ro`, or explicit `PATH:rw`. `--ask` / `--auto` are mowi permission-mode
+inputs, not `mow rpc` flags; after connect, `perm.set` mirrors the resolved
+mode (CLI > `$MOW_PERMISSION_MODE` > `extensions.mowi` > ask) so the UI and
+Engine agree.
 
 UI config is `extensions.mowi` via additive `extension.config`
 `{name:"mowi"}` when advertised. mowi never opens the host YAML itself.
@@ -85,10 +85,13 @@ UI config is `extensions.mowi` via additive `extension.config`
 
 Slash commands exist only if the **mow binary** blank-imported the pack.
 `slash.list` is the source of truth for pack-discovered names (`/review`,
-`/sec`, `/goal`, …). This crate must not hard-code them or infer a stock
+`/sec`, `/goal`). This crate must not hard-code them or infer a stock
 build from an empty `version.methods` list. Help, completion, and
 behavior are gated by advertised `methods` / `control_methods` /
-`features` plus the cached `slash.list`.
+`features` plus the cached `slash.list`. **job** and **ops** never
+register slash (`/job`, `/ops` will not appear). Fleet clock is
+`mow job` / `mow ops run`; ops tools may still show in the session
+because they are tools, not slash.
 
 ## Rust client properties
 

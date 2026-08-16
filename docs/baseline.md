@@ -50,11 +50,16 @@ Host-side (this crate, or slash if registered):
 | `/quit` `/exit` `/q` | UI-local quit (cancels an in-flight turn first) |
 | `/model` | UI-local: `model.list` overlay (enter to set), or `/model gpt-5-mini` → `model.set` |
 | `/effort` | UI-local: `effort.list` overlay (enter to set), or `/effort high` → `effort.set` |
+| `/skills` | UI-local: `skill.list` overlay when advertised |
+| `/plugins` | UI-local: `plugin.list` overlay when advertised |
 | `/review` `/sec` `/goal` … | RPC `slash` — only if `slash.list` has them |
+
+There is **no** `/job` or `/ops`. Those packs are CLI (`mow job`, `mow ops`)
+and, for ops, session **tools**. Do not add them as mowi slash.
 
 Commands fall into three classes. Core local names (`/help`, `/quit`,
 `/clear`, `/search`, `/copy`, `/status`) are always offered. RPC-method-gated
-names (`/model`, `/effort`, `/steer`, `/compact`, `/skills`, …)
+names (`/model`, `/effort`, `/steer`, `/compact`, `/skills`, `/plugins`, …)
 appear in Help / completion only when `version` / `capabilities` advertised
 the backing method, feature, or event. Pack-discovered names stay dynamic
 via `slash.list` — `/goal` is never hardcoded. An empty method list does
@@ -161,6 +166,9 @@ CLI/env. Keys stay hard-coded.
 
 ## Out of scope for the Rust binary
 
-- `mowi acp` / `mowi review` as subcommands (call `mow`)
-- Implementing ACP
+- `mowi acp` / `mowi review` / `mowi goal` / `mowi sec` / `mowi job` /
+  `mowi ops` / `mowi lsp` as subcommands (call `mow`)
+- `/job` or `/ops` slash (clock stays `mow job` / `mow ops`)
+- In-TUI job or ops daemons
+- Implementing ACP or review ensemble (`mow review --reviewer`)
 - Embedding libmow via FFI

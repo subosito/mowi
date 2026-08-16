@@ -121,6 +121,7 @@ const LOCAL_OFFER: &[(&str, Availability)] = &[
         "skills",
         Availability::AnyMethod(&["skill.list", "skill.activate"]),
     ),
+    ("plugins", Availability::Method("plugin.list")),
     ("edit", Availability::Method("rewind")),
     ("retry", Availability::Method("rewind")),
     ("rewind", Availability::Method("rewind")),
@@ -148,6 +149,7 @@ const COMPLETIONS: &[&str] = &[
     "rewind",
     "undo",
     "skills",
+    "plugins",
     "steer",
     "btw",
     "perm",
@@ -178,6 +180,7 @@ pub const LOCAL_HELP: &[(&str, &str)] = &[
     ("/resume", "resume a session, or /resume <id>"),
     ("/transcript", "reload engine history"),
     ("/skills", "list or activate skills"),
+    ("/plugins", "list plugins"),
     ("/rewind", "drop the last exchange"),
     ("/undo", "drop the last exchange"),
 ];
@@ -475,7 +478,7 @@ mod tests {
             pack("perm"),
         ];
         for name in [
-            "context", "compact", "rewind", "undo", "skills", "perm",
+            "context", "compact", "rewind", "undo", "skills", "plugins", "perm",
         ] {
             assert_eq!(slash_route(name, &packs), SlashRoute::Local, "/{name}");
         }
@@ -513,7 +516,7 @@ mod tests {
         assert!(all.contains(&"status".into()), "{all:?}");
         assert!(all.contains(&"clear".into()), "{all:?}");
         for name in [
-            "compact", "steer", "skills", "model", "effort", "btw", "goal",
+            "compact", "steer", "skills", "plugins", "model", "effort", "btw", "goal",
         ] {
             assert!(!all.contains(&name.to_string()), "{name} leaked: {all:?}");
             assert!(!command_offered(name, &host), "{name}");
@@ -522,6 +525,22 @@ mod tests {
         assert!(msg.contains("unknown /compact"), "{msg}");
         assert!(!msg.contains("/steer"), "{msg}");
         assert!(!msg.contains("/goal"), "{msg}");
+    }
+
+    #[test]
+    fn plugins_are_offered_only_when_plugin_list_is_advertised() {
+        let features = BTreeMap::new();
+        let without_plugin_list = vec!["prompt".into()];
+        let without = empty_host(&without_plugin_list, &features);
+        assert_eq!(slash_route("plugins", &[]), SlashRoute::Local);
+        assert!(!command_offered("plugins", &without));
+        assert!(!slash_completions("", &[], &without).contains(&"plugins".into()));
+
+        let with_plugin_list = stock_methods();
+        let with = empty_host(&with_plugin_list, &features);
+        assert!(command_offered("plugins", &with));
+        assert!(slash_completions("", &[], &with).contains(&"plugins".into()));
+        assert!(LOCAL_HELP.iter().any(|(name, _)| *name == "/plugins"));
     }
 
     #[test]

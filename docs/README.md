@@ -2,15 +2,15 @@
 
 Mowi is the terminal interface for [mow](https://github.com/subosito/mow),
 built using Ratatui. This repository is a **client**. The agent loop, tools,
-path jail, sessions, ACP peers, and review/sec all live in the headless `mow`
-process.
+path jail, sessions, ACP peers, and pack-provided slash commands from
+`slash.list` all live in the headless `mow` process.
 
 ```
 [mowi — mow with interface]
         │  JSON-lines  (mow rpc, compatibility epoch 1)
         ▼
 [mow Engine] ── acp_delegate ──▶ Cursor / Gemini / mow acp
-        └── /review /sec, sessions, perm policy
+        └── slash.list, sessions, perm policy
 ```
 
 The former Go `packs/mowi` host has been retired. This Rust client is the maintained TUI over the additive RPC contract.
@@ -33,12 +33,12 @@ devenv shell -- cargo run -- --help
 
 mowi spawns `mow rpc` by default (with supported Engine flags:
 `--session`, `--continue`, `--model`, `--effort`, `--allow-write`,
-`--allow-shell`, `--ask` / `--auto`, repeatable `--skill NAME` and
-`--extra-root PATH` /
-`PATH:ro` / `PATH:rw`). Theme and permission mode also read
-`$MOW_THEME` / `$MOW_PERMISSION_MODE` and, when advertised,
-`extension.config` `{name:"mowi"}` (`extensions.mowi`). It does not
-embed the Engine or spawn ACP peers.
+`--allow-shell`, repeatable `--skill NAME` and `--extra-root PATH` /
+`PATH:ro` / `PATH:rw`). `--ask` / `--auto` set permission mode through
+`perm.set` after handshake (they are not `mow rpc` flags). Theme and
+permission mode also read `$MOW_THEME` / `$MOW_PERMISSION_MODE` and, when
+advertised, `extension.config` `{name:"mowi"}` (`extensions.mowi`). It does
+not embed the Engine or spawn ACP peers.
 
 ## Public samples
 
