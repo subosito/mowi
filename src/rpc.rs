@@ -448,6 +448,7 @@ pub fn tool_error(params: &Value) -> Option<&str> {
 /// so tests and older hosts that inline the path keep working. Prefer
 /// [`tool_progress_label_for`] when the session workspace is known so in-root
 /// files paint as relative paths.
+#[cfg(test)]
 pub fn tool_progress_label(tool: &str, args: Option<&Value>) -> String {
     tool_progress_label_for(tool, args, "", &[])
 }

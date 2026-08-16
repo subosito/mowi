@@ -876,6 +876,7 @@ impl App {
             .any(|item| item.eq_ignore_ascii_case(method))
     }
 
+    #[cfg(test)]
     pub fn feature(&self, name: &str) -> bool {
         self.features.get(name).copied().unwrap_or(false)
     }
@@ -1194,10 +1195,11 @@ impl App {
                 self.theme.badge(self.compact_chip_tone()).patch(bg),
             ),
             RightChip::Context(text) => {
-                let style = self
-                    .context_percent()
-                    .map(|pct| self.theme.ctx_style(pct))
-                    .unwrap_or_else(|| self.theme.badge(Tone::Muted));
+                let style = match self.context_tone() {
+                    Tone::Error => self.theme.ctx_hot(),
+                    Tone::Warn => self.theme.ctx_warn(),
+                    _ => self.theme.ctx_ok(),
+                };
                 // Hot is inverted; don't wash the red pill with the header Reset.
                 let style = if style.bg.is_some() {
                     style

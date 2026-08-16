@@ -663,12 +663,10 @@ impl Theme {
 
     /// Header/footer ctx chip style for a fill percentage.
     pub fn ctx_style(self, pct: f64) -> Style {
-        if pct >= Self::CTX_HOT_PCT {
-            self.ctx_hot()
-        } else if pct >= Self::CTX_WARN_PCT {
-            self.ctx_warn()
-        } else {
-            self.ctx_ok()
+        match Self::ctx_tone(pct) {
+            Tone::Error => self.ctx_hot(),
+            Tone::Warn => self.ctx_warn(),
+            _ => self.ctx_ok(),
         }
     }
 
