@@ -14,7 +14,7 @@ mod snapshot;
 mod theme;
 
 use std::io::{self, Write};
-use std::process::ExitCode;
+use std::process::{Command as ProcessCommand, ExitCode};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
@@ -97,6 +97,11 @@ struct Cli {
     #[arg(long)]
     no_tui: bool,
 
+    /// Trust this workspace for project `.mow/config` and skills.
+    /// Delegates to `mow trust` (same store as the host).
+    #[arg(long)]
+    trust: bool,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -114,6 +119,17 @@ enum Command {
         width: u16,
         #[arg(long, default_value_t = 30)]
         height: u16,
+    },
+    /// Allow project `.mow/config` and skills (delegates to `mow trust`).
+    Trust {
+        /// Workspace to trust or revoke (default: `.`).
+        path: Option<String>,
+        /// List trusted workspaces.
+        #[arg(long)]
+        list: bool,
+        /// Revoke trust instead of granting it.
+        #[arg(long)]
+        revoke: bool,
     },
 }
 
@@ -235,6 +251,9 @@ fn main() -> ExitCode {
         print_snapshots(scene, *width, *height, theme);
         return ExitCode::SUCCESS;
     }
+    if cli.trust || matches!(&cli.command, Some(Command::Trust { .. })) {
+        return run_trust(&cli);
+    }
     let ping_only = cli.no_tui || matches!(cli.command, Some(Command::Ping));
     let res = if ping_only {
         ping(&cli)
@@ -245,6 +264,45 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("mowi: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Grant, list, or revoke workspace trust via `mow trust` (one store).
+fn run_trust(cli: &Cli) -> ExitCode {
+    let mut args: Vec<String> = Vec::new();
+    match &cli.command {
+        Some(Command::Trust { path, list, revoke }) => {
+            if *list {
+                args.push("--list".into());
+            }
+            if *revoke {
+                args.push("--revoke".into());
+            }
+            if let Some(p) = path {
+                args.push(p.clone());
+            }
+        }
+        _ => {}
+    }
+    match ProcessCommand::new(&cli.mow_bin)
+        .arg("trust")
+        .args(&args)
+        .status()
+    {
+        Ok(status) => {
+            if status.success() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(status.code().unwrap_or(1) as u8)
+            }
+        }
+        Err(e) => {
+            eprintln!(
+                "mowi: failed to run `{} trust`: {e}\ninstall mow on PATH or set --mow-bin / $MOW_BIN",
+                cli.mow_bin
+            );
             ExitCode::FAILURE
         }
     }
@@ -357,6 +415,8 @@ fn tui(cli: &Cli, resume: Option<&str>) -> Result<(), rpc::Error> {
     if let Ok(status) = client.status(HANDSHAKE_TIMEOUT) {
         app.apply_status(&status);
     }
+    // Status can lag `perm.set` on `--continue`. Re-apply so `--ask`/`--auto` win.
+    app.apply_resolved_config(&resolved);
     // Splash only for a fresh session (no transcript seed) when config allows it.
     app.welcome = app.entries.is_empty() && resolved.welcome;
     if app.supports("slash.list") {
@@ -524,6 +584,42 @@ mod tests {
     }
 
     #[test]
+    fn trust_flag_and_subcommand_parse() {
+        let flag = Cli::parse_from(["mowi", "--trust"]);
+        assert!(flag.trust);
+        assert!(flag.command.is_none());
+
+        let sub = Cli::parse_from(["mowi", "trust", "--list"]);
+        assert!(!sub.trust);
+        match sub.command {
+            Some(Command::Trust {
+                list,
+                revoke,
+                path,
+            }) => {
+                assert!(list);
+                assert!(!revoke);
+                assert!(path.is_none());
+            }
+            other => panic!("expected Trust, got {other:?}"),
+        }
+
+        let revoke = Cli::parse_from(["mowi", "trust", "--revoke", "/tmp/ws"]);
+        match revoke.command {
+            Some(Command::Trust {
+                list,
+                revoke,
+                path,
+            }) => {
+                assert!(!list);
+                assert!(revoke);
+                assert_eq!(path.as_deref(), Some("/tmp/ws"));
+            }
+            other => panic!("expected Trust, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn extra_root_repeatable_forwards_rw_ro_specs() {
         let cli = Cli::parse_from([
             "mowi",
@@ -578,6 +674,8 @@ mod tests {
         assert!(help.contains("PATH:ro"), "{help}");
         assert!(help.contains("PATH:rw"), "{help}");
         assert!(help.contains("--skill"), "{help}");
+        assert!(help.contains("--trust"), "{help}");
+        assert!(help.contains("trust"), "{help}");
     }
 
     #[test]

@@ -863,83 +863,6 @@ pub fn decode_goal_event(params: &Value) -> Option<GoalInfo> {
 }
 
 /// Frozen host event type for language-server findings after write/edit.
-pub const EVENT_LSP_DIAGNOSTICS: &str = "harness.lsp.diagnostics";
-/// Host cap on findings that ride along a tool result or LSP event.
-pub const MAX_LSP_DIAGNOSTICS: usize = 10;
-
-/// One language-server finding from `harness.lsp.diagnostics`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LspDiagnostic {
-    pub severity: String,
-    pub message: String,
-    pub line: i64,
-    pub column: i64,
-    pub source: String,
-}
-
-/// Newest diagnostics batch for one path.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LspProblems {
-    pub path: String,
-    pub count: i64,
-    pub diagnostics: Vec<LspDiagnostic>,
-}
-
-fn lsp_severity_rank(severity: &str) -> i32 {
-    match severity {
-        "error" => 4,
-        "warning" => 3,
-        "information" => 2,
-        _ => 1,
-    }
-}
-
-/// Parse a `harness.lsp.diagnostics` payload. `count <= 0` is a no-op.
-pub fn decode_lsp_diagnostics(params: &Value) -> Option<LspProblems> {
-    let kind = params.get("type").and_then(Value::as_str).unwrap_or("");
-    if !kind.is_empty() && kind != EVENT_LSP_DIAGNOSTICS && !kind.ends_with("lsp.diagnostics") {
-        return None;
-    }
-    let count = params.get("count").and_then(Value::as_i64).unwrap_or(0);
-    if count <= 0 {
-        return None;
-    }
-    let path = params
-        .get("path")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
-    let mut diagnostics = Vec::new();
-    if let Some(items) = params.get("diagnostics").and_then(Value::as_array) {
-        for item in items.iter().take(MAX_LSP_DIAGNOSTICS) {
-            diagnostics.push(LspDiagnostic {
-                severity: item
-                    .get("severity")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                message: item
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-                line: item.get("line").and_then(Value::as_i64).unwrap_or(0),
-                column: item.get("column").and_then(Value::as_i64).unwrap_or(0),
-                source: item
-                    .get("source")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string(),
-            });
-        }
-    }
-    diagnostics.sort_by_key(|b| std::cmp::Reverse(lsp_severity_rank(&b.severity)));
-    Some(LspProblems {
-        path,
-        count,
-        diagnostics,
-    })
-}
 
 /// `rewind` result: `Some(last_user)` when the host dropped the last exchange.
 pub fn decode_rewind(value: &Value) -> Option<String> {
@@ -1406,6 +1329,11 @@ impl Client {
         self.send("skill.activate", Some(json!({ "names": names })))
     }
 
+    /// Non-blocking `plugin.list`.
+    pub fn request_plugin_list(&mut self) -> Result<Receiver<Result<Value, Error>>, Error> {
+        self.send("plugin.list", None)
+    }
+
     /// Non-blocking `model.set`.
     pub fn request_model_set(&mut self, id: &str) -> Result<Receiver<Result<Value, Error>>, Error> {
         let id = id.trim();
@@ -1613,13 +1541,200 @@ pub fn decode_sessions(value: &Value) -> Result<Vec<SessionSummary>, Error> {
 }
 
 pub fn decode_skill_list(value: &Value) -> Vec<String> {
+    decode_skill_items(value)
+        .into_iter()
+        .map(|s| s.id)
+        .collect()
+}
+
+/// One discoverable skill. `id` is the folder (activation key).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillItem {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+}
+
+impl SkillItem {
+    pub fn label(&self) -> String {
+        if self.description.is_empty() || self.description == self.id {
+            if self.name.is_empty() || self.name == self.id {
+                return self.id.clone();
+            }
+            return format!("{} · {}", self.id, self.name);
+        }
+        let desc = clip_skill_desc(&self.description, 48);
+        if self.name.is_empty() || self.name == self.id {
+            format!("{} — {desc}", self.id)
+        } else {
+            format!("{} — {desc}", self.id)
+        }
+    }
+}
+
+fn clip_skill_desc(s: &str, max: usize) -> String {
+    let s = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if s.chars().count() <= max {
+        return s;
+    }
+    let mut out = String::new();
+    for (i, ch) in s.chars().enumerate() {
+        if i + 1 >= max {
+            out.push('…');
+            break;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Prefer additive `items` (Agent Skills frontmatter). Fall back to `skills:[name]`.
+pub fn decode_skill_items(value: &Value) -> Vec<SkillItem> {
+    if let Some(items) = value.get("items").and_then(Value::as_array) {
+        let mut out = Vec::new();
+        for item in items {
+            let id = item
+                .get("id")
+                .or_else(|| item.get("folder"))
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if id.is_empty() {
+                continue;
+            }
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            let description = item
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            out.push(SkillItem {
+                id,
+                name,
+                description,
+            });
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
     value
         .get("skills")
         .and_then(Value::as_array)
         .map(|a| {
             a.iter()
                 .filter_map(Value::as_str)
-                .map(str::to_string)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| SkillItem {
+                    id: s.to_string(),
+                    name: String::new(),
+                    description: String::new(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// One Agent Plugin from `plugin.list`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PluginItem {
+    pub id: String,
+    pub name: String,
+    pub version: String,
+    pub description: String,
+    pub skills: Vec<String>,
+}
+
+impl PluginItem {
+    pub fn label(&self) -> String {
+        let mut head = self.id.clone();
+        if !self.version.is_empty() {
+            head = format!("{head} {}", self.version);
+        }
+        if !self.description.is_empty() {
+            format!("{head} — {}", clip_skill_desc(&self.description, 40))
+        } else if !self.name.is_empty() && self.name != self.id {
+            format!("{head} · {}", self.name)
+        } else {
+            head
+        }
+    }
+}
+
+/// Prefer additive `items`; fall back to `plugins:[id]`.
+pub fn decode_plugin_items(value: &Value) -> Vec<PluginItem> {
+    if let Some(items) = value.get("items").and_then(Value::as_array) {
+        let mut out = Vec::new();
+        for item in items {
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if id.is_empty() {
+                continue;
+            }
+            let skills = item
+                .get("skills")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(|s| s.to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.push(PluginItem {
+                id,
+                name: item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+                version: item
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+                description: item
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string(),
+                skills,
+            });
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    value
+        .get("plugins")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| PluginItem {
+                    id: s.to_string(),
+                    name: String::new(),
+                    version: String::new(),
+                    description: String::new(),
+                    skills: Vec::new(),
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -1973,48 +2088,44 @@ mod tests {
     }
 
     #[test]
-    fn decode_lsp_diagnostics_matches_frozen_shape() {
-        let event = serde_json::json!({
-            "type": "harness.lsp.diagnostics",
-            "tool": "edit",
-            "path": "internal/x.go",
-            "count": 3,
-            "diagnostics": [
-                {"severity": "warning", "message": "unused", "line": 8, "column": 1},
-                {"severity": "error", "message": "undefined: foo", "line": 42, "column": 9, "source": "compiler"},
-            ]
-        });
-        let problems = decode_lsp_diagnostics(&event).expect("shape");
-        assert_eq!(problems.path, "internal/x.go");
-        assert_eq!(problems.count, 3);
-        assert_eq!(problems.diagnostics[0].severity, "error");
-        assert_eq!(problems.diagnostics[0].source, "compiler");
-        assert_eq!(problems.diagnostics.len(), 2);
-
-        assert!(
-            decode_lsp_diagnostics(&serde_json::json!({
-                "type": "harness.lsp.diagnostics",
-                "path": "clean.go",
-                "count": 0
-            }))
-            .is_none()
-        );
-        assert!(
-            decode_lsp_diagnostics(&serde_json::json!({
-                "type": "loop.token",
-                "count": 2
-            }))
-            .is_none()
-        );
-    }
-
-    #[test]
     fn decode_skill_list_and_activate() {
         assert_eq!(
             decode_skill_list(&serde_json::json!({"skills": ["review", "docs"]})),
             vec!["review".to_string(), "docs".to_string()]
         );
         assert!(decode_skill_list(&serde_json::json!({})).is_empty());
+        assert_eq!(
+            decode_skill_list(&serde_json::json!({
+                "skills": ["review"],
+                "items": [{
+                    "id": "review",
+                    "name": "code-review",
+                    "description": "Review a PR."
+                }]
+            })),
+            vec!["review".to_string()]
+        );
+        let items = decode_skill_items(&serde_json::json!({
+            "items": [{
+                "id": "review",
+                "name": "code-review",
+                "description": "Review a PR."
+            }]
+        }));
+        assert_eq!(items[0].name, "code-review");
+        assert!(items[0].label().contains("Review a PR."));
+        let plugins = decode_plugin_items(&serde_json::json!({
+            "plugins": ["review-kit"],
+            "items": [{
+                "id": "review-kit",
+                "name": "Review Kit",
+                "version": "1.2.0",
+                "description": "PR review helpers",
+                "skills": ["review"]
+            }]
+        }));
+        assert_eq!(plugins[0].id, "review-kit");
+        assert!(plugins[0].label().contains("PR review helpers"));
         let (activated, unknown) = decode_skill_activate(&serde_json::json!({
             "activated": ["review"],
             "unknown": ["nope"]

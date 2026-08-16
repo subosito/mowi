@@ -40,10 +40,11 @@ use crate::render::{
 use crate::rpc::{
     Client, CompactReport, ContextUsage, EVENT_COMPACT, EVENT_COMPACT_START, EVENT_GOAL_BLOCKED,
     EVENT_GOAL_DONE, EVENT_GOAL_FAIL, EVENT_GOAL_PARTIAL, EVENT_GOAL_START, EVENT_GOAL_STEP,
-    EVENT_LSP_DIAGNOSTICS, EffortList, Error, ExtraRoot, GoalInfo, LspDiagnostic, LspProblems,
+    EffortList, Error, ExtraRoot, GoalInfo, 
     ModelList, Notification, PermissionRequest, SessionInfo, SessionSummary, SlashCommand,
-    TranscriptMessage, VersionInfo, decode_extra_roots, decode_goal_event, decode_lsp_diagnostics,
-    decode_rewind, decode_sessions, decode_skill_activate, decode_skill_list, extract_thinking,
+    TranscriptMessage, VersionInfo, decode_extra_roots, decode_goal_event,
+    decode_rewind, decode_sessions, decode_skill_activate, decode_skill_items,
+    decode_plugin_items, extract_thinking,
     has_extra_roots_field, reasoning_delta, token_delta, tool_args, tool_denied, tool_error,
     tool_name, tool_progress_label_for, tool_result,
 };
@@ -81,12 +82,6 @@ const NOTIFICATION_BATCH: usize = 256;
 /// single turn. Navigation repeats are coalesced, so this does not mean 4096
 /// expensive transcript recalculations.
 const INPUT_BATCH: usize = 4096;
-/// Newest retained LSP batches (one per path).
-const MAX_LSP_PROBLEM_PATHS: usize = 10;
-/// `/lsp` dumps at most this many newest batches.
-const MAX_LSP_RECENT_BATCHES: usize = 5;
-/// `/lsp` dumps at most this many transcript lines.
-const MAX_LSP_RECENT_LINES: usize = 40;
 /// Recent tool rows kept in the live progress section (plus the tally).
 const LIVE_PROGRESS_RECENT: usize = 3;
 /// Write/edit diff cards kept in the live progress section.
@@ -273,7 +268,11 @@ pub enum Overlay {
         state: ListState,
     },
     Skills {
-        items: Vec<String>,
+        items: Vec<crate::rpc::SkillItem>,
+        state: ListState,
+    },
+    Plugins {
+        items: Vec<crate::rpc::PluginItem>,
         state: ListState,
     },
     Peer,
@@ -329,8 +328,15 @@ impl Overlay {
         }
     }
 
-    fn skills(items: Vec<String>) -> Self {
+    fn skills(items: Vec<crate::rpc::SkillItem>) -> Self {
         Overlay::Skills {
+            state: select_list(items.len(), 0),
+            items,
+        }
+    }
+
+    fn plugins(items: Vec<crate::rpc::PluginItem>) -> Self {
+        Overlay::Plugins {
             state: select_list(items.len(), 0),
             items,
         }
@@ -400,7 +406,6 @@ enum IdentityChip {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RightChip {
     ExtraRoots(String),
-    Lsp(String),
     Compact(String),
     Context(String),
 }
@@ -569,8 +574,6 @@ pub struct App {
     pub caps: Vec<String>,
     /// Boolean features from `version` / `capabilities`.
     pub features: BTreeMap<String, bool>,
-    /// True after an LSP diagnostics event (or an advertised lsp feature).
-    pub lsp_seen: bool,
     /// Character index into `input`.
     pub cursor: usize,
     /// Composer history cursor: None = draft, Some = index into prior user prompts.
@@ -597,8 +600,6 @@ pub struct App {
     think_raw: String,
     /// Reasoning channel or an open think tag is armed — status says thinking.
     thinking: bool,
-    /// Newest LSP batch per path, newest first, capped at `MAX_LSP_PROBLEM_PATHS`.
-    lsp_problems: Vec<LspProblems>,
     /// `/compact` requested while a non-control compact would block the worker.
     pending_compact: Option<i64>,
     /// Live compact chrome: queued, manual `/compact`, or automatic.
@@ -657,7 +658,6 @@ impl Default for App {
             goal: None,
             caps: Vec::new(),
             features: BTreeMap::new(),
-            lsp_seen: false,
             cursor: 0,
             history_index: None,
             history_draft: String::new(),
@@ -673,7 +673,6 @@ impl Default for App {
             pending_osc52: None,
             think_raw: String::new(),
             thinking: false,
-            lsp_problems: Vec::new(),
             pending_compact: None,
             compacting: None,
             control_caps: Vec::new(),
@@ -703,25 +702,24 @@ impl App {
                         .as_deref()
                         .and_then(parse_rfc3339_system_time),
                 },
-                "assistant" => Entry::Assistant(message.content),
+                "assistant" => Entry::Assistant(visible_answer(&message.content)),
                 _ => Entry::Note(format!("{}: {}", message.role, message.content)),
             })
             .collect();
         app
     }
 
-    /// Adopt capability / ask-mode chips from a `status` result.
+    /// Adopt capability chips from a `status` result.
+    ///
+    /// Permission mode is *not* taken from status. CLI (`--ask`/`--auto`),
+    /// shift+tab, and `/perm` own it. Engine status can lag a just-sent
+    /// `perm.set` (especially on `--continue`) and must not flip the chip.
     pub fn apply_status(&mut self, status: &Value) {
         if let Some(v) = status.get("allow_write").and_then(Value::as_bool) {
             self.allow_write = v;
         }
         if let Some(v) = status.get("allow_shell").and_then(Value::as_bool) {
             self.allow_shell = v;
-        }
-        match status.get("ask_mode") {
-            Some(Value::Bool(v)) => self.ask_mode = *v,
-            Some(Value::String(mode)) => self.ask_mode = mode == "ask",
-            _ => {}
         }
         if let Some(model) = status.get("model").and_then(Value::as_str)
             && !model.is_empty()
@@ -861,9 +859,6 @@ impl App {
         self.set_capabilities(&version.methods);
         self.set_control_methods(&version.control_methods);
         self.features = version.features.clone();
-        if self.feature("lsp") || self.feature("lsp_diagnostics") {
-            self.lsp_seen = true;
-        }
     }
 
     /// `compact` is a worker method on current hosts unless advertised as control.
@@ -889,7 +884,6 @@ impl App {
         HostOffer {
             methods: &self.caps,
             features: &self.features,
-            lsp_seen: self.lsp_seen || self.feature("lsp") || self.feature("lsp_diagnostics"),
         }
     }
 
@@ -903,60 +897,6 @@ impl App {
     }
 
     /// Keep the newest batch per path and paint one summary line — not every finding.
-    fn ingest_lsp_problems(&mut self, problems: LspProblems) {
-        self.lsp_problems
-            .retain(|existing| existing.path != problems.path);
-        self.lsp_problems.insert(0, problems.clone());
-        if self.lsp_problems.len() > MAX_LSP_PROBLEM_PATHS {
-            self.lsp_problems.truncate(MAX_LSP_PROBLEM_PATHS);
-        }
-        self.lsp_seen = true;
-        let note = format!("lsp · {} · {} problem(s)", problems.path, problems.count);
-        self.status = note.clone();
-        self.entries.push(Entry::Note(note));
-    }
-
-    /// Dump retained batches without replaying an unbounded session transcript.
-    fn show_lsp_problems(&mut self) {
-        if self.lsp_problems.is_empty() {
-            let msg = if self.feature("lsp") || self.feature("lsp_diagnostics") || self.lsp_seen {
-                "lsp · no diagnostics yet"
-            } else {
-                "lsp · host has not sent diagnostics"
-            };
-            self.status = msg.into();
-            self.entries.push(Entry::Note(msg.into()));
-            return;
-        }
-        let mut lines = 0usize;
-        let mut batches = 0usize;
-        let mut notes = Vec::new();
-        for problems in &self.lsp_problems {
-            if batches >= MAX_LSP_RECENT_BATCHES || lines >= MAX_LSP_RECENT_LINES {
-                break;
-            }
-            notes.push(format!(
-                "lsp · {} · {} problem(s)",
-                problems.path, problems.count
-            ));
-            lines += 1;
-            for diagnostic in &problems.diagnostics {
-                if lines >= MAX_LSP_RECENT_LINES {
-                    break;
-                }
-                notes.push(lsp_diagnostic_text(&problems.path, diagnostic));
-                lines += 1;
-            }
-            batches += 1;
-        }
-        if batches < self.lsp_problems.len() || lines >= MAX_LSP_RECENT_LINES {
-            notes.push("lsp · …older omitted".into());
-        }
-        self.status = format!("lsp · {} file(s)", batches);
-        self.entries.push(Entry::Note(notes.join("\n")));
-    }
-
-    /// One-line context summary, e.g. "context: 12.3k / 200k (6%)".
     pub fn context_summary(&self) -> String {
         let Some(ctx) = &self.ctx else {
             return "context: unknown".into();
@@ -1188,9 +1128,6 @@ impl App {
         if let Some(roots) = self.extra_roots_chip() {
             chips.push(RightChip::ExtraRoots(roots));
         }
-        if let Some(lsp) = self.lsp_chip_text() {
-            chips.push(RightChip::Lsp(lsp));
-        }
         if let Some(compact) = self.compact_chip_text() {
             chips.push(RightChip::Compact(compact));
         }
@@ -1200,24 +1137,6 @@ impl App {
         chips
     }
 
-    fn lsp_problem_count(&self) -> usize {
-        self.lsp_problems.iter().map(|p| p.count.max(0) as usize).sum()
-    }
-
-    fn lsp_chip_text(&self) -> Option<String> {
-        let n = self.lsp_problem_count();
-        if n == 0 {
-            return None;
-        }
-        Some(if n == 1 {
-            "1 problem".into()
-        } else {
-            format!("{n} problems")
-        })
-    }
-
-    /// Identity side of the header: `mowi · basename · model (effort)`.
-    /// Only the effort word is dimmed; the parentheses keep the header style.
     fn header_identity_spans(&self, identity: &[IdentityChip]) -> Vec<Span<'static>> {
         let header = self.theme.header();
         let fold_effort = identity
@@ -1270,9 +1189,6 @@ impl App {
             RightChip::ExtraRoots(text) => {
                 Span::styled(text.clone(), self.theme.badge(Tone::Warn).patch(bg))
             }
-            RightChip::Lsp(text) => {
-                Span::styled(text.clone(), self.theme.badge(Tone::Warn).patch(bg))
-            }
             RightChip::Compact(text) => Span::styled(
                 text.clone(),
                 self.theme.badge(self.compact_chip_tone()).patch(bg),
@@ -1293,11 +1209,10 @@ impl App {
         }
     }
 
-    /// Paint order after safety: extra-roots, then lsp, then context.
+    /// Paint order after safety: extra-roots, then context.
     fn header_right_spans(&self, chips: &[RightChip]) -> Vec<Span<'static>> {
         const PAINT: &[fn(&RightChip) -> bool] = &[
             |c| matches!(c, RightChip::ExtraRoots(_)),
-            |c| matches!(c, RightChip::Lsp(_)),
             |c| matches!(c, RightChip::Compact(_)),
             |c| matches!(c, RightChip::Context(_)),
         ];
@@ -1632,9 +1547,19 @@ impl App {
     }
 
     /// Markdown by default; only fenced or bare unified-diff bodies become cards.
+    /// Thinking / CoT is stripped so the main pane stays the answer.
     fn assistant_lines(&self, text: &str) -> Vec<Line<'static>> {
+        let text = visible_answer(text);
         let mut out = Vec::new();
-        for segment in split_markdown_and_diffs(text) {
+        if text.trim().is_empty() {
+            if self.thinking {
+                out.push(Line::styled("thinking", self.theme.note().add_modifier(Modifier::ITALIC)));
+            } else {
+                out.push(Line::raw(""));
+            }
+            return out;
+        }
+        for segment in split_markdown_and_diffs(&text) {
             if !out.is_empty() {
                 out.push(Line::raw(""));
             }
@@ -2599,11 +2524,6 @@ impl App {
                     chars_after,
                 ));
             }
-            k if k == EVENT_LSP_DIAGNOSTICS || k.ends_with("lsp.diagnostics") => {
-                if let Some(problems) = decode_lsp_diagnostics(params) {
-                    self.ingest_lsp_problems(problems);
-                }
-            }
             EVENT_GOAL_START | EVENT_GOAL_STEP | EVENT_GOAL_DONE | EVENT_GOAL_FAIL
             | EVENT_GOAL_PARTIAL | EVENT_GOAL_BLOCKED => {
                 if let Some(goal) = decode_goal_event(params) {
@@ -3063,6 +2983,14 @@ impl App {
 
     fn delete_char(&mut self) {
         self.leave_prompt_history();
+        // Block caret sits *on* the character at `cursor`. Delete that cell
+        // (same as Backspace after moving left), not the one after it.
+        if self.input.chars().count() == 0 {
+            return;
+        }
+        if self.cursor >= self.input.chars().count() {
+            return;
+        }
         let start = self.cursor_byte();
         let ch_len = self.input[start..]
             .chars()
@@ -3270,6 +3198,7 @@ impl App {
         };
         let skill_len = match &self.overlay {
             Overlay::Skills { items, .. } => self.filter_skills(items).len(),
+            Overlay::Plugins { items, .. } => self.filter_plugins(items).len(),
             _ => 0,
         };
         let peer_len = self.filter_peers(&self.peer_agents()).len();
@@ -3280,6 +3209,7 @@ impl App {
             Overlay::Efforts { state, .. } => step_list(state, effort_len, delta),
             Overlay::Completions { state, .. } => step_list(state, completion_len, delta),
             Overlay::Skills { state, .. } => step_list(state, skill_len, delta),
+            Overlay::Plugins { state, .. } => step_list(state, skill_len, delta),
             Overlay::PeerPicker { state } => step_list(state, peer_len, delta),
             Overlay::Peer => {
                 if delta < 0 {
@@ -3318,7 +3248,11 @@ impl App {
             }
             Overlay::Skills { items, state } => {
                 let idx = *self.filter_skills(items).get(state.selected()?)?;
-                items.get(idx).cloned()
+                items.get(idx).map(|s| s.id.clone())
+            }
+            Overlay::Plugins { items, state } => {
+                let idx = *self.filter_plugins(items).get(state.selected()?)?;
+                items.get(idx).map(|p| p.id.clone())
             }
             Overlay::PeerPicker { state } => {
                 let agents = self.peer_agents();
@@ -3385,11 +3319,31 @@ impl App {
             .collect()
     }
 
-    fn filter_skills(&self, items: &[String]) -> Vec<usize> {
+    fn filter_skills(&self, items: &[crate::rpc::SkillItem]) -> Vec<usize> {
         items
             .iter()
             .enumerate()
-            .filter(|(_, name)| self.query_matches(name))
+            .filter(|(_, skill)| {
+                self.query_matches(&skill.id)
+                    || self.query_matches(&skill.name)
+                    || self.query_matches(&skill.description)
+                    || self.query_matches(&skill.label())
+            })
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    fn filter_plugins(&self, items: &[crate::rpc::PluginItem]) -> Vec<usize> {
+        items
+            .iter()
+            .enumerate()
+            .filter(|(_, plugin)| {
+                self.query_matches(&plugin.id)
+                    || self.query_matches(&plugin.name)
+                    || self.query_matches(&plugin.description)
+                    || self.query_matches(&plugin.label())
+                    || plugin.skills.iter().any(|s| self.query_matches(s))
+            })
             .map(|(idx, _)| idx)
             .collect()
     }
@@ -3442,6 +3396,7 @@ impl App {
         };
         let skill_len = match &self.overlay {
             Overlay::Skills { items, .. } => self.filter_skills(items).len(),
+            Overlay::Plugins { items, .. } => self.filter_plugins(items).len(),
             _ => 0,
         };
         let peer_len = self.filter_peers(&self.peer_agents()).len();
@@ -3452,6 +3407,7 @@ impl App {
             Overlay::Efforts { state, .. } => *state = select_list(effort_len, 0),
             Overlay::Completions { state, .. } => *state = select_list(completion_len, 0),
             Overlay::Skills { state, .. } => *state = select_list(skill_len, 0),
+            Overlay::Plugins { state, .. } => *state = select_list(skill_len, 0),
             Overlay::PeerPicker { state } => *state = select_list(peer_len, 0),
             Overlay::Peer | Overlay::None => {}
         }
@@ -3517,7 +3473,7 @@ impl App {
                         .as_deref()
                         .and_then(parse_rfc3339_system_time),
                 },
-                "assistant" => Entry::Assistant(message.content),
+                "assistant" => Entry::Assistant(visible_answer(&message.content)),
                 _ => Entry::Note(format!("{}: {}", message.role, message.content)),
             })
             .collect();
@@ -4036,7 +3992,7 @@ fn tool_activity_state(name: &str) -> &'static str {
     match verb {
         "read" | "glob" | "grep" => "searching",
         "write" | "edit" => "shaping",
-        "mcp" | "lsp" => "connecting",
+        "mcp" => "connecting",
         "generate_image" | "generate_speech" | "generate_video" => "creating",
         "understand_image" | "understand_voice" | "understand_video" => "inspecting",
         "bash" | "proc_start" | "proc_status" | "proc_stop" => "running",
@@ -4114,23 +4070,6 @@ fn tool_result_diff(name: &str, result: Option<&str>) -> Option<String> {
         return None;
     }
     Some(result.to_string())
-}
-
-fn lsp_diagnostic_text(path: &str, diagnostic: &LspDiagnostic) -> String {
-    let severity = if diagnostic.severity.is_empty() {
-        String::new()
-    } else {
-        format!("[{}] ", diagnostic.severity)
-    };
-    let mut text = format!(
-        "lsp · {path}:{} {severity}{}",
-        diagnostic.line, diagnostic.message
-    );
-    if !diagnostic.source.is_empty() {
-        text.push_str(" · ");
-        text.push_str(&diagnostic.source);
-    }
-    text
 }
 
 fn highlight_term_in_lines(
@@ -4953,6 +4892,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         Overlay::Efforts { list, state } => draw_efforts(frame, app, list, state, doc),
         Overlay::Completions { items, state } => draw_completions(frame, app, items, state, doc),
         Overlay::Skills { items, state } => draw_skills(frame, app, items, state, doc),
+        Overlay::Plugins { items, state } => draw_plugins(frame, app, items, state, doc),
         Overlay::Peer => draw_peer(frame, app, doc),
         Overlay::PeerPicker { state } => draw_peer_picker(frame, app, state, doc),
         Overlay::None => {}
@@ -5720,7 +5660,7 @@ fn draw_completions(
 fn draw_skills(
     frame: &mut Frame<'_>,
     app: &App,
-    items: &[String],
+    items: &[crate::rpc::SkillItem],
     state: &mut ListState,
     area: Rect,
 ) {
@@ -5742,9 +5682,9 @@ fn draw_skills(
         shown
             .iter()
             .filter_map(|idx| items.get(*idx))
-            .map(|name| {
+            .map(|skill| {
                 ListItem::new(Line::styled(
-                    name.clone(),
+                    skill.label(),
                     app.theme.text().patch(app.theme.overlay()),
                 ))
             })
@@ -5763,6 +5703,57 @@ fn draw_skills(
             app,
             "skills",
             &[HINT_ENTER_SET, HINT_ESC_CLOSE],
+            &hint_note,
+        ));
+    frame.render_stateful_widget(widget, spot, state);
+}
+
+fn draw_plugins(
+    frame: &mut Frame<'_>,
+    app: &App,
+    items: &[crate::rpc::PluginItem],
+    state: &mut ListState,
+    area: Rect,
+) {
+    let shown = app.filter_plugins(items);
+    let rows = shown.len().max(1) as u16;
+    let spot = overlay_list_spot(area, rows, 28, 56, 14);
+    frame.render_widget(Clear, spot);
+    let rows: Vec<ListItem<'static>> = if items.is_empty() {
+        vec![ListItem::new(Line::styled(
+            "no plugins installed",
+            app.theme.note().patch(app.theme.overlay()),
+        ))]
+    } else if shown.is_empty() {
+        vec![ListItem::new(Line::styled(
+            "no matches",
+            app.theme.note().patch(app.theme.overlay()),
+        ))]
+    } else {
+        shown
+            .iter()
+            .filter_map(|idx| items.get(*idx))
+            .map(|plugin| {
+                ListItem::new(Line::styled(
+                    plugin.label(),
+                    app.theme.text().patch(app.theme.overlay()),
+                ))
+            })
+            .collect()
+    };
+    let note = app.overlay_filter_note(shown.len(), items.len());
+    let hint_note = if note.is_empty() {
+        "$MOW_HOME/plugins · /skills to activate".to_string()
+    } else {
+        note
+    };
+    let widget = List::new(rows)
+        .highlight_symbol("▸ ")
+        .highlight_style(app.theme.selected())
+        .block(overlay_block_hint(
+            app,
+            "plugins",
+            &[HINT_ESC_CLOSE],
             &hint_note,
         ));
     frame.render_stateful_widget(widget, spot, state);
@@ -6285,7 +6276,7 @@ fn poll_slash(
                         *slash_rx = None;
                     }
                     ("skill.list", Ok(value)) => {
-                        let skills = decode_skill_list(&value);
+                        let skills = decode_skill_items(&value);
                         if skills.is_empty() {
                             app.status = "no skills in this workspace".into();
                             app.entries
@@ -6293,6 +6284,19 @@ fn poll_slash(
                         } else {
                             app.open_overlay(Overlay::skills(skills));
                             app.status = "skills".into();
+                        }
+                        *slash_rx = None;
+                    }
+                    ("plugin.list", Ok(value)) => {
+                        let plugins = decode_plugin_items(&value);
+                        if plugins.is_empty() {
+                            app.status = "no plugins installed".into();
+                            app.entries.push(Entry::Note(
+                                "no plugins installed — drop a folder with plugin.json under $MOW_HOME/plugins".into(),
+                            ));
+                        } else {
+                            app.open_overlay(Overlay::plugins(plugins));
+                            app.status = "plugins".into();
                         }
                         *slash_rx = None;
                     }
@@ -6740,6 +6744,7 @@ fn overlay_activate(
         Overlay::Efforts { .. } => "effort",
         Overlay::Completions { .. } => "complete",
         Overlay::Skills { .. } => "skill",
+        Overlay::Plugins { .. } => "plugin",
         Overlay::None => "none",
     };
     match picker {
@@ -6753,6 +6758,13 @@ fn overlay_activate(
                 *slash_rx = Some(client.request_skill_activate(&[name])?);
                 app.pending_local = Some("skill.activate".into());
                 app.status = "activating skills…".into();
+            }
+        }
+        "plugin" => {
+            app.overlay = Overlay::None;
+            if let Some(id) = selection {
+                app.status = format!("plugin {id} · activate its skills with /skills");
+                app.entries.push(Entry::Note(app.status.clone()));
             }
         }
         "model" => {
@@ -7056,9 +7068,6 @@ fn handle_slash(
             app.pending_local = Some("status".into());
             app.status = "reading status…".into();
         }
-        "lsp" => {
-            app.show_lsp_problems();
-        }
         "perm" => {
             return handle_perm_slash(&args, client, app, slash_rx);
         }
@@ -7097,6 +7106,11 @@ fn handle_slash(
                 app.pending_local = Some("skill.activate".into());
                 app.status = "activating skills…".into();
             }
+        }
+        "plugins" => {
+            *slash_rx = Some(client.request_plugin_list()?);
+            app.pending_local = Some("plugin.list".into());
+            app.status = "listing plugins…".into();
         }
         "steer" => {
             let busy = app.busy || turn.is_some();
@@ -8583,7 +8597,6 @@ mod tests {
             "skill.list".into(),
         ]);
         app.features.insert("ephemeral_prompt".into(), true);
-        app.lsp_seen = true;
     }
 
     #[test]
@@ -8668,7 +8681,7 @@ mod tests {
         assert!(joined.contains("/search"), "{joined}");
         assert!(joined.contains("/copy"), "{joined}");
         for name in [
-            "/steer", "/compact", "/model", "/lsp", "/skills", "/goal", "/btw", "/edit",
+            "/steer", "/compact", "/model", "/skills", "/goal", "/btw", "/edit",
             "/retry", "/resume",
         ] {
             assert!(
@@ -8769,12 +8782,40 @@ mod tests {
     #[test]
     fn skills_overlay_lists_names() {
         let mut app = App::new(SessionInfo::default());
-        app.open_overlay(Overlay::skills(vec!["review".into(), "docs".into()]));
-        let out = render(&mut app, 60, 16);
+        app.open_overlay(Overlay::skills(vec![
+            crate::rpc::SkillItem {
+                id: "review".into(),
+                name: "code-review".into(),
+                description: "Review a PR.".into(),
+            },
+            crate::rpc::SkillItem {
+                id: "docs".into(),
+                name: String::new(),
+                description: String::new(),
+            },
+        ]));
+        let out = render(&mut app, 72, 16);
         assert!(out.contains("review"), "{out}");
+        assert!(out.contains("Review a PR."), "{out}");
         assert!(out.contains("docs"), "{out}");
         assert!(out.contains("/skills <name>"), "{out}");
         assert_eq!(app.overlay_selection().as_deref(), Some("review"));
+    }
+
+    #[test]
+    fn plugins_overlay_lists_ids() {
+        let mut app = App::new(SessionInfo::default());
+        app.open_overlay(Overlay::plugins(vec![crate::rpc::PluginItem {
+            id: "review-kit".into(),
+            name: "Review Kit".into(),
+            version: "1.2.0".into(),
+            description: "PR review helpers".into(),
+            skills: vec!["review".into()],
+        }]));
+        let out = render(&mut app, 72, 16);
+        assert!(out.contains("review-kit"), "{out}");
+        assert!(out.contains("PR review helpers"), "{out}");
+        assert_eq!(app.overlay_selection().as_deref(), Some("review-kit"));
     }
 
     #[test]
@@ -8894,7 +8935,7 @@ mod tests {
         };
         assert!(note.contains("unknown /bogus"), "{note}");
         assert!(note.contains("/help") || note.contains("/status"), "{note}");
-        for name in ["/steer", "/compact", "/model", "/lsp", "/skills", "/goal"] {
+        for name in ["/steer", "/compact", "/model", "/skills", "/goal"] {
             assert!(!note.contains(name), "{name} leaked: {note}");
         }
 
@@ -9594,6 +9635,10 @@ mod tests {
             "allow_write": true, "allow_shell": false, "ask_mode": "auto"
         }));
         assert_eq!(app.capability_chip(), "write");
+        // Permission is not taken from status — default ask stays until CLI /perm.
+        assert_eq!(app.mode_chip(), "ask");
+        app.ask_mode = false;
+        app.apply_status(&serde_json::json!({ "ask_mode": "ask" }));
         assert_eq!(app.mode_chip(), "auto");
     }
 
@@ -9630,121 +9675,6 @@ mod tests {
         assert!(
             !summary.contains("allow_write"),
             "raw JSON leaked: {summary}"
-        );
-    }
-
-    #[test]
-    fn lsp_events_stay_to_one_summary_note() {
-        let mut app = App::new(SessionInfo::default());
-        app.on_notification(&Notification {
-            method: "event".into(),
-            params: serde_json::json!({
-                "type": "harness.lsp.diagnostics",
-                "tool": "edit",
-                "path": "src/app.rs",
-                "count": 8,
-                "diagnostics": [
-                    {"severity": "error", "message": "undefined: foo", "line": 42, "source": "compiler"},
-                    {"severity": "warning", "message": "unused", "line": 8},
-                    {"severity": "hint", "message": "prefer", "line": 9},
-                ]
-            }),
-        });
-        let notes: Vec<_> = app
-            .entries
-            .iter()
-            .filter_map(|entry| match entry {
-                Entry::Note(text) => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(notes, vec!["lsp · src/app.rs · 8 problem(s)"]);
-        assert_eq!(app.lsp_problems.len(), 1);
-        assert!(!notes.iter().any(|n| n.contains("undefined: foo")));
-
-        app.on_notification(&Notification {
-            method: "event".into(),
-            params: serde_json::json!({
-                "type": "harness.lsp.diagnostics",
-                "path": "clean.go",
-                "count": 0
-            }),
-        });
-        assert_eq!(app.lsp_problems.len(), 1);
-
-        app.on_notification(&Notification {
-            method: "event".into(),
-            params: serde_json::json!({
-                "type": "harness.lsp.diagnostics",
-                "path": "src/app.rs",
-                "count": 1,
-                "diagnostics": [
-                    {"severity": "error", "message": "newest", "line": 9}
-                ]
-            }),
-        });
-        assert_eq!(app.lsp_problems.len(), 1);
-        assert_eq!(app.lsp_problems[0].count, 1);
-        assert_eq!(app.lsp_problems[0].diagnostics[0].message, "newest");
-
-        app.show_lsp_problems();
-        let last = match app.entries.last() {
-            Some(Entry::Note(text)) => text,
-            other => panic!("expected detail note, got {other:?}"),
-        };
-        assert!(last.contains("newest"), "{last}");
-        assert!(last.contains("src/app.rs:9"), "{last}");
-        assert!(last.contains("[error]"), "{last}");
-        assert_eq!(app.lsp_chip_text().as_deref(), Some("1 problem"));
-    }
-
-    #[test]
-    fn lsp_empty_dump_says_why() {
-        let mut app = App::new(SessionInfo::default());
-        app.show_lsp_problems();
-        let last = match app.entries.last() {
-            Some(Entry::Note(text)) => text.as_str(),
-            other => panic!("expected note, got {other:?}"),
-        };
-        assert!(
-            last.contains("has not sent diagnostics"),
-            "{last}"
-        );
-
-        app.features.insert("lsp".into(), true);
-        app.show_lsp_problems();
-        let last = match app.entries.last() {
-            Some(Entry::Note(text)) => text.as_str(),
-            other => panic!("expected note, got {other:?}"),
-        };
-        assert!(last.contains("no diagnostics yet"), "{last}");
-    }
-
-    #[test]
-    fn lsp_chip_shows_when_diagnostics_exist() {
-        let mut app = App::new(SessionInfo {
-            model: "gpt-5-mini".into(),
-            ..Default::default()
-        });
-        app.theme = Theme::colored(ThemeName::CatppuccinMocha);
-        app.on_notification(&Notification {
-            method: "event".into(),
-            params: serde_json::json!({
-                "type": "harness.lsp.diagnostics",
-                "path": "src/app.rs",
-                "count": 2,
-                "diagnostics": [
-                    {"severity": "error", "message": "x", "line": 1}
-                ]
-            }),
-        });
-        assert_eq!(app.lsp_chip_text().as_deref(), Some("2 problems"));
-        let head = header_text(&app, 80);
-        assert!(head.contains("2 problems"), "{head}");
-        let foot = footer_text(&app, 80);
-        assert!(
-            !foot.contains("2 problems"),
-            "N problems chip lives in the header: {foot}"
         );
     }
 
@@ -10067,7 +9997,7 @@ mod tests {
         }
         for name in [
             "help", "search", "copy", "retry", "edit", "steer", "sessions", "status", "model",
-            "effort", "clear", "lsp", "perm", "compact",
+            "effort", "clear", "perm", "compact",
         ] {
             assert_eq!(slash_route(name, &[]), SlashRoute::Local, "/{name}");
         }
@@ -10914,15 +10844,17 @@ mod tests {
         app.set_input("hello".into());
         app.cursor_home();
         assert_eq!(app.cursor, 0);
-        app.delete_char(); // 'h' is before the cursor now
+        app.delete_char(); // block caret is on 'h'
         assert_eq!(app.input, "ello");
+        assert_eq!(app.cursor, 0);
         app.cursor_end();
         assert_eq!(app.cursor, 4);
-        app.delete_char(); // nothing after the end
+        app.delete_char(); // caret past last cell — no-op
         assert_eq!(app.input, "ello");
-        app.move_cursor(-1);
+        app.move_cursor(-1); // caret on 'o'
         app.delete_char();
         assert_eq!(app.input, "ell");
+        assert_eq!(app.cursor, 3);
     }
 
     #[test]
@@ -11241,6 +11173,26 @@ mod tests {
         app.push_visible_token("key files.<think>plan the approach</think>Let me go");
         assert_eq!(app.live, "key files. Let me go");
         assert!(!app.live.contains("plan the approach"));
+    }
+
+    #[test]
+    fn transcript_resume_strips_thinking_from_main_pane() {
+        let app = App::from_transcript(
+            SessionInfo::default(),
+            vec![crate::rpc::TranscriptMessage {
+                role: "assistant".into(),
+                content: "Intro.<think>secret plan</think>Now the answer.".into(),
+                timestamp: None,
+            }],
+        );
+        match &app.entries[0] {
+            Entry::Assistant(body) => {
+                assert!(!body.contains("secret plan"), "{body}");
+                assert!(!body.contains("<think>"), "{body}");
+                assert!(body.contains("Intro. Now the answer."), "{body}");
+            }
+            other => panic!("expected assistant, got {other:?}"),
+        }
     }
 
     #[test]

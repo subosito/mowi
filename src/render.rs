@@ -388,7 +388,14 @@ pub fn markdown_lines(text: &str, theme: Theme) -> Vec<Line<'static>> {
             }
 
             Event::Code(text) => {
-                spans.push(Span::styled(text.to_string(), theme.md_code()));
+                if table.is_some() {
+                    // Tables accumulate a plain cell string. Inline code must
+                    // land there too — otherwise chips dump onto the paragraph
+                    // and weld (`mcp.json$MOW_HOME`).
+                    cell.push_str(&text);
+                } else {
+                    spans.push(Span::styled(text.to_string(), theme.md_code()));
+                }
             }
 
             Event::Text(text) => {
@@ -1509,6 +1516,23 @@ mod tests {
             row2.find("bo").unwrap(),
             "columns not aligned:\n{row1}\n{row2}"
         );
+    }
+
+    #[test]
+    fn table_inline_code_stays_in_cells() {
+        let lines = md_text(
+            "| Source | Role |\n|---|---|\n| `$MOW_HOME/mcp.json` | fallback |\n| `$MOW_HOME/config.yaml` | first |\n",
+        );
+        let joined = lines.join("\n");
+        assert!(
+            !joined.contains("mcp.json$MOW_HOME") && !joined.contains("mcp.jsonconfig"),
+            "table code chips welded:\n{joined}"
+        );
+        assert!(joined.contains("mcp.json"), "{joined}");
+        assert!(joined.contains("config.yaml"), "{joined}");
+        let row1 = lines.iter().find(|l| l.contains("mcp.json")).unwrap();
+        let row2 = lines.iter().find(|l| l.contains("config.yaml")).unwrap();
+        assert_ne!(row1, row2, "two rows collapsed:\n{joined}");
     }
 
     #[test]

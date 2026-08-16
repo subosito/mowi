@@ -39,7 +39,6 @@ enum Builtin {
 pub struct HostOffer<'a> {
     pub methods: &'a [String],
     pub features: &'a BTreeMap<String, bool>,
-    pub lsp_seen: bool,
 }
 
 impl HostOffer<'_> {
@@ -61,8 +60,6 @@ enum Availability {
     Method(&'static str),
     AnyMethod(&'static [&'static str]),
     Feature(&'static str),
-    /// `/lsp` needs diagnostics events or an explicit lsp feature.
-    Lsp,
 }
 
 /// Explicit UI-owned names. Packs cannot steal these.
@@ -94,7 +91,7 @@ const DISPATCH: &[(&str, Builtin)] = &[
     ("steer", Builtin::Local),
     ("btw", Builtin::Local),
     ("perm", Builtin::Local),
-    ("lsp", Builtin::Local),
+    ("plugins", Builtin::Local),
 ];
 
 /// Offer table: core vs RPC-gated. Pack commands are not listed here.
@@ -130,7 +127,6 @@ const LOCAL_OFFER: &[(&str, Availability)] = &[
     ("undo", Availability::Method("rewind")),
     ("btw", Availability::Feature("ephemeral_prompt")),
     ("perm", Availability::AnyMethod(&["perm.set"])),
-    ("lsp", Availability::Lsp),
 ];
 
 /// Canonical names offered by autocomplete, in display order.
@@ -155,7 +151,6 @@ const COMPLETIONS: &[&str] = &[
     "steer",
     "btw",
     "perm",
-    "lsp",
     "quit",
     "exit",
 ];
@@ -176,7 +171,6 @@ pub const LOCAL_HELP: &[(&str, &str)] = &[
     ("/quit", "quit"),
     ("/exit", "quit"),
     ("/status", "session summary"),
-    ("/lsp", "recent diagnostics"),
     ("/perm", "set ask / auto mode"),
     ("/compact", "compact history"),
     ("/context", "context window usage"),
@@ -194,9 +188,6 @@ fn available(rule: Availability, host: &HostOffer<'_>) -> bool {
         Availability::Method(method) => host.method(method),
         Availability::AnyMethod(methods) => methods.iter().any(|method| host.method(method)),
         Availability::Feature(feature) => host.feature(feature),
-        Availability::Lsp => {
-            host.lsp_seen || host.feature("lsp") || host.feature("lsp_diagnostics")
-        }
     }
 }
 
@@ -353,6 +344,7 @@ mod tests {
             "rewind",
             "skill.list",
             "skill.activate",
+            "plugin.list",
         ]
         .into_iter()
         .map(str::to_string)
@@ -373,7 +365,6 @@ mod tests {
         HostOffer {
             methods,
             features,
-            lsp_seen: true,
         }
     }
 
@@ -384,7 +375,6 @@ mod tests {
         HostOffer {
             methods,
             features,
-            lsp_seen: false,
         }
     }
 
@@ -459,7 +449,7 @@ mod tests {
             "steer",
             "btw",
             "perm",
-            "lsp",
+            "plugins",
             "find",
             "yank",
         ] {
@@ -483,10 +473,9 @@ mod tests {
             pack("undo"),
             pack("skills"),
             pack("perm"),
-            pack("lsp"),
         ];
         for name in [
-            "context", "compact", "rewind", "undo", "skills", "perm", "lsp",
+            "context", "compact", "rewind", "undo", "skills", "perm",
         ] {
             assert_eq!(slash_route(name, &packs), SlashRoute::Local, "/{name}");
         }
@@ -502,7 +491,7 @@ mod tests {
         assert!(all.contains(&"effort".into()), "{all:?}");
         assert!(all.contains(&"model".into()), "{all:?}");
         for name in [
-            "context", "compact", "rewind", "undo", "skills", "perm", "lsp",
+            "context", "compact", "rewind", "undo", "skills", "perm",
         ] {
             assert!(all.contains(&name.to_string()), "{name}: {all:?}");
         }
@@ -524,7 +513,7 @@ mod tests {
         assert!(all.contains(&"status".into()), "{all:?}");
         assert!(all.contains(&"clear".into()), "{all:?}");
         for name in [
-            "compact", "steer", "skills", "model", "effort", "lsp", "btw", "goal",
+            "compact", "steer", "skills", "model", "effort", "btw", "goal",
         ] {
             assert!(!all.contains(&name.to_string()), "{name} leaked: {all:?}");
             assert!(!command_offered(name, &host), "{name}");
@@ -545,7 +534,6 @@ mod tests {
         assert!(!command_offered("steer", &host));
         assert!(!command_offered("skills", &host));
         assert!(!command_offered("model", &host));
-        assert!(!command_offered("lsp", &host));
         assert!(!command_offered("btw", &host));
     }
 

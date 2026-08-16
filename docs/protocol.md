@@ -70,8 +70,9 @@ Stderr is Engine logs — do not parse it.
 | `effort.set` | yes | `{id}` | `{ok, effort}` |
 | `context` | yes | — | `{tokens, context_window?, remaining?, percent?}` |
 | `rewind` | yes | — | `{ok, last_user}` |
-| `skill.list` | yes | — | `{skills:[name]}` |
+| `skill.list` | yes | — | `{skills:[folder], items?:[{id,name,folder,description?}]}` |
 | `skill.activate` | yes | `{names[]}` | `{activated, unknown}` |
+| `plugin.list` | yes | — | `{plugins:[id], items?:[{id,name,version,description?,skills?}]}` |
 | `version` | yes | — | `{name, version, rpc, package, methods?, control_methods?, features?}` |
 | `capabilities` | yes | — | same surface as `version` when the handshake omitted `methods` |
 | `extension.config` | yes | `{name}` | `extensions.<name>` object (see below) |
@@ -183,7 +184,6 @@ Exact strings live in mow `Event*` consts (`mow.go`). Handle at least:
 | `graph.goal.start` / `step` / `done` / `fail` | status-bar Goal state: short id + `step/max` |
 | `graph.goal.partial` / `blocked` | status-bar Goal state: `blocked`, or step/max while partial |
 | compact | refresh ctx% |
-| lsp diagnostics | optional diagnostics line |
 
 Dump one `prompt` in tests or read `mow.go` — do not guess ACP method names.
 

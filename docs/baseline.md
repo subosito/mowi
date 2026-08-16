@@ -54,7 +54,7 @@ Host-side (this crate, or slash if registered):
 
 Commands fall into three classes. Core local names (`/help`, `/quit`,
 `/clear`, `/search`, `/copy`, `/status`) are always offered. RPC-method-gated
-names (`/model`, `/effort`, `/steer`, `/compact`, `/skills`, `/lsp`, …)
+names (`/model`, `/effort`, `/steer`, `/compact`, `/skills`, …)
 appear in Help / completion only when `version` / `capabilities` advertised
 the backing method, feature, or event. Pack-discovered names stay dynamic
 via `slash.list` — `/goal` is never hardcoded. An empty method list does
@@ -89,7 +89,9 @@ Mowi requests ask mode unless `--auto`, `$MOW_PERMISSION_MODE=auto`, or
 (CLI > env > pack > default ask). `--ask` / `--auto` are explicit;
 absent flags fall through.
 
-Trust: `mow trust` / `mowi trust` out of band. No marker in the workspace.
+Trust: `mow trust` / `mowi trust` / `mowi --trust` out of band. No marker
+in the workspace. `mowi` delegates to `mow trust` (same `$MOW_HOME/trusted`
+store).
 
 ## Peers
 

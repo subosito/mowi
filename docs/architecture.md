@@ -67,8 +67,9 @@ See [protocol.md](protocol.md).
 
 ## Trust and flags
 
-Workspace trust (`mow trust`) stays out-of-band. mowi may shell out to
-`mow trust` or document it; it does not invent a second trust store.
+Workspace trust (`mow trust` / `mowi trust` / `mowi --trust`) stays
+out-of-band. mowi shells out to `mow trust` and does not invent a second
+trust store.
 
 `--allow-write` / `--allow-shell` / `--ask` / `--auto` / `--extra-root` are
 **engine flags** passed through to `mow rpc`. `--extra-root` is repeatable
