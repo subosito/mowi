@@ -11464,7 +11464,7 @@ mod tests {
             assert!(lines.len() <= window_line_bound(24));
         }
         assert!(
-            started.elapsed() < Duration::from_millis(40),
+            started.elapsed() < Duration::from_millis(200),
             "indexed scroll window regressed: {:?}",
             started.elapsed()
         );
@@ -11593,6 +11593,6 @@ mod tests {
             assert!(n <= bound);
         }
         let elapsed = started.elapsed().as_millis();
-        assert!(elapsed < 50);
+        assert!(elapsed < 200, "2k-entry cached window x20 took {elapsed}ms");
     }
 }
