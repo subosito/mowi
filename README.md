@@ -21,7 +21,11 @@ devenv shell -- cargo run -- --help
 
 Requires `mow` on `PATH` (or `$MOW_BIN`) with `ext/rpc` linked. Mowi requires
 RPC compatibility epoch `1` and discovers additive behavior through
-`capabilities` plus `slash.list`.
+`capabilities` plus `slash.list`. Pair with **mow ≥ 1.0.0-rc.1**.
+
+Version is `package.version` in [`Cargo.toml`](Cargo.toml). Tag `v$(that)`
+to run [`.github/workflows/release.yml`](.github/workflows/release.yml)
+(linux/darwin amd64+arm64, GitHub Release; `*-rc.*` is a prerelease).
 
 ## Themes
 

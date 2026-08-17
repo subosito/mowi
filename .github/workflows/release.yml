@@ -1,0 +1,110 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: ver
+        run: |
+          set -euo pipefail
+          file="$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml","rb"))["package"]["version"])')"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$file" != "$tag" ]; then
+            echo "Cargo.toml version is $file but tag is $GITHUB_REF_NAME (want v$file)"
+            exit 1
+          fi
+          echo "version=$file" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: mowi-linux-amd64
+            extra_apt: ""
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact: mowi-linux-arm64
+            extra_apt: gcc-aarch64-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: mowi-darwin-arm64
+            extra_apt: ""
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            artifact: mowi-darwin-amd64
+            extra_apt: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Cross linker
+        if: matrix.extra_apt != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.extra_apt }}
+      - name: Test
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo test --all-targets
+      - name: Build
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          cargo build --release --locked --target ${{ matrix.target }}
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/mowi" "dist/${{ matrix.artifact }}"
+      - name: Check version
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || startsWith(matrix.os, 'macos')
+        run: |
+          "./dist/${{ matrix.artifact }}" --version | grep -F "${{ needs.check-version.outputs.version }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
+
+  publish:
+    needs: [check-version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum mowi-* | tee SHA256SUMS
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          prerelease=()
+          case "${{ needs.check-version.outputs.version }}" in
+            *-rc.*|*-alpha.*|*-beta.*) prerelease=(--prerelease) ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" \
+            --title "mowi ${{ needs.check-version.outputs.version }}" \
+            --generate-notes \
+            "${prerelease[@]}" \
+            dist/mowi-* dist/SHA256SUMS
