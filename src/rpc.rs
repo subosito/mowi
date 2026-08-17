@@ -857,8 +857,6 @@ pub fn decode_goal_event(params: &Value) -> Option<GoalInfo> {
     })
 }
 
-/// Frozen host event type for language-server findings after write/edit.
-
 /// `rewind` result: `Some(last_user)` when the host dropped the last exchange.
 pub fn decode_rewind(value: &Value) -> Option<String> {
     if !value.get("ok").and_then(Value::as_bool).unwrap_or(false) {
@@ -1559,11 +1557,7 @@ impl SkillItem {
             return format!("{} · {}", self.id, self.name);
         }
         let desc = clip_skill_desc(&self.description, 48);
-        if self.name.is_empty() || self.name == self.id {
-            format!("{} — {desc}", self.id)
-        } else {
-            format!("{} — {desc}", self.id)
-        }
+        format!("{} — {desc}", self.id)
     }
 }
 

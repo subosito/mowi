@@ -272,19 +272,16 @@ fn main() -> ExitCode {
 /// Grant, list, or revoke workspace trust via `mow trust` (one store).
 fn run_trust(cli: &Cli) -> ExitCode {
     let mut args: Vec<String> = Vec::new();
-    match &cli.command {
-        Some(Command::Trust { path, list, revoke }) => {
-            if *list {
-                args.push("--list".into());
-            }
-            if *revoke {
-                args.push("--revoke".into());
-            }
-            if let Some(p) = path {
-                args.push(p.clone());
-            }
+    if let Some(Command::Trust { path, list, revoke }) = &cli.command {
+        if *list {
+            args.push("--list".into());
         }
-        _ => {}
+        if *revoke {
+            args.push("--revoke".into());
+        }
+        if let Some(p) = path {
+            args.push(p.clone());
+        }
     }
     match ProcessCommand::new(&cli.mow_bin)
         .arg("trust")

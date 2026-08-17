@@ -114,15 +114,15 @@ fn compact_tokens(n: u64) -> String {
 /// a raw char count (1.4m against a 500k tok-eq cap → 271%). Convert when
 /// used is implausibly larger than the window.
 fn sanitize_context_usage(mut usage: ContextUsage) -> ContextUsage {
-    if let Some(window) = usage.context_window.filter(|w| *w > 0) {
+    if let Some(window) = usage.context_window.filter(|w| *w > 0)
+        && usage.tokens > window
+    {
+        usage.tokens = (usage.tokens + 2) / 4;
         if usage.tokens > window {
-            usage.tokens = (usage.tokens + 2) / 4;
-            if usage.tokens > window {
-                usage.tokens = window;
-            }
-            usage.remaining = Some(window.saturating_sub(usage.tokens));
-            usage.percent = Some((usage.tokens as f64 / window as f64) * 100.0);
+            usage.tokens = window;
         }
+        usage.remaining = Some(window.saturating_sub(usage.tokens));
+        usage.percent = Some((usage.tokens as f64 / window as f64) * 100.0);
     }
     if let Some(pct) = usage.percent {
         usage.percent = Some(pct.clamp(0.0, 100.0));
@@ -4285,13 +4285,31 @@ fn extend_to_open_fence(text: &str, start: usize) -> &str {
         .lines()
         .filter(|line| line.trim_start().starts_with("```"))
         .count();
+    // A complete fence in the tail still needs the sentence that introduced
+    // it (`Edited cfg.go:` before ```diff). Otherwise the clip starts on the
+    // fence and the lead-in disappears off the top of a short frame.
     if fences % 2 == 0 {
+        if suffix
+            .lines()
+            .next()
+            .is_some_and(|line| line.trim_start().starts_with("```"))
+        {
+            return preceding_paragraph(text, start);
+        }
         return suffix;
     }
     let Some(open) = text[..start].rfind("```") else {
         return text;
     };
     let line_start = text[..open].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    preceding_paragraph(text, line_start)
+}
+
+/// Last non-empty line at or before `at` through the end of `text`.
+fn preceding_paragraph(text: &str, at: usize) -> &str {
+    let at = at.min(text.len());
+    let prefix = text[..at].trim_end();
+    let line_start = prefix.rfind('\n').map(|i| i + 1).unwrap_or(0);
     &text[line_start..]
 }
 
@@ -9686,7 +9704,18 @@ mod tests {
         app.entries.push(Entry::Note("compact queued".into()));
         assert_eq!(app.pending_compact, Some(0));
         assert_eq!(app.compact_chip_text().as_deref(), Some("compact queued"));
-        assert!(app.footer().contains("compact queued"));
+        let header = app
+            .header_line(120)
+            .spans
+            .iter()
+            .map(|s| s.content.as_ref())
+            .collect::<String>();
+        assert!(header.contains("compact queued"), "{header}");
+        let footer = app.footer();
+        assert!(
+            !footer.contains("compact queued"),
+            "queued compact is a header chip: {footer}"
+        );
 
         app.set_control_methods(&["compact".into()]);
         assert!(app.compact_is_control());
@@ -10021,7 +10050,7 @@ mod tests {
         app.entries.push(Entry::Assistant(
             "Edited `cfg.go`:\n\n```diff\n@@ -1 +1 @@\n-old\n+new\n```\n".into(),
         ));
-        let out = render(&mut app, 80, 20);
+        let out = render(&mut app, 80, 28);
         assert!(out.contains("─ hunk "), "{out}");
         assert!(!out.contains("─ diff "), "{out}");
         assert!(out.contains("Edited"), "{out}");

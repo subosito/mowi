@@ -601,6 +601,14 @@ pub fn diff_title(text: &str) -> String {
 /// header already shows. Peel that verb off so the body is not a second
 /// path row.
 pub fn peel_diff_action(text: &str) -> (Option<&'static str>, &str) {
+    // Fenced ```diff in assistant prose is not a tool-action card. Leave
+    // the lead-in (`Edited cfg.go:`) as markdown.
+    if text
+        .lines()
+        .any(|line| line.trim_start().starts_with("```"))
+    {
+        return (None, text);
+    }
     let trimmed = text.trim_start_matches('\n');
     let Some((first, rest)) = trimmed.split_once('\n') else {
         return (None, text);
@@ -858,6 +866,7 @@ fn flush_context(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_hunk(
     hunk: &[String],
     old_line: &mut Option<usize>,
@@ -910,7 +919,9 @@ fn paint_hunk(
             let no = *old_line;
             *old_line = old_line.map(|n| n + 1);
             *new_line = new_line.map(|n| n + 1);
-            pending_context.push((no.or(*new_line), body));
+            if !body.is_empty() {
+                pending_context.push((no.or(*new_line), body));
+            }
         }
     }
     flush_change(
@@ -983,6 +994,7 @@ fn align_lines(old: &[String], new: &[String]) -> Vec<(AlignKind, String)> {
     ops
 }
 
+#[allow(clippy::too_many_arguments)]
 fn replay_ops(
     ops: Vec<(AlignKind, String)>,
     old_line: &mut Option<usize>,
@@ -1002,7 +1014,11 @@ fn replay_ops(
                 let no = *old_line;
                 *old_line = old_line.map(|n| n + 1);
                 *new_line = new_line.map(|n| n + 1);
-                pending_context.push((no.or(*new_line), ops[i].1.clone()));
+                // Unified diffs include empty source lines to keep numbers
+                // honest; do not paint a blank context row for them.
+                if !ops[i].1.is_empty() {
+                    pending_context.push((no.or(*new_line), ops[i].1.clone()));
+                }
                 i += 1;
             }
             AlignKind::Del => {
@@ -1089,7 +1105,7 @@ fn parse_hunk_side(field: &str, sign: char) -> Option<(usize, usize)> {
 }
 
 fn hunk_last_line(start: usize, count: usize) -> usize {
-    start.saturating_add(count.saturating_sub(1).max(0))
+    start.saturating_add(count.saturating_sub(1))
 }
 
 fn hunk_gap(old_line: Option<usize>, new_line: Option<usize>, old: usize, new: usize) -> usize {
@@ -1150,6 +1166,7 @@ fn numbered_context(
     Line::from(spans)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn numbered_band(
     number: (Option<usize>, Style),
     sign: char,
