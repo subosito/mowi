@@ -40,13 +40,11 @@ use crate::render::{
 use crate::rpc::{
     Client, CompactReport, ContextUsage, EVENT_COMPACT, EVENT_COMPACT_START, EVENT_GOAL_BLOCKED,
     EVENT_GOAL_DONE, EVENT_GOAL_FAIL, EVENT_GOAL_PARTIAL, EVENT_GOAL_START, EVENT_GOAL_STEP,
-    EffortList, Error, ExtraRoot, GoalInfo, 
-    ModelList, Notification, PermissionRequest, SessionInfo, SessionSummary, SlashCommand,
-    TranscriptMessage, VersionInfo, decode_extra_roots, decode_goal_event,
-    decode_rewind, decode_sessions, decode_skill_activate, decode_skill_items,
-    decode_plugin_items, extract_thinking,
-    has_extra_roots_field, reasoning_delta, token_delta, tool_args, tool_denied, tool_error,
-    tool_name, tool_progress_label_for, tool_result,
+    EffortList, Error, ExtraRoot, GoalInfo, ModelList, Notification, PermissionRequest,
+    SessionInfo, SessionSummary, SlashCommand, TranscriptMessage, VersionInfo, decode_extra_roots,
+    decode_goal_event, decode_plugin_items, decode_rewind, decode_sessions, decode_skill_activate,
+    decode_skill_items, extract_thinking, has_extra_roots_field, reasoning_delta, token_delta,
+    tool_args, tool_denied, tool_error, tool_name, tool_progress_label_for, tool_result,
 };
 use crate::slash::{
     HostOffer, LOCAL_HELP, SlashRoute, canonical_slash, command_offered, slash_completions,
@@ -236,7 +234,10 @@ impl Usage {
             format_tokens(self.total())
         )];
         if self.peer_tokens > 0 {
-            lines.push(format!("peer tokens: {} ⇄", format_tokens(self.peer_tokens)));
+            lines.push(format!(
+                "peer tokens: {} ⇄",
+                format_tokens(self.peer_tokens)
+            ));
         }
         lines.join("\n")
     }
@@ -1004,15 +1005,10 @@ impl App {
             return;
         }
         if outcome.record {
-            let repeat = self
-                .entries
-                .iter()
-                .rev()
-                .find_map(|entry| match entry {
-                    Entry::Note(existing) if is_compact_note(existing) => Some(existing.as_str()),
-                    _ => None,
-                })
-                == Some(outcome.note.as_str());
+            let repeat = self.entries.iter().rev().find_map(|entry| match entry {
+                Entry::Note(existing) if is_compact_note(existing) => Some(existing.as_str()),
+                _ => None,
+            }) == Some(outcome.note.as_str());
             if !repeat {
                 self.entries.push(Entry::Note(outcome.note.clone()));
             }
@@ -1555,7 +1551,10 @@ impl App {
         let mut out = Vec::new();
         if text.trim().is_empty() {
             if self.thinking {
-                out.push(Line::styled("thinking", self.theme.note().add_modifier(Modifier::ITALIC)));
+                out.push(Line::styled(
+                    "thinking",
+                    self.theme.note().add_modifier(Modifier::ITALIC),
+                ));
             } else {
                 out.push(Line::raw(""));
             }
@@ -2575,11 +2574,12 @@ impl App {
                 .and_then(Value::as_str)
                 .unwrap_or("peer")
                 .to_string();
-            self.peers
-                .entry(agent.clone())
-                .or_default();
+            self.peers.entry(agent.clone()).or_default();
             if let Some(buf) = self.peers.get_mut(&agent) {
-                append_stream_text(buf, params.get("delta").and_then(Value::as_str).unwrap_or(""));
+                append_stream_text(
+                    buf,
+                    params.get("delta").and_then(Value::as_str).unwrap_or(""),
+                );
             }
             self.touch_peer(&agent);
             self.status = format!("⇄ {} · receiving", sanitize_preview(&agent));
@@ -3664,7 +3664,10 @@ fn needs_stream_space(buf: &str, delta: &str) -> bool {
     if prev.is_whitespace() || next.is_whitespace() {
         return false;
     }
-    if matches!(next, ',' | '.' | '!' | '?' | ';' | ':' | ')' | ']' | '}' | '\'' | '"') {
+    if matches!(
+        next,
+        ',' | '.' | '!' | '?' | ';' | ':' | ')' | ']' | '}' | '\'' | '"'
+    ) {
         return false;
     }
     if matches!(prev, '(' | '[' | '{' | '"' | '\'' | '/' | '\\' | '-' | '_') {
@@ -4111,7 +4114,10 @@ fn highlight_term_in_span(span: Span<'static>, needle: &str, hit: Style) -> Vec<
             out.push(Span::styled(rest[..at].to_string(), span.style));
         }
         let end = at + needle.len();
-        out.push(Span::styled(rest[at..end].to_string(), span.style.patch(hit)));
+        out.push(Span::styled(
+            rest[at..end].to_string(),
+            span.style.patch(hit),
+        ));
         rest = &rest[end..];
         rest_lower = &rest_lower[end..];
     }
@@ -4689,15 +4695,8 @@ fn wrap_styled_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
             if ch == '\n' {
                 if word_armed {
                     flush_word(
-                        &mut rows,
-                        &mut spans,
-                        &mut buf,
-                        &mut style,
-                        &mut col,
-                        &mut word,
-                        word_style,
-                        word_w,
-                        line_style,
+                        &mut rows, &mut spans, &mut buf, &mut style, &mut col, &mut word,
+                        word_style, word_w, line_style,
                     );
                     word_armed = false;
                     word_w = 0;
@@ -4708,15 +4707,8 @@ fn wrap_styled_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
             if ch.is_whitespace() {
                 if word_armed {
                     flush_word(
-                        &mut rows,
-                        &mut spans,
-                        &mut buf,
-                        &mut style,
-                        &mut col,
-                        &mut word,
-                        word_style,
-                        word_w,
-                        line_style,
+                        &mut rows, &mut spans, &mut buf, &mut style, &mut col, &mut word,
+                        word_style, word_w, line_style,
                     );
                     word_armed = false;
                     word_w = 0;
@@ -4738,15 +4730,8 @@ fn wrap_styled_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
             }
             if word_armed && span.style != word_style {
                 flush_word(
-                    &mut rows,
-                    &mut spans,
-                    &mut buf,
-                    &mut style,
-                    &mut col,
-                    &mut word,
-                    word_style,
-                    word_w,
-                    line_style,
+                    &mut rows, &mut spans, &mut buf, &mut style, &mut col, &mut word, word_style,
+                    word_w, line_style,
                 );
                 word_armed = false;
                 word_w = 0;
@@ -4761,14 +4746,7 @@ fn wrap_styled_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
     }
     if word_armed {
         flush_word(
-            &mut rows,
-            &mut spans,
-            &mut buf,
-            &mut style,
-            &mut col,
-            &mut word,
-            word_style,
-            word_w,
+            &mut rows, &mut spans, &mut buf, &mut style, &mut col, &mut word, word_style, word_w,
             line_style,
         );
     }
@@ -5810,12 +5788,7 @@ fn draw_peer(frame: &mut Frame<'_>, app: &App, area: Rect) {
     } else {
         ([HINT_SCROLL, HINT_ESC_CLOSE, HINT_X_CLOSE].as_slice(), "")
     };
-    let mut block = overlay_block_hint(
-        app,
-        &format!("⇄ {agent}{position}"),
-        hints,
-        note,
-    );
+    let mut block = overlay_block_hint(app, &format!("⇄ {agent}{position}"), hints, note);
     block = block.title(
         Line::from(Span::styled(
             " x ",
@@ -7736,10 +7709,7 @@ mod tests {
 
     #[test]
     fn wrap_cols_breaks_on_words_not_letters() {
-        assert_eq!(
-            wrap_cols("hello world", 8),
-            vec!["hello", "world"]
-        );
+        assert_eq!(wrap_cols("hello world", 8), vec!["hello", "world"]);
         assert_eq!(
             wrap_cols("recommending. Now let me inspect the overlay chrome.", 20),
             vec!["recommending. Now", "let me inspect the", "overlay chrome."]
@@ -8372,7 +8342,10 @@ mod tests {
         assert!(wide.contains("mow"), "{wide}");
         assert!(!wide.contains("/home/dev/src/mow"), "basename only: {wide}");
         assert!(wide.contains("gpt-5-mini (medium)"), "{wide}");
-        assert!(!wide.contains("tok"), "token totals live on /status: {wide}");
+        assert!(
+            !wide.contains("tok"),
+            "token totals live on /status: {wide}"
+        );
         assert!(wide.contains("41.5k/200k ctx"), "{wide}");
         assert!(!wide.contains('▰'), "percentage gauge is gone: {wide}");
         assert!(!wide.contains('%'), "header does not print percent: {wide}");
@@ -8400,10 +8373,7 @@ mod tests {
         );
         let mid_ctx = mid.find("41.5k/200k ctx").expect("context");
         let mid_safety = mid.find("read-only").expect("safety");
-        assert!(
-            mid_safety < mid_ctx,
-            "context stays right of safety: {mid}"
-        );
+        assert!(mid_safety < mid_ctx, "context stays right of safety: {mid}");
         assert!(
             mid.trim_end().ends_with("41.5k/200k ctx"),
             "context stays at the right edge at 80: {mid}"
@@ -8683,8 +8653,8 @@ mod tests {
         assert!(joined.contains("/search"), "{joined}");
         assert!(joined.contains("/copy"), "{joined}");
         for name in [
-            "/steer", "/compact", "/model", "/skills", "/goal", "/btw", "/edit",
-            "/retry", "/resume",
+            "/steer", "/compact", "/model", "/skills", "/goal", "/btw", "/edit", "/retry",
+            "/resume",
         ] {
             assert!(
                 !names.iter().any(|row| row == name),
@@ -9409,7 +9379,11 @@ mod tests {
         assert_eq!(app.context_chip().as_deref(), Some("339k/500k ctx"));
         let pct = app.context_percent().expect("pct");
         assert!(pct > 60.0 && pct <= 100.0, "{pct}");
-        assert!(app.context_summary().contains("68%"), "{}", app.context_summary());
+        assert!(
+            app.context_summary().contains("68%"),
+            "{}",
+            app.context_summary()
+        );
     }
 
     fn goal_event(kind: &str, id: &str, status: &str, step: u64, max_steps: u64) -> Notification {
@@ -9669,7 +9643,10 @@ mod tests {
         assert!(summary.contains("write+shell"), "{summary}");
         assert!(summary.contains("effort high"), "{summary}");
         assert!(summary.contains("context: 12.3k / 200k (6%)"), "{summary}");
-        assert!(summary.contains("tokens: 800 in · 400 out · 1.2k total"), "{summary}");
+        assert!(
+            summary.contains("tokens: 800 in · 400 out · 1.2k total"),
+            "{summary}"
+        );
         assert!(summary.contains("peer tokens: 250 ⇄"), "{summary}");
         assert!(summary.contains("⇄"), "{summary}");
         assert!(summary.contains("01J8ZK4M7Q2XN5V9"), "{summary}");
@@ -10108,7 +10085,11 @@ mod tests {
             .map(|x| buf[(x, 0)].symbol().to_string())
             .collect::<String>();
         let title_x = header.find("mowi").expect("header title") as u16;
-        assert_eq!(buf[(title_x, 0)].fg, p.accent, "header title uses latte mauve");
+        assert_eq!(
+            buf[(title_x, 0)].fg,
+            p.accent,
+            "header title uses latte mauve"
+        );
         let mut saw_user = false;
         let mut saw_add = false;
         for y in 0..16u16 {

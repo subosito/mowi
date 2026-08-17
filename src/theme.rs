@@ -537,9 +537,7 @@ impl Theme {
     /// blue is still tools / spinner / links.
     pub fn user(self) -> Style {
         if self.colored {
-            Style::default()
-                .fg(self.palette.text)
-                .patch(self.user_bg())
+            Style::default().fg(self.palette.text).patch(self.user_bg())
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         }
@@ -1128,10 +1126,7 @@ mod tests {
 
         let plain = Theme::plain(ThemeName::CatppuccinMocha);
         assert!(
-            plain
-                .ctx_warn()
-                .add_modifier
-                .contains(Modifier::UNDERLINED),
+            plain.ctx_warn().add_modifier.contains(Modifier::UNDERLINED),
             "NO_COLOR ctx_warn must differ from ctx_ok"
         );
         assert!(!plain.ctx_ok().add_modifier.contains(Modifier::UNDERLINED));

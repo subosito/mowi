@@ -536,9 +536,7 @@ fn tool_progress_detail(
             .into_iter()
             .map(get)
             .find(|value| !value.is_empty())
-            .map(|value| {
-                clip_runes(&display_jail_path(&value, workspace, extra_roots), 64)
-            })
+            .map(|value| clip_runes(&display_jail_path(&value, workspace, extra_roots), 64))
             .unwrap_or_default(),
     }
 }
@@ -561,11 +559,7 @@ pub fn display_jail_path(path: &str, workspace: &str, extra_roots: &[ExtraRoot])
         // the workspace (unusual). Extra roots that sit *beside* the
         // workspace keep their full path because this branch does not fire.
         let _ = extra_roots;
-        return if rel.is_empty() {
-            ".".into()
-        } else {
-            rel
-        };
+        return if rel.is_empty() { ".".into() } else { rel };
     }
     path.to_string()
 }

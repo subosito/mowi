@@ -592,11 +592,7 @@ mod tests {
         let sub = Cli::parse_from(["mowi", "trust", "--list"]);
         assert!(!sub.trust);
         match sub.command {
-            Some(Command::Trust {
-                list,
-                revoke,
-                path,
-            }) => {
+            Some(Command::Trust { list, revoke, path }) => {
                 assert!(list);
                 assert!(!revoke);
                 assert!(path.is_none());
@@ -606,11 +602,7 @@ mod tests {
 
         let revoke = Cli::parse_from(["mowi", "trust", "--revoke", "/tmp/ws"]);
         match revoke.command {
-            Some(Command::Trust {
-                list,
-                revoke,
-                path,
-            }) => {
+            Some(Command::Trust { list, revoke, path }) => {
                 assert!(!list);
                 assert!(revoke);
                 assert_eq!(path.as_deref(), Some("/tmp/ws"));

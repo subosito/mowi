@@ -365,20 +365,14 @@ mod tests {
         methods: &'a [String],
         features: &'a BTreeMap<String, bool>,
     ) -> HostOffer<'a> {
-        HostOffer {
-            methods,
-            features,
-        }
+        HostOffer { methods, features }
     }
 
     fn empty_host<'a>(
         methods: &'a [String],
         features: &'a BTreeMap<String, bool>,
     ) -> HostOffer<'a> {
-        HostOffer {
-            methods,
-            features,
-        }
+        HostOffer { methods, features }
     }
 
     #[test]
@@ -493,9 +487,7 @@ mod tests {
         let all = slash_completions("", &packs, &host);
         assert!(all.contains(&"effort".into()), "{all:?}");
         assert!(all.contains(&"model".into()), "{all:?}");
-        for name in [
-            "context", "compact", "rewind", "undo", "skills", "perm",
-        ] {
+        for name in ["context", "compact", "rewind", "undo", "skills", "perm"] {
             assert!(all.contains(&name.to_string()), "{name}: {all:?}");
         }
         assert!(all.contains(&"review".into()), "{all:?}");

@@ -625,7 +625,10 @@ pub fn peel_diff_action(text: &str) -> (Option<&'static str>, &str) {
     }
     // Only peel when the rest is (or contains) a unified diff — a lone
     // "edited notes.txt" note should stay prose.
-    if !is_unified_diff(rest) && !rest.lines().any(|line| line.starts_with("@@") || line.starts_with("---") || line.starts_with("+++"))
+    if !is_unified_diff(rest)
+        && !rest.lines().any(|line| {
+            line.starts_with("@@") || line.starts_with("---") || line.starts_with("+++")
+        })
     {
         return (None, text);
     }
@@ -1091,7 +1094,9 @@ fn hunk_last_line(start: usize, count: usize) -> usize {
 
 fn hunk_gap(old_line: Option<usize>, new_line: Option<usize>, old: usize, new: usize) -> usize {
     match (old_line, new_line) {
-        (Some(prev_old), Some(prev_new)) => old.saturating_sub(prev_old).max(new.saturating_sub(prev_new)),
+        (Some(prev_old), Some(prev_new)) => old
+            .saturating_sub(prev_old)
+            .max(new.saturating_sub(prev_new)),
         (Some(prev_old), None) => old.saturating_sub(prev_old),
         (None, Some(prev_new)) => new.saturating_sub(prev_new),
         _ => 0,
@@ -1357,8 +1362,7 @@ mod tests {
 
     #[test]
     fn peel_edited_path_off_a_write_result() {
-        let raw =
-            "edited src/app.rs\n--- src/app.rs\n+++ src/app.rs\n@@ -1 +1 @@\n-old\n+new\n";
+        let raw = "edited src/app.rs\n--- src/app.rs\n+++ src/app.rs\n@@ -1 +1 @@\n-old\n+new\n";
         assert_eq!(
             super::peel_diff_action(raw),
             (
@@ -1723,10 +1727,7 @@ mod tests {
             text.iter().any(|row| row.contains("… 7 unchanged lines")),
             "{text:?}"
         );
-        assert!(
-            text.iter().all(|row| !row.contains("@@")),
-            "{text:?}"
-        );
+        assert!(text.iter().all(|row| !row.contains("@@")), "{text:?}");
         let gap = lines
             .iter()
             .find(|row| plain(row).contains("unchanged"))
@@ -1741,11 +1742,7 @@ mod tests {
             .map(|i| format!(" keep{i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let lines = diff_lines(
-            &format!("@@ -1,10 +1,10 @@\n{ctx}\n-old\n+new"),
-            theme,
-            40,
-        );
+        let lines = diff_lines(&format!("@@ -1,10 +1,10 @@\n{ctx}\n-old\n+new"), theme, 40);
         let text: Vec<String> = lines.iter().map(plain).collect();
         assert!(
             text.iter().any(|row| row.contains("… 4 unchanged lines")),
@@ -1790,10 +1787,7 @@ mod tests {
     #[test]
     fn number_gutter_fits_the_last_line_in_a_hunk() {
         assert_eq!(
-            super::diff_number_width(&[
-                "@@ -98,20 +98,20 @@".into(),
-                " context".into(),
-            ]),
+            super::diff_number_width(&["@@ -98,20 +98,20 @@".into(), " context".into(),]),
             3
         );
         assert_eq!(super::parse_hunk("@@ -10,4 +12,6 @@"), Some((10, 12, 4, 6)));
